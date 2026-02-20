@@ -25,6 +25,8 @@ Continuous execution is a primary goal of the Looper agent. As the name suggests
 
 By default, the loop does not run at a fixed rate; after an iteration ends, the next will begin immediately. However, global configurations exist for backoff timing.
 
+![Architecture flow](https://i.imgur.com/xX0vLVT.png)
+
 ### 1. Surprise Detection
 
 At the beginning of the loop iteration, the local model will list the percepts that have been received through sensors since the last iteration. The local model will read this list, in addition to (up to) 10 previous iterations' lists, to find any percepts that seem surprising in the newest iteration.

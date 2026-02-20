@@ -5,6 +5,7 @@ use std::{fs, path::PathBuf};
 
 use anyhow::{Result, anyhow};
 use arboard::Clipboard;
+use chrono::Local;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -120,6 +121,10 @@ struct App {
     chat_input: String,
     status: String,
     activity_log: Vec<String>,
+    chat_history: Vec<String>,
+    latest_loop_state_log: String,
+    start_timestamp: String,
+    started_at: Instant,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -170,6 +175,10 @@ impl App {
             chat_input: String::new(),
             status: "Setup: use arrows + Enter. Ctrl+V/right-click to paste.".to_string(),
             activity_log: Vec::new(),
+            chat_history: Vec::new(),
+            latest_loop_state_log: "(no loop state yet)".to_string(),
+            start_timestamp: format_start_timestamp(Local::now()),
+            started_at: Instant::now(),
         };
 
         if let Some(config) = read_persisted_setup_config()? {
@@ -311,6 +320,7 @@ impl App {
                             report.surprising_percepts.len(),
                             report.action_results.len()
                         );
+                        self.latest_loop_state_log = self.status.clone();
                     }
                     Err(error) => {
                         self.status = format!("loop error: {error}");
@@ -341,29 +351,24 @@ impl App {
             return Ok(false);
         }
 
-        match code {
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                self.runtime.stop("manually stopped");
-                self.status = "state changed to stopped".to_string();
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => match self.runtime.start() {
-                Ok(()) => {
-                    self.status = "state changed to running".to_string();
-                }
-                Err(error) => {
-                    self.status = format!("cannot start: {error}");
-                }
-            },
-            _ => {
-                self.handle_runtime_key(code, modifiers)?;
-            }
-        }
+        self.handle_runtime_key(code, modifiers)?;
 
         Ok(false)
     }
 
     async fn handle_setup_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         if modifiers.contains(KeyModifiers::CONTROL) {
+            return Ok(());
+        }
+
+        if matches!(code, KeyCode::Char('s') | KeyCode::Char('S')) {
+            self.step = self.previous_setup_step(self.step);
+            self.status = "Moved to previous setup step".to_string();
+            return Ok(());
+        }
+
+        if matches!(code, KeyCode::Char('r') | KeyCode::Char('R')) {
+            self.advance_setup_step().await?;
             return Ok(());
         }
 
@@ -667,8 +672,11 @@ impl App {
                 self.chat_input.pop();
             }
             KeyCode::Enter => {
-                if !self.chat_input.trim().is_empty() {
+                if modifiers.contains(KeyModifiers::SHIFT) {
+                    self.chat_input.push('\n');
+                } else if !self.chat_input.trim().is_empty() {
                     self.runtime.enqueue_chat_message(self.chat_input.clone())?;
+                    self.push_chat_history(&format!("you: {}", self.chat_input.trim()));
                     self.chat_input.clear();
                     self.status = "chat percept queued".to_string();
                 }
@@ -978,25 +986,36 @@ impl App {
     }
 
     fn draw_runtime(&self, frame: &mut ratatui::Frame<'_>) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(5),
-                Constraint::Min(4),
-            ])
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
             .split(frame.area());
 
+        let left = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(8), Constraint::Length(8)])
+            .split(columns[0]);
+
+        let right = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Length(5),
+                Constraint::Min(6),
+                Constraint::Length(4),
+            ])
+            .split(columns[1]);
+
+        let history_text = if self.chat_history.is_empty() {
+            "(no chat yet)".to_string()
+        } else {
+            self.chat_history.join("\n\n")
+        };
+
         frame.render_widget(
-            Paragraph::new(
-                "Running mode: type chat + Enter | s stop | r run | Ctrl+V/right-click paste | Ctrl+C quit",
-            )
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!("Looper ({:?})", self.runtime.state())),
-            ),
-            chunks[0],
+            Paragraph::new(history_text)
+                .block(Block::default().borders(Borders::ALL).title("Chat History")),
+            left[0],
         );
 
         let local = self
@@ -1011,16 +1030,58 @@ impl App {
             .unwrap_or_else(|| "(unset)".to_string());
 
         frame.render_widget(
-            Paragraph::new(format!("local={local}\nfrontier={frontier}"))
-                .block(Block::default().borders(Borders::ALL).title("Model Config")),
-            chunks[1],
+            Paragraph::new(format!(
+                "status: {:?}\n{}",
+                self.runtime.state(),
+                self.status
+            ))
+            .block(Block::default().borders(Borders::ALL).title("Looper")),
+            right[0],
         );
 
         frame.render_widget(
-            Paragraph::new(format!("chat: {}\n{}", self.chat_input, self.status))
+            Paragraph::new(format!("local={local}\nfrontier={frontier}"))
+                .block(Block::default().borders(Borders::ALL).title("Model Config")),
+            right[1],
+        );
+
+        let observability = self.runtime.observability_snapshot();
+        let start_ago = format_elapsed_ago(self.started_at.elapsed());
+        frame.render_widget(
+            Paragraph::new(format!(
+                "start={} ({} ago)\nloops={} ({:.2}/min)\nfailed_tool_exec={} ({:.1}%)\nfalse_positive_surprises={} ({:.1}%)",
+                self.start_timestamp,
+                start_ago,
+                observability.total_iterations,
+                observability.loops_per_minute,
+                observability.failed_tool_executions,
+                observability.failed_tool_execution_percent,
+                observability.false_positive_surprises,
+                observability.false_positive_surprise_percent,
+            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title("Execution Summary"),
+            ),
+            right[2],
+        );
+
+        frame.render_widget(
+            Paragraph::new(self.latest_loop_state_log.as_str())
+                .block(Block::default().borders(Borders::ALL).title("Loop State")),
+            right[3],
+        );
+
+        frame.render_widget(
+            Paragraph::new(self.chat_input.as_str())
                 .style(Style::default().fg(Color::Yellow))
-                .block(Block::default().borders(Borders::ALL).title("Input / Logs")),
-            chunks[2],
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title("Chat Input (Enter send, Shift+Enter newline, Ctrl+V paste)"),
+                ),
+            left[1],
         );
     }
 
@@ -1033,6 +1094,18 @@ impl App {
         self.activity_log.push(trimmed.to_string());
         if self.activity_log.len() > 200 {
             self.activity_log.drain(0..(self.activity_log.len() - 200));
+        }
+    }
+
+    fn push_chat_history(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        self.chat_history.push(trimmed.to_string());
+        if self.chat_history.len() > 200 {
+            self.chat_history.drain(0..(self.chat_history.len() - 200));
         }
     }
 }
@@ -1392,6 +1465,51 @@ fn visible_window(selected: usize, total: usize, capacity: usize) -> (usize, usi
 
 fn split_model_and_version(model: &str) -> (&str, &str) {
     model.split_once(':').unwrap_or((model, "latest"))
+}
+
+fn format_start_timestamp(now: chrono::DateTime<Local>) -> String {
+    let formatted = now.format("%b %-d, %-I:%M%P").to_string();
+    if let Some(trimmed) = formatted.strip_suffix("am") {
+        return format!("{trimmed}a");
+    }
+    if let Some(trimmed) = formatted.strip_suffix("pm") {
+        return format!("{trimmed}p");
+    }
+    formatted
+}
+
+fn format_elapsed_ago(elapsed: Duration) -> String {
+    let total_seconds = elapsed.as_secs();
+    let units = [
+        (86_400_u64, "day"),
+        (3_600_u64, "hour"),
+        (60_u64, "min"),
+        (1_u64, "sec"),
+    ];
+
+    let mut remaining = total_seconds;
+    let mut parts = Vec::new();
+
+    for (unit_seconds, unit_name) in units {
+        if parts.len() == 2 {
+            break;
+        }
+
+        let count = remaining / unit_seconds;
+        if count == 0 {
+            continue;
+        }
+
+        remaining %= unit_seconds;
+        let suffix = if count == 1 { "" } else { "s" };
+        parts.push(format!("{count} {unit_name}{suffix}"));
+    }
+
+    if parts.is_empty() {
+        return "0 secs".to_string();
+    }
+
+    parts.join(", ")
 }
 
 fn read_persisted_setup_config() -> Result<Option<PersistedSetupConfig>> {
