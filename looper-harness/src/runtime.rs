@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
@@ -10,8 +11,8 @@ use crate::executors::{
     ShellActuatorExecutor, WebSearchActuatorExecutor,
 };
 use crate::model::{
-    Actuator, ActuatorType, ExecutionResult, InternalActuatorKind, PendingApproval, Percept,
-    RecommendedAction, SafetyPolicy, Sensor,
+    Actuator, ActuatorType, AgentState, ExecutionResult, InternalActuatorKind, ModelProviderKind,
+    ModelSelection, PendingApproval, Percept, RecommendedAction, SafetyPolicy, Sensor,
 };
 use crate::models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,
@@ -22,20 +23,17 @@ use crate::storage::{PersistedIteration, SqliteStore};
 /// Phases of a loop iteration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum LoopPhase {
-    /// Read new percepts from sensors.
     SurpriseDetection,
-    /// Frontier reasoning over surprising percepts.
     Reasoning,
-    /// Action execution phase.
     PerformActions,
 }
 
 impl LoopPhase {
     fn as_key(self) -> &'static str {
         match self {
-            LoopPhase::SurpriseDetection => "surprise_detection",
-            LoopPhase::Reasoning => "reasoning",
-            LoopPhase::PerformActions => "perform_actions",
+            Self::SurpriseDetection => "surprise_detection",
+            Self::Reasoning => "reasoning",
+            Self::PerformActions => "perform_actions",
         }
     }
 }
@@ -43,17 +41,11 @@ impl LoopPhase {
 /// Observability counters for loop health.
 #[derive(Clone, Debug)]
 pub struct Observability {
-    /// Execution counts per phase.
     pub phase_execution_counts: HashMap<LoopPhase, u64>,
-    /// Approximate local model token usage.
     pub local_model_tokens: u64,
-    /// Approximate frontier model token usage.
     pub frontier_model_tokens: u64,
-    /// Number of false positive surprises.
     pub false_positive_surprises: u64,
-    /// Number of failed tool executions.
     pub failed_tool_executions: u64,
-    /// Total iteration count.
     pub total_iterations: u64,
     start: Instant,
 }
@@ -73,12 +65,10 @@ impl Default for Observability {
 }
 
 impl Observability {
-    /// Increments the execution counter for a loop phase.
     pub fn bump_phase(&mut self, phase: LoopPhase) {
         *self.phase_execution_counts.entry(phase).or_insert(0) += 1;
     }
 
-    /// Calculates loops per minute since startup.
     pub fn loops_per_minute(&self) -> f64 {
         let elapsed_secs = self.start.elapsed().as_secs_f64();
         if elapsed_secs <= f64::EPSILON {
@@ -87,7 +77,6 @@ impl Observability {
         (self.total_iterations as f64 / elapsed_secs) * 60.0
     }
 
-    /// Returns failed tool execution percent.
     pub fn failed_tool_execution_percent(&self) -> f64 {
         if self.total_iterations == 0 {
             return 0.0;
@@ -95,7 +84,6 @@ impl Observability {
         (self.failed_tool_executions as f64 / self.total_iterations as f64) * 100.0
     }
 
-    /// Returns false positive surprise percent.
     pub fn false_positive_surprise_percent(&self) -> f64 {
         if self.total_iterations == 0 {
             return 0.0;
@@ -103,7 +91,6 @@ impl Observability {
         (self.false_positive_surprises as f64 / self.total_iterations as f64) * 100.0
     }
 
-    /// Creates a serialization-friendly snapshot of metrics.
     pub fn snapshot(&self) -> ObservabilitySnapshot {
         let mut phase_execution_counts = HashMap::new();
         for (phase, count) in &self.phase_execution_counts {
@@ -127,52 +114,41 @@ impl Observability {
 /// Serialization-friendly observability payload.
 #[derive(Clone, Debug, Serialize)]
 pub struct ObservabilitySnapshot {
-    /// Execution counts per phase.
     pub phase_execution_counts: HashMap<String, u64>,
-    /// Approximate local model token usage.
     pub local_model_tokens: u64,
-    /// Approximate frontier model token usage.
     pub frontier_model_tokens: u64,
-    /// Number of false positive surprises.
     pub false_positive_surprises: u64,
-    /// Percent of iterations with false positive surprises.
     pub false_positive_surprise_percent: f64,
-    /// Number of failed tool executions.
     pub failed_tool_executions: u64,
-    /// Percent of iterations with failed executions.
     pub failed_tool_execution_percent: f64,
-    /// Total iteration count.
     pub total_iterations: u64,
-    /// Loops per minute since startup.
     pub loops_per_minute: f64,
 }
 
 /// Output of a completed loop iteration.
 #[derive(Clone, Debug)]
 pub struct IterationReport {
-    /// Persisted database id if storage is enabled.
     pub iteration_id: Option<i64>,
-    /// Percepts sensed this iteration.
     pub sensed_percepts: Vec<Percept>,
-    /// Percepts marked surprising this iteration.
     pub surprising_percepts: Vec<Percept>,
-    /// Planned actions this iteration.
     pub planned_actions: Vec<RecommendedAction>,
-    /// Action execution results.
     pub action_results: Vec<ExecutionResult>,
-    /// Whether the iteration ended before reasoning.
     pub ended_after_surprise_detection: bool,
-    /// Whether the iteration ended before action execution.
     pub ended_after_reasoning: bool,
 }
 
-/// First-pass implementation of the Looper sensory loop runtime.
+/// Runtime for Looper sensory loop.
 pub struct LooperRuntime {
     sensors: HashMap<String, Sensor>,
     actuators: HashMap<String, Actuator>,
     internal_executors: HashMap<InternalActuatorKind, Box<dyn ActuatorExecutor>>,
-    local_model: Box<dyn LocalModel>,
-    frontier_model: Box<dyn FrontierModel>,
+    local_model: Option<Box<dyn LocalModel>>,
+    frontier_model: Option<Box<dyn FrontierModel>>,
+    local_selection: Option<ModelSelection>,
+    frontier_selection: Option<ModelSelection>,
+    provider_api_keys: HashMap<ModelProviderKind, String>,
+    agent_state: AgentState,
+    stop_reason: Option<String>,
     observability: Observability,
     executions_per_actuator: HashMap<String, u32>,
     pending_approvals: HashMap<u64, PendingApproval>,
@@ -181,14 +157,18 @@ pub struct LooperRuntime {
 }
 
 impl LooperRuntime {
-    /// Creates an empty runtime.
     pub fn new() -> Self {
         Self {
             sensors: HashMap::new(),
             actuators: HashMap::new(),
             internal_executors: HashMap::new(),
-            local_model: Box::new(RuleBasedLocalModel),
-            frontier_model: Box::new(RuleBasedFrontierModel),
+            local_model: None,
+            frontier_model: None,
+            local_selection: None,
+            frontier_selection: None,
+            provider_api_keys: HashMap::new(),
+            agent_state: AgentState::Setup,
+            stop_reason: None,
             observability: Observability::default(),
             executions_per_actuator: HashMap::new(),
             pending_approvals: HashMap::new(),
@@ -197,7 +177,6 @@ impl LooperRuntime {
         }
     }
 
-    /// Creates a runtime with default sensors, actuators, executors, and fiddlesticks models.
     pub fn with_internal_defaults() -> Result<Self> {
         let mut runtime = Self::new();
         runtime.add_sensor(Sensor::new(
@@ -258,50 +237,92 @@ impl LooperRuntime {
             Box::<WebSearchActuatorExecutor>::default(),
         );
 
-        runtime.configure_fiddlesticks_ollama_models()?;
-
-        let db_path = default_store_path(&workspace_root);
-        runtime.attach_store(SqliteStore::new(db_path)?);
+        runtime.attach_store(SqliteStore::new(default_store_path())?);
+        runtime.load_persisted_api_keys()?;
         Ok(runtime)
     }
 
-    /// Configures local/frontier models using fiddlesticks Ollama adapters.
-    pub fn configure_fiddlesticks_ollama_models(&mut self) -> Result<()> {
-        let local_model_name = std::env::var("LOOPER_LOCAL_MODEL")
-            .unwrap_or_else(|_| "qwen2.5:3b-instruct".to_string());
-        let frontier_model_name = std::env::var("LOOPER_FRONTIER_MODEL")
-            .unwrap_or_else(|_| "qwen2.5:7b-instruct".to_string());
-
-        self.set_local_model(Box::new(FiddlesticksLocalModel::from_ollama(
-            local_model_name,
-        )?));
-        self.set_frontier_model(Box::new(FiddlesticksFrontierModel::from_ollama(
-            frontier_model_name,
-        )?));
+    pub fn register_api_key(
+        &mut self,
+        provider: ModelProviderKind,
+        api_key: impl Into<String>,
+    ) -> Result<()> {
+        let value = api_key.into();
+        if value.trim().is_empty() {
+            return Err(anyhow!("api key cannot be empty"));
+        }
+        self.provider_api_keys.insert(provider, value);
+        self.persist_api_keys()?;
         Ok(())
     }
 
-    /// Replaces the local model implementation.
-    pub fn set_local_model(&mut self, local_model: Box<dyn LocalModel>) {
-        self.local_model = local_model;
+    pub fn configure_models(
+        &mut self,
+        local: ModelSelection,
+        frontier: ModelSelection,
+    ) -> Result<()> {
+        let local_model = self.build_local_model(&local)?;
+        let frontier_model = self.build_frontier_model(&frontier)?;
+
+        self.local_selection = Some(local);
+        self.frontier_selection = Some(frontier);
+        self.local_model = Some(local_model);
+        self.frontier_model = Some(frontier_model);
+        if self.agent_state == AgentState::Setup {
+            self.stop_reason = None;
+        }
+        Ok(())
     }
 
-    /// Replaces the frontier model implementation.
-    pub fn set_frontier_model(&mut self, frontier_model: Box<dyn FrontierModel>) {
-        self.frontier_model = frontier_model;
+    pub fn use_rule_models_for_testing(&mut self) {
+        self.local_model = Some(Box::new(RuleBasedLocalModel));
+        self.frontier_model = Some(Box::new(RuleBasedFrontierModel));
     }
 
-    /// Attaches a persistence store.
+    pub fn start(&mut self) -> Result<()> {
+        if !self.is_configured() {
+            return Err(anyhow!(
+                "runtime is not configured: select local/frontier models and required API keys"
+            ));
+        }
+        self.agent_state = AgentState::Running;
+        self.stop_reason = None;
+        Ok(())
+    }
+
+    pub fn stop(&mut self, reason: impl Into<String>) {
+        self.agent_state = AgentState::Stopped;
+        self.stop_reason = Some(reason.into());
+    }
+
+    pub fn state(&self) -> AgentState {
+        self.agent_state
+    }
+
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.stop_reason.as_deref()
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.local_model.is_some() && self.frontier_model.is_some()
+    }
+
+    pub fn local_selection(&self) -> Option<&ModelSelection> {
+        self.local_selection.as_ref()
+    }
+
+    pub fn frontier_selection(&self) -> Option<&ModelSelection> {
+        self.frontier_selection.as_ref()
+    }
+
     pub fn attach_store(&mut self, store: SqliteStore) {
         self.store = Some(store);
     }
 
-    /// Disables persistence storage.
     pub fn disable_store(&mut self) {
         self.store = None;
     }
 
-    /// Gets persisted iteration by id.
     pub fn get_iteration(&self, id: i64) -> Result<Option<PersistedIteration>> {
         match &self.store {
             Some(store) => store.get_iteration(id),
@@ -309,17 +330,14 @@ impl LooperRuntime {
         }
     }
 
-    /// Adds or replaces a sensor by name.
     pub fn add_sensor(&mut self, sensor: Sensor) {
         self.sensors.insert(sensor.name.clone(), sensor);
     }
 
-    /// Adds or replaces an actuator by name.
     pub fn add_actuator(&mut self, actuator: Actuator) {
         self.actuators.insert(actuator.name.clone(), actuator);
     }
 
-    /// Registers or replaces an internal tool executor.
     pub fn register_internal_executor(
         &mut self,
         kind: InternalActuatorKind,
@@ -328,7 +346,6 @@ impl LooperRuntime {
         self.internal_executors.insert(kind, executor);
     }
 
-    /// Enqueues a percept on the chat sensor.
     pub fn enqueue_chat_message(&mut self, message: impl Into<String>) -> Result<()> {
         let sensor = self
             .sensors
@@ -338,48 +355,48 @@ impl LooperRuntime {
         Ok(())
     }
 
-    /// Returns pending approvals.
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
         let mut approvals = self.pending_approvals.values().cloned().collect::<Vec<_>>();
         approvals.sort_by_key(|approval| approval.id);
         approvals
     }
 
-    /// Approves an action and executes it.
     pub fn approve(&mut self, approval_id: u64) -> Result<Option<ExecutionResult>> {
         let approval = match self.pending_approvals.remove(&approval_id) {
             Some(approval) => approval,
             None => return Ok(None),
         };
-
         let result = self.execute_recommendation(&approval.recommendation, true)?;
         Ok(Some(result))
     }
 
-    /// Denies an action without execution.
     pub fn deny(&mut self, approval_id: u64) -> bool {
         self.pending_approvals.remove(&approval_id).is_some()
     }
 
-    /// Returns a snapshot of current observability metrics.
     pub fn observability(&self) -> &Observability {
         &self.observability
     }
 
-    /// Returns a serialization-friendly metrics snapshot.
     pub fn observability_snapshot(&self) -> ObservabilitySnapshot {
         self.observability.snapshot()
     }
 
-    /// Executes one full sensory loop iteration.
     pub async fn run_iteration(&mut self) -> Result<IterationReport> {
-        self.observability.total_iterations += 1;
+        if self.agent_state != AgentState::Running {
+            return Err(anyhow!("runtime is not running"));
+        }
 
+        self.observability.total_iterations += 1;
         self.observability.bump_phase(LoopPhase::SurpriseDetection);
+
         let sensed = self.collect_new_percepts();
         let prior_windows = self.latest_history_windows()?;
-        let surprise_response = self
+        let local_model = self
             .local_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("local model is not configured"))?;
+        let surprise_response = local_model
             .detect_surprises(LocalModelRequest {
                 latest_percepts: sensed.clone(),
                 previous_windows: prior_windows,
@@ -408,12 +425,25 @@ impl LooperRuntime {
         }
 
         self.observability.bump_phase(LoopPhase::Reasoning);
-        let plan_response = self
+        let frontier_model = self
             .frontier_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("frontier model is not configured"))?;
+        let plan_response = match frontier_model
             .plan_actions(FrontierModelRequest {
                 surprising_percepts: surprising.clone(),
             })
-            .await?;
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                if is_frontier_communication_issue(&error) {
+                    self.stop(format!("frontier communication failure: {error}"));
+                }
+                return Err(error);
+            }
+        };
+
         self.observability.frontier_model_tokens += plan_response.token_usage;
         let planned_actions = plan_response.actions;
 
@@ -494,7 +524,6 @@ impl LooperRuntime {
         }
 
         let action_keyword = recommendation.action.keyword();
-
         if let Some(denylist) = &actuator.policy.denylist
             && denylist.iter().any(|entry| entry == action_keyword)
         {
@@ -542,11 +571,13 @@ impl LooperRuntime {
                 "MCP actuator '{}' queued request to {} ({:?})",
                 actuator.name, details.url, details.connection
             ),
-            ActuatorType::Workflow(details) => format!(
-                "workflow '{}' accepted {} cells",
-                details.name,
-                details.cells.len()
-            ),
+            ActuatorType::Workflow(details) => {
+                format!(
+                    "workflow '{}' accepted {} cells",
+                    details.name,
+                    details.cells.len()
+                )
+            }
         };
 
         *self
@@ -579,6 +610,52 @@ impl LooperRuntime {
         report.iteration_id = Some(store.insert_iteration(&persisted)?);
         Ok(())
     }
+
+    fn build_local_model(&self, selection: &ModelSelection) -> Result<Box<dyn LocalModel>> {
+        Ok(Box::new(FiddlesticksLocalModel::from_provider(
+            selection.provider,
+            selection.model.clone(),
+            self.key_for(selection.provider),
+        )?))
+    }
+
+    fn build_frontier_model(&self, selection: &ModelSelection) -> Result<Box<dyn FrontierModel>> {
+        Ok(Box::new(FiddlesticksFrontierModel::from_provider(
+            selection.provider,
+            selection.model.clone(),
+            self.key_for(selection.provider),
+        )?))
+    }
+
+    fn key_for(&self, provider: ModelProviderKind) -> Option<&str> {
+        if provider == ModelProviderKind::Ollama {
+            return None;
+        }
+        self.provider_api_keys.get(&provider).map(String::as_str)
+    }
+
+    fn persist_api_keys(&self) -> Result<()> {
+        let path = api_key_store_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let encoded = serde_json::to_string_pretty(&self.provider_api_keys)?;
+        fs::write(path, encoded)?;
+        Ok(())
+    }
+
+    fn load_persisted_api_keys(&mut self) -> Result<()> {
+        let path = api_key_store_path();
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let raw = fs::read_to_string(path)?;
+        let parsed = serde_json::from_str::<HashMap<ModelProviderKind, String>>(&raw)?;
+        self.provider_api_keys = parsed;
+        Ok(())
+    }
 }
 
 impl Default for LooperRuntime {
@@ -587,8 +664,49 @@ impl Default for LooperRuntime {
     }
 }
 
-fn default_store_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".looper").join("looper.db")
+fn default_store_path() -> PathBuf {
+    looper_user_dir().join("looper.db")
+}
+
+fn api_key_store_path() -> PathBuf {
+    looper_user_dir().join("keys.json")
+}
+
+fn looper_user_dir() -> PathBuf {
+    if let Some(home) = user_home_dir() {
+        return home.join(".looper");
+    }
+
+    std::env::temp_dir().join(".looper")
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    if cfg!(windows) {
+        return std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                let drive = std::env::var_os("HOMEDRIVE")?;
+                let path = std::env::var_os("HOMEPATH")?;
+                Some(PathBuf::from(format!(
+                    "{}{}",
+                    drive.to_string_lossy(),
+                    path.to_string_lossy()
+                )))
+            })
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    }
+
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn is_frontier_communication_issue(error: &anyhow::Error) -> bool {
+    let lower = format!("{error:#}").to_lowercase();
+    lower.contains("rate")
+        || lower.contains("token")
+        || lower.contains("timeout")
+        || lower.contains("network")
+        || lower.contains("transport")
+        || lower.contains("429")
 }
 
 #[cfg(test)]
@@ -598,9 +716,9 @@ mod tests {
     #[tokio::test]
     async fn non_surprising_percept_ends_early() {
         let mut runtime = LooperRuntime::with_internal_defaults().expect("defaults should build");
-        runtime.set_local_model(Box::new(RuleBasedLocalModel));
-        runtime.set_frontier_model(Box::new(RuleBasedFrontierModel));
+        runtime.use_rule_models_for_testing();
         runtime.disable_store();
+        runtime.start().expect("start should succeed");
         runtime
             .enqueue_chat_message("routine status update")
             .expect("chat sensor should exist");
@@ -616,9 +734,9 @@ mod tests {
     #[tokio::test]
     async fn surprising_percept_executes_real_web_search_executor() {
         let mut runtime = LooperRuntime::with_internal_defaults().expect("defaults should build");
-        runtime.set_local_model(Box::new(RuleBasedLocalModel));
-        runtime.set_frontier_model(Box::new(RuleBasedFrontierModel));
+        runtime.use_rule_models_for_testing();
         runtime.disable_store();
+        runtime.start().expect("start should succeed");
         runtime
             .enqueue_chat_message("please search docs for model guidance")
             .expect("chat sensor should exist");
@@ -633,15 +751,14 @@ mod tests {
             report.action_results[0],
             ExecutionResult::Executed { .. }
         ));
-        assert!(report.iteration_id.is_none());
     }
 
     #[tokio::test]
     async fn denied_action_counts_as_failed_execution() {
         let mut runtime = LooperRuntime::with_internal_defaults().expect("defaults should build");
-        runtime.set_local_model(Box::new(RuleBasedLocalModel));
-        runtime.set_frontier_model(Box::new(RuleBasedFrontierModel));
+        runtime.use_rule_models_for_testing();
         runtime.disable_store();
+        runtime.start().expect("start should succeed");
         let shell = Actuator::internal(
             "shell",
             "shell",

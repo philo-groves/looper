@@ -3,6 +3,39 @@ use std::collections::VecDeque;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+/// Supported model providers for Looper configuration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelProviderKind {
+    /// Local Ollama provider.
+    Ollama,
+    /// OpenAI provider.
+    OpenAi,
+    /// OpenCode Zen provider.
+    OpenCodeZen,
+}
+
+/// Current lifecycle state of the Looper agent.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    /// Agent is not yet configured for first run.
+    Setup,
+    /// Agent is actively looping.
+    Running,
+    /// Agent is stopped and cannot operate until restarted.
+    Stopped,
+}
+
+/// Model selection for a loop phase.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelSelection {
+    /// Provider backing the selected model.
+    pub provider: ModelProviderKind,
+    /// Provider-specific model identifier.
+    pub model: String,
+}
+
 /// A single unit of perception received from a sensor.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Percept {

@@ -10,7 +10,7 @@ use tokio::select;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::dto::{ActuatorCreateRequest, SensorCreateRequest};
-use crate::model::ExecutionResult;
+use crate::model::{AgentState, ExecutionResult, ModelProviderKind, ModelSelection};
 use crate::runtime::{LooperRuntime, ObservabilitySnapshot};
 use crate::storage::PersistedIteration;
 
@@ -38,10 +38,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sensors", post(add_sensor_handler))
         .route("/api/actuators", post(add_actuator_handler))
         .route("/api/percepts/chat", post(add_chat_percept_handler))
+        .route("/api/config/keys", post(register_api_key_handler))
+        .route("/api/config/models", post(configure_models_handler))
         .route("/api/metrics", get(metrics_handler))
         .route("/api/loop/start", post(loop_start_handler))
         .route("/api/loop/stop", post(loop_stop_handler))
         .route("/api/loop/status", get(loop_status_handler))
+        .route("/api/state", get(state_handler))
         .route("/api/iterations/{id}", get(get_iteration_handler))
         .route("/api/approvals", get(list_approvals_handler))
         .route("/api/approvals/{id}/approve", post(approve_handler))
@@ -117,12 +120,48 @@ pub async fn metrics_handler(
     Ok(Json(runtime.observability_snapshot()))
 }
 
+/// Registers a provider API key.
+pub async fn register_api_key_handler(
+    State(state): State<AppState>,
+    Json(request): Json<ApiKeyRequest>,
+) -> Result<Json<SimpleStatusResponse>, (StatusCode, Json<ApiError>)> {
+    let mut runtime = state.runtime.lock().await;
+    runtime
+        .register_api_key(request.provider, request.api_key)
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(SimpleStatusResponse {
+        status: "ok".to_string(),
+    }))
+}
+
+/// Configures local and frontier model selections.
+pub async fn configure_models_handler(
+    State(state): State<AppState>,
+    Json(request): Json<ModelConfigRequest>,
+) -> Result<Json<SimpleStatusResponse>, (StatusCode, Json<ApiError>)> {
+    let mut runtime = state.runtime.lock().await;
+    runtime
+        .configure_models(request.local, request.frontier)
+        .map_err(|error| bad_request(error.to_string()))?;
+
+    Ok(Json(SimpleStatusResponse {
+        status: "ok".to_string(),
+    }))
+}
+
 /// Starts continuous loop execution.
 pub async fn loop_start_handler(
     State(state): State<AppState>,
     Json(request): Json<LoopStartRequest>,
 ) -> Result<Json<LoopStatusResponse>, (StatusCode, Json<ApiError>)> {
     let interval_ms = request.interval_ms.unwrap_or(200);
+
+    {
+        let mut runtime = state.runtime.lock().await;
+        runtime
+            .start()
+            .map_err(|error| bad_request(error.to_string()))?;
+    }
 
     {
         let loop_control = state.loop_control.lock().await;
@@ -189,6 +228,9 @@ pub async fn loop_stop_handler(
         let _ = handle.await;
     }
 
+    let mut runtime = state.runtime.lock().await;
+    runtime.stop("manually stopped");
+
     let loop_control = state.loop_control.lock().await;
     Ok(Json(loop_control.status_response()))
 }
@@ -199,6 +241,20 @@ pub async fn loop_status_handler(
 ) -> Result<Json<LoopStatusResponse>, (StatusCode, Json<ApiError>)> {
     let loop_control = state.loop_control.lock().await;
     Ok(Json(loop_control.status_response()))
+}
+
+/// Returns high-level agent state.
+pub async fn state_handler(
+    State(state): State<AppState>,
+) -> Result<Json<AgentStateResponse>, (StatusCode, Json<ApiError>)> {
+    let runtime = state.runtime.lock().await;
+    Ok(Json(AgentStateResponse {
+        state: runtime.state(),
+        reason: runtime.stop_reason().map(str::to_string),
+        configured: runtime.is_configured(),
+        local_selection: runtime.local_selection().cloned(),
+        frontier_selection: runtime.frontier_selection().cloned(),
+    }))
 }
 
 /// Returns one persisted iteration.
@@ -298,6 +354,39 @@ pub struct LoopStatusResponse {
     pub running: bool,
     /// Current loop interval in milliseconds.
     pub interval_ms: u64,
+}
+
+/// Request payload for registering an API key.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ApiKeyRequest {
+    /// Provider receiving the key.
+    pub provider: ModelProviderKind,
+    /// API key value.
+    pub api_key: String,
+}
+
+/// Request payload for configuring local/frontier models.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ModelConfigRequest {
+    /// Local model selection.
+    pub local: ModelSelection,
+    /// Frontier model selection.
+    pub frontier: ModelSelection,
+}
+
+/// Agent state response payload.
+#[derive(Clone, Debug, Serialize)]
+pub struct AgentStateResponse {
+    /// Current agent state.
+    pub state: AgentState,
+    /// Optional stop reason.
+    pub reason: Option<String>,
+    /// Whether required model config is present.
+    pub configured: bool,
+    /// Current local selection.
+    pub local_selection: Option<ModelSelection>,
+    /// Current frontier selection.
+    pub frontier_selection: Option<ModelSelection>,
 }
 
 /// Successful mutation response payload.

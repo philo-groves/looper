@@ -10,7 +10,7 @@ use fiddlesticks::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Action, Percept, RecommendedAction};
+use crate::model::{Action, ModelProviderKind, Percept, RecommendedAction};
 
 /// Input contract for local surprise-detection model.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -202,12 +202,13 @@ pub struct FiddlesticksLocalModel {
 }
 
 impl FiddlesticksLocalModel {
-    /// Builds a local model adapter backed by Ollama.
-    pub fn from_ollama(model: impl Into<String>) -> Result<Self> {
-        let provider = build_provider_with_config(
-            ProviderBuildConfig::new(ProviderId::Ollama, "").with_timeout(Duration::from_secs(120)),
-        )
-        .map_err(|error| anyhow!("failed to build ollama provider: {error}"))?;
+    /// Builds a local model adapter backed by a configured provider.
+    pub fn from_provider(
+        provider_kind: ModelProviderKind,
+        model: impl Into<String>,
+        api_key: Option<&str>,
+    ) -> Result<Self> {
+        let provider = build_provider(provider_kind, api_key, Duration::from_secs(120))?;
 
         Ok(Self {
             provider,
@@ -238,12 +239,13 @@ pub struct FiddlesticksFrontierModel {
 }
 
 impl FiddlesticksFrontierModel {
-    /// Builds a frontier model adapter backed by Ollama.
-    pub fn from_ollama(model: impl Into<String>) -> Result<Self> {
-        let provider = build_provider_with_config(
-            ProviderBuildConfig::new(ProviderId::Ollama, "").with_timeout(Duration::from_secs(180)),
-        )
-        .map_err(|error| anyhow!("failed to build ollama provider: {error}"))?;
+    /// Builds a frontier model adapter backed by a configured provider.
+    pub fn from_provider(
+        provider_kind: ModelProviderKind,
+        model: impl Into<String>,
+        api_key: Option<&str>,
+    ) -> Result<Self> {
+        let provider = build_provider(provider_kind, api_key, Duration::from_secs(180))?;
 
         Ok(Self {
             provider,
@@ -331,4 +333,20 @@ fn estimate_tokens(percepts: &[Percept]) -> u64 {
         .iter()
         .map(|percept| (percept.content.split_whitespace().count() as u64) + 4)
         .sum()
+}
+
+fn build_provider(
+    provider_kind: ModelProviderKind,
+    api_key: Option<&str>,
+    timeout: Duration,
+) -> Result<Arc<dyn ModelProvider>> {
+    let provider_id = match provider_kind {
+        ModelProviderKind::Ollama => ProviderId::Ollama,
+        ModelProviderKind::OpenAi => ProviderId::OpenAi,
+        ModelProviderKind::OpenCodeZen => ProviderId::OpenCodeZen,
+    };
+
+    let key = api_key.unwrap_or_default();
+    build_provider_with_config(ProviderBuildConfig::new(provider_id, key).with_timeout(timeout))
+        .map_err(|error| anyhow!("failed to build {provider_kind:?} provider: {error}"))
 }

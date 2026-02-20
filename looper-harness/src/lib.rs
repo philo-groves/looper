@@ -15,9 +15,9 @@ pub use executors::{
 };
 pub use http::{AppState, build_router};
 pub use model::{
-    Action, Actuator, ActuatorType, ExecutionResult, InternalActuatorKind, McpConnectionType,
-    McpDetails, PendingApproval, Percept, RateLimit, RateLimitPeriod, RecommendedAction,
-    SafetyPolicy, Sensor, WorkflowDetails,
+    Action, Actuator, ActuatorType, AgentState, ExecutionResult, InternalActuatorKind,
+    McpConnectionType, McpDetails, ModelProviderKind, ModelSelection, PendingApproval, Percept,
+    RateLimit, RateLimitPeriod, RecommendedAction, SafetyPolicy, Sensor, WorkflowDetails,
 };
 pub use models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,
