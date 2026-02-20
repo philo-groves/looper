@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Result, anyhow};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::executors::{
     ActuatorExecutor, ChatActuatorExecutor, GlobActuatorExecutor, GrepActuatorExecutor,
@@ -114,7 +114,7 @@ impl Observability {
 }
 
 /// Serialization-friendly observability payload.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ObservabilitySnapshot {
     pub phase_execution_counts: HashMap<String, u64>,
     pub local_model_tokens: u64,
@@ -180,6 +180,14 @@ impl LooperRuntime {
     }
 
     pub fn with_internal_defaults() -> Result<Self> {
+        let workspace_root = std::env::current_dir()?;
+        Self::with_internal_defaults_for_workspace(workspace_root)
+    }
+
+    /// Builds a runtime with default sensors/actuators for a fixed workspace root.
+    pub fn with_internal_defaults_for_workspace(
+        workspace_root: impl Into<PathBuf>,
+    ) -> Result<Self> {
         let mut runtime = Self::new();
         runtime.add_sensor(Sensor::with_sensitivity_score(
             "chat",
@@ -218,7 +226,7 @@ impl LooperRuntime {
             SafetyPolicy::default(),
         )?);
 
-        let workspace_root = std::env::current_dir()?;
+        let workspace_root = workspace_root.into();
         runtime.register_internal_executor(
             InternalActuatorKind::Chat,
             Box::<ChatActuatorExecutor>::default(),
@@ -250,8 +258,8 @@ impl LooperRuntime {
         provider: ModelProviderKind,
         api_key: impl Into<String>,
     ) -> Result<()> {
-        let value = api_key.into();
-        if value.trim().is_empty() {
+        let value = normalize_api_key_value(&api_key.into());
+        if value.is_empty() {
             return Err(anyhow!("api key cannot be empty"));
         }
         self.provider_api_keys.insert(provider, value);
@@ -329,6 +337,26 @@ impl LooperRuntime {
     pub fn get_iteration(&self, id: i64) -> Result<Option<PersistedIteration>> {
         match &self.store {
             Some(store) => store.get_iteration(id),
+            None => Ok(None),
+        }
+    }
+
+    /// Lists persisted iterations after an optional id.
+    pub fn list_iterations_after(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PersistedIteration>> {
+        match &self.store {
+            Some(store) => store.list_iterations_after(after_id, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Returns the latest persisted iteration id.
+    pub fn latest_iteration_id(&self) -> Result<Option<i64>> {
+        match &self.store {
+            Some(store) => store.latest_iteration_id(),
             None => Ok(None),
         }
     }
@@ -674,7 +702,17 @@ impl LooperRuntime {
 
         let raw = fs::read_to_string(path)?;
         let parsed = serde_json::from_str::<HashMap<ModelProviderKind, String>>(&raw)?;
-        self.provider_api_keys = parsed;
+        self.provider_api_keys = parsed
+            .into_iter()
+            .filter_map(|(provider, key)| {
+                let normalized = normalize_api_key_value(&key);
+                if normalized.is_empty() {
+                    None
+                } else {
+                    Some((provider, normalized))
+                }
+            })
+            .collect();
         Ok(())
     }
 }
@@ -718,6 +756,20 @@ fn user_home_dir() -> Option<PathBuf> {
     }
 
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn normalize_api_key_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let unprefixed = trimmed
+        .strip_prefix("Bearer ")
+        .or_else(|| trimmed.strip_prefix("bearer "))
+        .unwrap_or(trimmed);
+    let unquoted = unprefixed
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+    unquoted.to_string()
 }
 
 fn is_frontier_communication_issue(error: &anyhow::Error) -> bool {

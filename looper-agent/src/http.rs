@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -41,15 +41,29 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/config/keys", post(register_api_key_handler))
         .route("/api/config/models", post(configure_models_handler))
         .route("/api/metrics", get(metrics_handler))
+        .route("/api/health", get(health_handler))
         .route("/api/loop/start", post(loop_start_handler))
         .route("/api/loop/stop", post(loop_stop_handler))
         .route("/api/loop/status", get(loop_status_handler))
         .route("/api/state", get(state_handler))
+        .route("/api/iterations", get(list_iterations_handler))
         .route("/api/iterations/{id}", get(get_iteration_handler))
         .route("/api/approvals", get(list_approvals_handler))
         .route("/api/approvals/{id}/approve", post(approve_handler))
         .route("/api/approvals/{id}/deny", post(deny_handler))
         .with_state(state)
+}
+
+/// Basic health payload.
+#[derive(Clone, Debug, Serialize)]
+pub struct HealthResponse {
+    /// Health status value.
+    pub status: &'static str,
+}
+
+/// Returns process health.
+pub async fn health_handler() -> Json<HealthResponse> {
+    Json(HealthResponse { status: "ok" })
 }
 
 /// Handles sensor registration.
@@ -248,12 +262,16 @@ pub async fn state_handler(
     State(state): State<AppState>,
 ) -> Result<Json<AgentStateResponse>, (StatusCode, Json<ApiError>)> {
     let runtime = state.runtime.lock().await;
+    let latest_iteration_id = runtime
+        .latest_iteration_id()
+        .map_err(|error| internal_error(error.to_string()))?;
     Ok(Json(AgentStateResponse {
         state: runtime.state(),
         reason: runtime.stop_reason().map(str::to_string),
         configured: runtime.is_configured(),
         local_selection: runtime.local_selection().cloned(),
         frontier_selection: runtime.frontier_selection().cloned(),
+        latest_iteration_id,
     }))
 }
 
@@ -276,6 +294,36 @@ pub async fn get_iteration_handler(
             }),
         )),
     }
+}
+
+/// Query payload for listing iterations.
+#[derive(Clone, Debug, Deserialize)]
+pub struct IterationListQuery {
+    /// Return iterations with id greater than this value.
+    pub after_id: Option<i64>,
+    /// Maximum number of iterations to return.
+    pub limit: Option<usize>,
+}
+
+/// Response payload for listing iterations.
+#[derive(Clone, Debug, Serialize)]
+pub struct IterationsResponse {
+    /// Ordered list of persisted iterations.
+    pub iterations: Vec<PersistedIteration>,
+}
+
+/// Lists persisted iterations, optionally filtered by id.
+pub async fn list_iterations_handler(
+    State(state): State<AppState>,
+    Query(query): Query<IterationListQuery>,
+) -> Result<Json<IterationsResponse>, (StatusCode, Json<ApiError>)> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let runtime = state.runtime.lock().await;
+    let iterations = runtime
+        .list_iterations_after(query.after_id, limit)
+        .map_err(|error| internal_error(error.to_string()))?;
+
+    Ok(Json(IterationsResponse { iterations }))
 }
 
 /// Lists currently pending approvals.
@@ -387,6 +435,8 @@ pub struct AgentStateResponse {
     pub local_selection: Option<ModelSelection>,
     /// Current frontier selection.
     pub frontier_selection: Option<ModelSelection>,
+    /// Latest persisted iteration id.
+    pub latest_iteration_id: Option<i64>,
 }
 
 /// Successful mutation response payload.

@@ -95,6 +95,78 @@ impl SqliteStore {
         }))
     }
 
+    /// Lists up to `limit` iterations with ids greater than `after_id`.
+    pub fn list_iterations_after(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PersistedIteration>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT id, created_at_unix, sensed_percepts, surprising_percepts, planned_actions, action_results
+             FROM iterations
+             WHERE (?1 IS NULL OR id > ?1)
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?;
+
+        let rows = statement.query_map(params![after_id, limit as i64], |row| {
+            let sensed_raw: String = row.get(2)?;
+            let surprising_raw: String = row.get(3)?;
+            let planned_raw: String = row.get(4)?;
+            let results_raw: String = row.get(5)?;
+
+            let iteration = PersistedIteration {
+                id: row.get(0)?,
+                created_at_unix: row.get(1)?,
+                sensed_percepts: serde_json::from_str(&sensed_raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                surprising_percepts: serde_json::from_str(&surprising_raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                planned_actions: serde_json::from_str(&planned_raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                action_results: serde_json::from_str(&results_raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        5,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+            };
+
+            Ok(iteration)
+        })?;
+
+        let mut iterations = Vec::new();
+        for row in rows {
+            iterations.push(row?);
+        }
+        Ok(iterations)
+    }
+
+    /// Returns the latest stored iteration id, if any.
+    pub fn latest_iteration_id(&self) -> Result<Option<i64>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare("SELECT MAX(id) FROM iterations")?;
+        let latest = statement.query_row([], |row| row.get(0))?;
+        Ok(latest)
+    }
+
     /// Returns up to `limit` previous windows of percept text.
     pub fn latest_percept_windows(&self, limit: usize) -> Result<Vec<Vec<String>>> {
         let conn = self.connection()?;

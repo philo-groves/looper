@@ -5,8 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0"
-looper-harness = { path = "../looper-harness" }
-axum = "0.8"
+looper-agent = { path = "../looper-agent" }
 tokio = { version = "=1.48.0", features = ["macros", "rt-multi-thread", "net"] }
 ratatui = "0.29"
 ratatui-widgets = "0.3"

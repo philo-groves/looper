@@ -1,3 +1,4 @@
+use std::env;
 use std::io;
 use std::io::Write;
 use std::process::Command;
@@ -14,9 +15,9 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fiddlesticks::{ProviderId, list_models_with_api_key};
-use looper_harness::{
-    AgentState, AppState, ExecutionResult, LooperRuntime, ModelProviderKind, ModelSelection,
-    build_router,
+use looper_agent::{
+    AgentState, ExecutionResult, ModelProviderKind, ModelSelection, ObservabilitySnapshot,
+    PersistedIteration,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -34,7 +35,9 @@ async fn main() -> Result<()> {
     clear_terminal_log();
     let args = std::env::args().skip(1).collect::<Vec<String>>();
     if matches!(args.first().map(String::as_str), Some("serve")) {
-        return run_server().await;
+        return Err(anyhow!(
+            "server mode was removed. Run looper-agent for the background process"
+        ));
     }
 
     if !args.is_empty() {
@@ -44,44 +47,201 @@ async fn main() -> Result<()> {
     run_tui().await
 }
 
-async fn run_server() -> Result<()> {
-    append_terminal_log("starting server mode");
-    let runtime = LooperRuntime::with_internal_defaults()?;
-    let state = AppState::new(runtime);
-    let app = build_router(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:10001").await?;
-    println!("looper-terminal server listening on http://127.0.0.1:10001");
-    axum::serve(listener, app).await?;
+async fn run_one_shot(message: String) -> Result<()> {
+    append_terminal_log(&format!("starting one-shot mode message={}", message));
+    let client = AgentClient::new(default_agent_base_url());
+    client.health().await?;
+    client.enqueue_chat_message(message).await?;
+    println!("message accepted by looper-agent");
     Ok(())
 }
 
-async fn run_one_shot(message: String) -> Result<()> {
-    append_terminal_log(&format!("starting one-shot mode message={}", message));
-    let mut runtime = LooperRuntime::with_internal_defaults()?;
-    configure_runtime_from_env(&mut runtime)?;
-    runtime.start()?;
-    runtime.enqueue_chat_message(message)?;
-    let report = runtime.run_iteration().await?;
+#[derive(Clone)]
+struct AgentClient {
+    base_url: String,
+    http: reqwest::Client,
+}
 
-    println!("sensed percepts: {}", report.sensed_percepts.len());
-    println!("surprising percepts: {}", report.surprising_percepts.len());
-    println!("planned actions: {}", report.planned_actions.len());
-    for (index, result) in report.action_results.iter().enumerate() {
-        match result {
-            ExecutionResult::Executed { output } => {
-                println!("action {}: executed", index + 1);
-                println!("output:\n{output}");
-            }
-            ExecutionResult::Denied(reason) => println!("action {}: denied ({reason})", index + 1),
-            ExecutionResult::RequiresHitl { approval_id } => {
-                println!(
-                    "action {}: requires HITL (approval id: {approval_id})",
-                    index + 1
-                )
-            }
+impl AgentClient {
+    fn new(base_url: String) -> Self {
+        Self {
+            base_url,
+            http: reqwest::Client::new(),
         }
     }
-    Ok(())
+
+    async fn health(&self) -> Result<()> {
+        let response = self
+            .http
+            .get(format!("{}/api/health", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?;
+        let body = response.json::<HealthResponse>().await?;
+        if body.status != "ok" {
+            return Err(anyhow!("agent reported unhealthy status: {}", body.status));
+        }
+        Ok(())
+    }
+
+    async fn state(&self) -> Result<AgentStateResponse> {
+        Ok(self
+            .http
+            .get(format!("{}/api/state", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    async fn metrics(&self) -> Result<ObservabilitySnapshot> {
+        Ok(self
+            .http
+            .get(format!("{}/api/metrics", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    async fn enqueue_chat_message(&self, message: String) -> Result<()> {
+        self.http
+            .post(format!("{}/api/percepts/chat", self.base_url))
+            .json(&ChatPerceptRequest { message })
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    async fn register_api_key(&self, provider: ModelProviderKind, api_key: String) -> Result<()> {
+        let response = self
+            .http
+            .post(format!("{}/api/config/keys", self.base_url))
+            .json(&ApiKeyRequest { provider, api_key })
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("register key failed ({status}): {body}"));
+        }
+        Ok(())
+    }
+
+    async fn configure_models(
+        &self,
+        local: ModelSelection,
+        frontier: ModelSelection,
+    ) -> Result<()> {
+        let response = self
+            .http
+            .post(format!("{}/api/config/models", self.base_url))
+            .json(&ModelConfigRequest { local, frontier })
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("configure models failed ({status}): {body}"));
+        }
+        Ok(())
+    }
+
+    async fn start_loop(&self, interval_ms: u64) -> Result<LoopStatusResponse> {
+        Ok(self
+            .http
+            .post(format!("{}/api/loop/start", self.base_url))
+            .json(&LoopStartRequest {
+                interval_ms: Some(interval_ms),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    async fn loop_status(&self) -> Result<LoopStatusResponse> {
+        Ok(self
+            .http
+            .get(format!("{}/api/loop/status", self.base_url))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    async fn list_iterations_after(
+        &self,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PersistedIteration>> {
+        let response = self
+            .http
+            .get(format!("{}/api/iterations", self.base_url))
+            .query(&[("after_id", after_id), ("limit", Some(limit as i64))])
+            .send()
+            .await?
+            .error_for_status()?;
+        let body = response.json::<IterationsResponse>().await?;
+        Ok(body.iterations)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct HealthResponse {
+    status: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AgentStateResponse {
+    state: AgentState,
+    reason: Option<String>,
+    configured: bool,
+    local_selection: Option<ModelSelection>,
+    frontier_selection: Option<ModelSelection>,
+    latest_iteration_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LoopStatusResponse {
+    running: bool,
+    interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct IterationsResponse {
+    iterations: Vec<PersistedIteration>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ChatPerceptRequest {
+    message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ApiKeyRequest {
+    provider: ModelProviderKind,
+    api_key: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ModelConfigRequest {
+    local: ModelSelection,
+    frontier: ModelSelection,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LoopStartRequest {
+    interval_ms: Option<u64>,
+}
+
+fn default_agent_base_url() -> String {
+    env::var("LOOPER_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:10001".to_string())
 }
 
 async fn run_tui() -> Result<()> {
@@ -115,7 +275,17 @@ enum SetupStep {
 }
 
 struct App {
-    runtime: LooperRuntime,
+    client: AgentClient,
+    agent_state: AgentState,
+    configured: bool,
+    local_selection: Option<ModelSelection>,
+    frontier_selection: Option<ModelSelection>,
+    observability: ObservabilitySnapshot,
+    latest_iteration_id: Option<i64>,
+    iterations_initialized: bool,
+    stop_reason: Option<String>,
+    loop_running: bool,
+    loop_interval_ms: u64,
     step: SetupStep,
     ollama_catalog_models: Vec<String>,
     ollama_catalog_tagged_models: Vec<String>,
@@ -151,8 +321,23 @@ fn default_local_provider() -> ModelProviderKind {
     ModelProviderKind::Ollama
 }
 
+fn empty_observability_snapshot() -> ObservabilitySnapshot {
+    ObservabilitySnapshot {
+        phase_execution_counts: Default::default(),
+        local_model_tokens: 0,
+        frontier_model_tokens: 0,
+        false_positive_surprises: 0,
+        false_positive_surprise_percent: 0.0,
+        failed_tool_executions: 0,
+        failed_tool_execution_percent: 0.0,
+        total_iterations: 0,
+        loops_per_minute: 0.0,
+    }
+}
+
 impl App {
     async fn new() -> Result<Self> {
+        let client = AgentClient::new(default_agent_base_url());
         let catalog = scrape_ollama_library_base_models()
             .await
             .unwrap_or_else(|_| {
@@ -170,7 +355,17 @@ impl App {
             .unwrap_or(0);
 
         let mut app = Self {
-            runtime: LooperRuntime::with_internal_defaults()?,
+            client,
+            agent_state: AgentState::Setup,
+            configured: false,
+            local_selection: None,
+            frontier_selection: None,
+            observability: empty_observability_snapshot(),
+            latest_iteration_id: None,
+            iterations_initialized: false,
+            stop_reason: None,
+            loop_running: false,
+            loop_interval_ms: 0,
             step: SetupStep::LocalProvider,
             ollama_catalog_models: catalog,
             ollama_catalog_tagged_models: tagged_catalog,
@@ -193,10 +388,20 @@ impl App {
             loops_per_minute_history: vec![0.0],
         };
 
+        if let Err(error) = app.refresh_agent_status().await {
+            app.status = format!("Could not reach looper-agent: {error}");
+        }
+
         if let Some(config) = read_persisted_setup_config()? {
             app.apply_persisted_setup_config(config.clone()).await;
-            if let Err(error) = app.try_start_from_persisted_setup(config) {
-                app.status = format!("Could not auto-start from saved setup: {error}");
+            match app.try_start_from_persisted_setup(config).await {
+                Ok(()) => {
+                    app.status = "Restored setup and started in running mode".to_string();
+                }
+                Err(error) => {
+                    app.status =
+                        format!("Restored setup selections, but auto-start failed: {error}");
+                }
             }
         }
 
@@ -276,31 +481,97 @@ impl App {
         self.status = "Restored previous setup selections".to_string();
     }
 
-    fn try_start_from_persisted_setup(&mut self, config: PersistedSetupConfig) -> Result<()> {
-        let local_model = config.local_model;
-        let frontier_provider = config.frontier_provider;
-        let frontier_model = config.frontier_model;
+    async fn refresh_agent_status(&mut self) -> Result<()> {
+        self.client.health().await?;
 
-        self.runtime.configure_models(
-            ModelSelection {
-                provider: ModelProviderKind::Ollama,
-                model: local_model,
-            },
-            ModelSelection {
-                provider: frontier_provider,
-                model: frontier_model,
-            },
-        )?;
-        self.runtime.start()?;
-        self.status = "Restored setup and started in running mode".to_string();
+        let state = self.client.state().await?;
+        if !self.iterations_initialized {
+            self.latest_iteration_id = state.latest_iteration_id;
+            self.iterations_initialized = true;
+        }
+        self.agent_state = state.state;
+        self.configured = state.configured;
+        self.local_selection = state.local_selection;
+        self.frontier_selection = state.frontier_selection;
+        self.stop_reason = state.reason;
+
+        self.observability = self.client.metrics().await?;
+        self.record_loops_per_minute(self.observability.loops_per_minute);
+
+        let loop_status = self.client.loop_status().await?;
+        self.loop_running = loop_status.running;
+        self.loop_interval_ms = loop_status.interval_ms;
+
+        let new_iterations = self
+            .client
+            .list_iterations_after(self.latest_iteration_id, 100)
+            .await?;
+        self.consume_iterations(new_iterations);
+
         Ok(())
+    }
+
+    async fn try_start_from_persisted_setup(&mut self, config: PersistedSetupConfig) -> Result<()> {
+        if config.frontier_provider != ModelProviderKind::Ollama {
+            let normalized_key = normalize_api_key_value(&self.frontier_api_key);
+            if !normalized_key.is_empty() {
+                self.client
+                    .register_api_key(config.frontier_provider, normalized_key)
+                    .await?;
+            }
+        }
+
+        self.client
+            .configure_models(
+                ModelSelection {
+                    provider: ModelProviderKind::Ollama,
+                    model: config.local_model,
+                },
+                ModelSelection {
+                    provider: config.frontier_provider,
+                    model: config.frontier_model,
+                },
+            )
+            .await?;
+        self.client.start_loop(500).await?;
+        self.refresh_agent_status().await?;
+        Ok(())
+    }
+
+    fn consume_iterations(&mut self, iterations: Vec<PersistedIteration>) {
+        for iteration in iterations {
+            self.latest_iteration_id = Some(iteration.id);
+            self.latest_loop_state_log = format!(
+                "loop: sensed={} surprising={} actions={}",
+                iteration.sensed_percepts.len(),
+                iteration.surprising_percepts.len(),
+                iteration.action_results.len()
+            );
+
+            for result in &iteration.action_results {
+                match result {
+                    ExecutionResult::Executed { output } if !output.trim().is_empty() => {
+                        self.push_looper_message(output.trim());
+                    }
+                    ExecutionResult::Denied(reason) => {
+                        self.push_looper_message(&format!("action denied ({reason})"));
+                    }
+                    ExecutionResult::RequiresHitl { approval_id } => {
+                        self.push_looper_message(&format!(
+                            "action requires HITL (approval id: {approval_id})"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         let mut last_tick = Instant::now();
         loop {
             terminal.draw(|frame| {
-                if self.runtime.state() == AgentState::Setup {
+                if self.agent_state == AgentState::Setup {
                     self.draw_setup(frame);
                 } else {
                     self.draw_runtime(frame);
@@ -310,8 +581,16 @@ impl App {
             if event::poll(Duration::from_millis(60))? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if self.handle_key(key.code, key.modifiers).await? {
-                            break;
+                        match self.handle_key(key.code, key.modifiers).await {
+                            Ok(should_exit) => {
+                                if should_exit {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                self.status = format!("input error: {error}");
+                                append_terminal_log(&self.status);
+                            }
                         }
                     }
                     Event::Paste(text) => {
@@ -321,49 +600,10 @@ impl App {
                 }
             }
 
-            if self.runtime.state() == AgentState::Running
-                && last_tick.elapsed() >= Duration::from_millis(500)
-            {
-                match self.runtime.run_iteration().await {
-                    Ok(report) => {
-                        self.status = format!(
-                            "loop: sensed={} surprising={} actions={}",
-                            report.sensed_percepts.len(),
-                            report.surprising_percepts.len(),
-                            report.action_results.len()
-                        );
-                        self.latest_loop_state_log = self.status.clone();
-                        for result in &report.action_results {
-                            match result {
-                                ExecutionResult::Executed { output }
-                                    if !output.trim().is_empty() =>
-                                {
-                                    self.push_looper_message(output.trim());
-                                }
-                                ExecutionResult::Denied(reason) => {
-                                    self.push_looper_message(&format!("action denied ({reason})"));
-                                }
-                                ExecutionResult::RequiresHitl { approval_id } => {
-                                    self.push_looper_message(&format!(
-                                        "action requires HITL (approval id: {approval_id})"
-                                    ));
-                                }
-                                _ => {}
-                            }
-                        }
-                        if report.sensed_percepts.len() > 0
-                            || report.surprising_percepts.len() > 0
-                            || report.action_results.len() > 0
-                        {
-                            append_terminal_log(&self.status);
-                        }
-                        let observability = self.runtime.observability_snapshot();
-                        self.record_loops_per_minute(observability.loops_per_minute);
-                    }
-                    Err(error) => {
-                        self.status = format!("loop error: {error}");
-                        append_terminal_log(&self.status);
-                    }
+            if last_tick.elapsed() >= Duration::from_millis(500) {
+                if let Err(error) = self.refresh_agent_status().await {
+                    self.status = format!("agent refresh error: {error}");
+                    append_terminal_log(&self.status);
                 }
                 last_tick = Instant::now();
             }
@@ -385,12 +625,12 @@ impl App {
             return Ok(false);
         }
 
-        if self.runtime.state() == AgentState::Setup {
+        if self.agent_state == AgentState::Setup {
             self.handle_setup_key(code, modifiers).await?;
             return Ok(false);
         }
 
-        self.handle_runtime_key(code, modifiers)?;
+        self.handle_runtime_key(code, modifiers).await?;
 
         Ok(false)
     }
@@ -484,23 +724,15 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let provider = self.selected_frontier_provider();
-                    self.frontier_models = if provider == ModelProviderKind::Ollama {
-                        self.ollama_catalog_tagged_models.clone()
-                    } else {
-                        self.models_for_provider(provider, &self.frontier_api_key)
-                            .await?
-                    };
-
-                    if self.frontier_models.is_empty() {
-                        self.status = format!(
-                            "No models found for {}. Check key/provider and retry.",
-                            provider_label(provider)
-                        );
-                    }
-
                     if provider == ModelProviderKind::Ollama {
+                        self.frontier_models = self.ollama_catalog_tagged_models.clone();
                         self.step = SetupStep::FrontierModel;
                     } else {
+                        if !self.frontier_api_key.trim().is_empty() {
+                            self.frontier_models = self
+                                .models_for_provider(provider, &self.frontier_api_key)
+                                .await?;
+                        }
                         self.step = SetupStep::FrontierApiKey;
                     }
                 }
@@ -512,7 +744,13 @@ impl App {
                 }
                 KeyCode::Enter => {
                     if self.frontier_api_key.trim().is_empty() {
-                        self.status = "API key is required for this provider".to_string();
+                        if self.frontier_models.is_empty() {
+                            self.frontier_models = vec![self.preferred_frontier_model()];
+                            self.frontier_model_index = 0;
+                            self.status = "No key entered. Using default model and saved agent key"
+                                .to_string();
+                        }
+                        self.step = SetupStep::FrontierModel;
                     } else {
                         self.frontier_models = self
                             .models_for_provider(
@@ -521,8 +759,11 @@ impl App {
                             )
                             .await?;
                         if self.frontier_models.is_empty() {
+                            self.frontier_models = vec![self.preferred_frontier_model()];
+                            self.frontier_model_index = 0;
                             self.status =
-                                "No models returned for provider with this key".to_string();
+                                "No models returned for key. Using default model".to_string();
+                            self.step = SetupStep::FrontierModel;
                         } else {
                             self.frontier_model_index = 0;
                             self.step = SetupStep::FrontierModel;
@@ -587,29 +828,27 @@ impl App {
             }
             SetupStep::FrontierProvider => {
                 let provider = self.selected_frontier_provider();
-                self.frontier_models = if provider == ModelProviderKind::Ollama {
-                    self.ollama_catalog_tagged_models.clone()
-                } else {
-                    self.models_for_provider(provider, &self.frontier_api_key)
-                        .await?
-                };
-
-                if self.frontier_models.is_empty() {
-                    self.status = format!(
-                        "No models found for {}. Check key/provider and retry.",
-                        provider_label(provider)
-                    );
-                }
-
                 self.step = if provider == ModelProviderKind::Ollama {
+                    self.frontier_models = self.ollama_catalog_tagged_models.clone();
                     SetupStep::FrontierModel
                 } else {
+                    if !self.frontier_api_key.trim().is_empty() {
+                        self.frontier_models = self
+                            .models_for_provider(provider, &self.frontier_api_key)
+                            .await?;
+                    }
                     SetupStep::FrontierApiKey
                 };
             }
             SetupStep::FrontierApiKey => {
                 if self.frontier_api_key.trim().is_empty() {
-                    self.status = "API key is required for this provider".to_string();
+                    if self.frontier_models.is_empty() {
+                        self.frontier_models = vec![self.preferred_frontier_model()];
+                        self.frontier_model_index = 0;
+                        self.status =
+                            "No key entered. Using default model and saved agent key".to_string();
+                    }
+                    self.step = SetupStep::FrontierModel;
                 } else {
                     self.frontier_models = self
                         .models_for_provider(
@@ -618,7 +857,10 @@ impl App {
                         )
                         .await?;
                     if self.frontier_models.is_empty() {
-                        self.status = "No models returned for provider with this key".to_string();
+                        self.frontier_models = vec![self.preferred_frontier_model()];
+                        self.frontier_model_index = 0;
+                        self.status = "No models returned for key. Using default model".to_string();
+                        self.step = SetupStep::FrontierModel;
                     } else {
                         self.frontier_model_index = 0;
                         self.step = SetupStep::FrontierModel;
@@ -688,7 +930,7 @@ impl App {
                             }
                         }
                         self.status = "Selected model(s) installed. Finishing setup...".to_string();
-                        self.finish_setup()?;
+                        self.finish_setup().await?;
                     }
                 } else {
                     self.status =
@@ -701,7 +943,7 @@ impl App {
         Ok(())
     }
 
-    fn handle_runtime_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+    async fn handle_runtime_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         if modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
@@ -715,7 +957,9 @@ impl App {
                     self.chat_input.push('\n');
                 } else if !self.chat_input.trim().is_empty() {
                     let queued_message = self.chat_input.trim().to_string();
-                    self.runtime.enqueue_chat_message(self.chat_input.clone())?;
+                    self.client
+                        .enqueue_chat_message(self.chat_input.clone())
+                        .await?;
                     self.push_me_message(&queued_message);
                     append_terminal_log(&format!("chat message queued: {queued_message}"));
                     self.chat_input.clear();
@@ -735,7 +979,7 @@ impl App {
             return;
         }
 
-        if self.runtime.state() == AgentState::Setup {
+        if self.agent_state == AgentState::Setup {
             if self.step == SetupStep::FrontierApiKey {
                 self.frontier_api_key.push_str(&text);
                 self.status = "pasted into API key".to_string();
@@ -776,7 +1020,7 @@ impl App {
             .collect();
 
         if self.pending_missing_models.is_empty() {
-            self.finish_setup()?;
+            self.finish_setup().await?;
         } else {
             self.install_prompt_index = 0;
             self.step = SetupStep::InstallModelPrompt;
@@ -789,7 +1033,7 @@ impl App {
         Ok(())
     }
 
-    fn finish_setup(&mut self) -> Result<()> {
+    async fn finish_setup(&mut self) -> Result<()> {
         let local_model = self.selected_local_model()?;
         let frontier_model = self
             .frontier_models
@@ -798,27 +1042,30 @@ impl App {
             .ok_or_else(|| anyhow!("no frontier model selected"))?;
 
         let frontier_provider = self.selected_frontier_provider();
-        if frontier_provider == ModelProviderKind::OpenAi {
-            self.runtime
-                .register_api_key(ModelProviderKind::OpenAi, self.frontier_api_key.clone())?;
+        let normalized_key = normalize_api_key_value(&self.frontier_api_key);
+        if frontier_provider == ModelProviderKind::OpenAi && !normalized_key.is_empty() {
+            self.client
+                .register_api_key(ModelProviderKind::OpenAi, normalized_key.clone())
+                .await?;
         }
-        if frontier_provider == ModelProviderKind::OpenCodeZen {
-            self.runtime.register_api_key(
-                ModelProviderKind::OpenCodeZen,
-                self.frontier_api_key.clone(),
-            )?;
+        if frontier_provider == ModelProviderKind::OpenCodeZen && !normalized_key.is_empty() {
+            self.client
+                .register_api_key(ModelProviderKind::OpenCodeZen, normalized_key)
+                .await?;
         }
 
-        self.runtime.configure_models(
-            ModelSelection {
-                provider: ModelProviderKind::Ollama,
-                model: local_model.clone(),
-            },
-            ModelSelection {
-                provider: frontier_provider,
-                model: frontier_model.clone(),
-            },
-        )?;
+        self.client
+            .configure_models(
+                ModelSelection {
+                    provider: ModelProviderKind::Ollama,
+                    model: local_model.clone(),
+                },
+                ModelSelection {
+                    provider: frontier_provider,
+                    model: frontier_model.clone(),
+                },
+            )
+            .await?;
         if let Err(error) = write_persisted_setup_config(&PersistedSetupConfig {
             local_provider: ModelProviderKind::Ollama,
             local_model: local_model.clone(),
@@ -827,7 +1074,9 @@ impl App {
         }) {
             self.push_log(&format!("failed to persist setup: {error}"));
         }
-        self.runtime.start()?;
+
+        self.client.start_loop(500).await?;
+        self.refresh_agent_status().await?;
         self.status = "setup complete, now running".to_string();
         append_terminal_log(&format!(
             "setup complete local={} frontier_provider={} frontier_model={}",
@@ -843,14 +1092,15 @@ impl App {
         provider: ModelProviderKind,
         api_key: &str,
     ) -> Result<Vec<String>> {
+        let api_key = normalize_api_key_value(api_key);
         let mut models = match provider {
             ModelProviderKind::Ollama => self.ollama_catalog_tagged_models.clone(),
             ModelProviderKind::OpenCodeZen => {
-                list_models_with_api_key(ProviderId::OpenCodeZen, api_key)
+                list_models_with_api_key(ProviderId::OpenCodeZen, &api_key)
                     .await
                     .unwrap_or_default()
             }
-            ModelProviderKind::OpenAi => list_openai_models(api_key).await.unwrap_or_default(),
+            ModelProviderKind::OpenAi => list_openai_models(&api_key).await.unwrap_or_default(),
         };
 
         models.sort();
@@ -860,6 +1110,18 @@ impl App {
 
     fn selected_frontier_provider(&self) -> ModelProviderKind {
         frontier_provider_options()[self.frontier_provider_index]
+    }
+
+    fn preferred_frontier_model(&self) -> String {
+        let provider = self.selected_frontier_provider();
+        if let Some(selection) = &self.frontier_selection
+            && selection.provider == provider
+            && !selection.model.trim().is_empty()
+        {
+            return selection.model.clone();
+        }
+
+        default_model_for_provider(provider).to_string()
     }
 
     fn selected_local_model(&self) -> Result<String> {
@@ -1102,13 +1364,13 @@ impl App {
         );
 
         let local = self
-            .runtime
-            .local_selection()
+            .local_selection
+            .as_ref()
             .map(|selection| format!("{:?}: {}", selection.provider, selection.model))
             .unwrap_or_else(|| "(unset)".to_string());
         let frontier = self
-            .runtime
-            .frontier_selection()
+            .frontier_selection
+            .as_ref()
             .map(|selection| format!("{:?}: {}", selection.provider, selection.model))
             .unwrap_or_else(|| "(unset)".to_string());
 
@@ -1126,12 +1388,15 @@ impl App {
         );
 
         frame.render_widget(
-            Paragraph::new(format!("local={local}\nfrontier={frontier}"))
-                .block(Block::default().borders(Borders::ALL).title("Model Config")),
+            Paragraph::new(format!(
+                "local={local}\nfrontier={frontier}\nconfigured={}\nloop={} ({}ms)",
+                self.configured, self.loop_running, self.loop_interval_ms
+            ))
+            .block(Block::default().borders(Borders::ALL).title("Model Config")),
             right[1],
         );
 
-        let observability = self.runtime.observability_snapshot();
+        let observability = &self.observability;
         let start_ago = format_elapsed_ago(self.started_at.elapsed());
         frame.render_widget(
             Paragraph::new(format!(
@@ -1154,8 +1419,12 @@ impl App {
         );
 
         frame.render_widget(
-            Paragraph::new(self.latest_loop_state_log.as_str())
-                .block(Block::default().borders(Borders::ALL).title("Loop State")),
+            Paragraph::new(format!(
+                "{}\nstop_reason={}",
+                self.latest_loop_state_log,
+                self.stop_reason.as_deref().unwrap_or("(none)")
+            ))
+            .block(Block::default().borders(Borders::ALL).title("Loop State")),
             right[3],
         );
 
@@ -1289,7 +1558,10 @@ fn styled_chat_history_line(line: &str) -> Line<'static> {
                 let gray_fill_len = pad_len.saturating_sub(1);
                 return Line::from(vec![
                     Span::raw(prefix.to_string()),
-                    Span::styled(":".repeat(gray_fill_len), Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        ":".repeat(gray_fill_len),
+                        Style::default().fg(Color::DarkGray),
+                    ),
                     Span::raw(" "),
                     Span::raw(suffix),
                 ]);
@@ -1305,7 +1577,10 @@ fn styled_chat_history_line(line: &str) -> Line<'static> {
     let suffix = line.chars().skip(leading_spaces).collect::<String>();
     let gray_fill_len = leading_spaces.saturating_sub(1);
     Line::from(vec![
-        Span::styled(":".repeat(gray_fill_len), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            ":".repeat(gray_fill_len),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::raw(" "),
         Span::raw(suffix),
     ])
@@ -1329,60 +1604,29 @@ fn provider_label(provider: ModelProviderKind) -> &'static str {
 
 fn default_model_for_provider(provider: ModelProviderKind) -> &'static str {
     match provider {
-        ModelProviderKind::Ollama => "gemma3:27b",
-        ModelProviderKind::OpenAi => "gpt-5.2-codex",
+        ModelProviderKind::Ollama => "gemma3:4b",
+        ModelProviderKind::OpenAi => "gpt-5.2",
         ModelProviderKind::OpenCodeZen => "kimi-k2.5",
     }
 }
 
-fn configure_runtime_from_env(runtime: &mut LooperRuntime) -> Result<()> {
-    let local_provider = provider_from_env("LOOPER_LOCAL_PROVIDER", ModelProviderKind::Ollama);
-    let frontier_provider =
-        provider_from_env("LOOPER_FRONTIER_PROVIDER", ModelProviderKind::Ollama);
-    let local_model =
-        std::env::var("LOOPER_LOCAL_MODEL").unwrap_or_else(|_| "gemma3:4b".to_string());
-    let frontier_model = std::env::var("LOOPER_FRONTIER_MODEL")
-        .unwrap_or_else(|_| default_model_for_provider(frontier_provider).to_string());
-
-    if let Ok(key) = std::env::var("OPENAI_API_KEY")
-        && !key.trim().is_empty()
-    {
-        runtime.register_api_key(ModelProviderKind::OpenAi, key)?;
-    }
-
-    if let Ok(key) = std::env::var("OPENCODE_ZEN_API_KEY")
-        && !key.trim().is_empty()
-    {
-        runtime.register_api_key(ModelProviderKind::OpenCodeZen, key)?;
-    }
-
-    runtime.configure_models(
-        ModelSelection {
-            provider: local_provider,
-            model: local_model,
-        },
-        ModelSelection {
-            provider: frontier_provider,
-            model: frontier_model,
-        },
-    )
-}
-
-fn provider_from_env(name: &str, default: ModelProviderKind) -> ModelProviderKind {
-    let Ok(value) = std::env::var(name) else {
-        return default;
-    };
-
-    match value.to_lowercase().as_str() {
-        "openai" => ModelProviderKind::OpenAi,
-        "opencode_zen" | "opencode-zen" | "zen" => ModelProviderKind::OpenCodeZen,
-        "ollama" => ModelProviderKind::Ollama,
-        _ => default,
-    }
+fn normalize_api_key_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let unprefixed = trimmed
+        .strip_prefix("Bearer ")
+        .or_else(|| trimmed.strip_prefix("bearer "))
+        .unwrap_or(trimmed);
+    let unquoted = unprefixed
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+    unquoted.to_string()
 }
 
 async fn list_openai_models(api_key: &str) -> Result<Vec<String>> {
-    if api_key.trim().is_empty() {
+    let api_key = normalize_api_key_value(api_key);
+    if api_key.is_empty() {
         return Ok(Vec::new());
     }
 
