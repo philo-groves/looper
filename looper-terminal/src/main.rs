@@ -22,8 +22,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
 use serde::{Deserialize, Serialize};
 
 #[tokio::main]
@@ -132,6 +133,7 @@ struct App {
     latest_loop_state_log: String,
     start_timestamp: String,
     started_at: Instant,
+    loops_per_minute_history: Vec<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -186,6 +188,7 @@ impl App {
             latest_loop_state_log: "(no loop state yet)".to_string(),
             start_timestamp: format_start_timestamp(Local::now()),
             started_at: Instant::now(),
+            loops_per_minute_history: vec![0.0],
         };
 
         if let Some(config) = read_persisted_setup_config()? {
@@ -357,6 +360,8 @@ impl App {
                         {
                             append_terminal_log(&self.status);
                         }
+                        let observability = self.runtime.observability_snapshot();
+                        self.record_loops_per_minute(observability.loops_per_minute);
                     }
                     Err(error) => {
                         self.status = format!("loop error: {error}");
@@ -1076,15 +1081,28 @@ impl App {
             .map(|selection| format!("{:?}: {}", selection.provider, selection.model))
             .unwrap_or_else(|| "(unset)".to_string());
 
-        frame.render_widget(
-            Paragraph::new(format!(
-                "status: {:?}\n{}",
-                self.runtime.state(),
-                self.status
-            ))
-            .block(Block::default().borders(Borders::ALL).title("Looper")),
-            right[0],
-        );
+        let lpm_points = self
+            .loops_per_minute_history
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as f64, *value))
+            .collect::<Vec<(f64, f64)>>();
+        let lpm_max = lpm_points
+            .iter()
+            .map(|(_, value)| *value)
+            .fold(1.0_f64, f64::max);
+        let lpm_chart = Chart::new(vec![
+            Dataset::default()
+                .name("LPM")
+                .graph_type(GraphType::Line)
+                .marker(symbols::Marker::Braille)
+                .style(Style::default().fg(Color::Cyan))
+                .data(&lpm_points),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Looper LPM"))
+        .x_axis(Axis::default().bounds([0.0, lpm_points.len().max(1) as f64]))
+        .y_axis(Axis::default().bounds([0.0, lpm_max]));
+        frame.render_widget(lpm_chart, right[0]);
 
         frame.render_widget(
             Paragraph::new(format!("local={local}\nfrontier={frontier}"))
@@ -1153,6 +1171,15 @@ impl App {
         self.chat_history.push(trimmed.to_string());
         if self.chat_history.len() > 200 {
             self.chat_history.drain(0..(self.chat_history.len() - 200));
+        }
+    }
+
+    fn record_loops_per_minute(&mut self, loops_per_minute: f64) {
+        self.loops_per_minute_history
+            .push(loops_per_minute.max(0.0));
+        if self.loops_per_minute_history.len() > 60 {
+            self.loops_per_minute_history
+                .drain(0..(self.loops_per_minute_history.len() - 60));
         }
     }
 }
