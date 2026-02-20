@@ -22,9 +22,11 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
-use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Sparkline,
+};
 use serde::{Deserialize, Serialize};
 
 #[tokio::main]
@@ -336,19 +338,14 @@ impl App {
                                 ExecutionResult::Executed { output }
                                     if !output.trim().is_empty() =>
                                 {
-                                    self.push_chat_history(&format!(
-                                        "assistant: {}",
-                                        output.trim()
-                                    ));
+                                    self.push_looper_message(output.trim());
                                 }
                                 ExecutionResult::Denied(reason) => {
-                                    self.push_chat_history(&format!(
-                                        "system: action denied ({reason})"
-                                    ));
+                                    self.push_looper_message(&format!("action denied ({reason})"));
                                 }
                                 ExecutionResult::RequiresHitl { approval_id } => {
-                                    self.push_chat_history(&format!(
-                                        "system: action requires HITL (approval id: {approval_id})"
+                                    self.push_looper_message(&format!(
+                                        "action requires HITL (approval id: {approval_id})"
                                     ));
                                 }
                                 _ => {}
@@ -717,12 +714,10 @@ impl App {
                 if modifiers.contains(KeyModifiers::SHIFT) {
                     self.chat_input.push('\n');
                 } else if !self.chat_input.trim().is_empty() {
+                    let queued_message = self.chat_input.trim().to_string();
                     self.runtime.enqueue_chat_message(self.chat_input.clone())?;
-                    self.push_chat_history(&format!("you: {}", self.chat_input.trim()));
-                    append_terminal_log(&format!(
-                        "chat message queued: {}",
-                        self.chat_input.trim()
-                    ));
+                    self.push_me_message(&queued_message);
+                    append_terminal_log(&format!("chat message queued: {queued_message}"));
                     self.chat_input.clear();
                     self.status = "chat percept queued".to_string();
                 }
@@ -1058,16 +1053,52 @@ impl App {
             ])
             .split(columns[1]);
 
-        let history_text = if self.chat_history.is_empty() {
-            "(no chat yet)".to_string()
+        let history_block = Block::default().borders(Borders::ALL).title("Chat History");
+        let history_inner = history_block.inner(left[0]);
+        frame.render_widget(history_block, left[0]);
+
+        let history_columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(history_inner);
+
+        let content_width = usize::from(history_columns[0].width.saturating_sub(1)).max(1);
+        let (items, history_line_count) = if self.chat_history.is_empty() {
+            (vec![ListItem::new("(no chat yet)")], 1_usize)
         } else {
-            self.chat_history.join("\n\n")
+            let mut total_lines = 0_usize;
+            let mut built_items = Vec::with_capacity(self.chat_history.len());
+            for (index, entry) in self.chat_history.iter().enumerate() {
+                let mut lines = wrap_chat_entry_lines(entry, content_width)
+                    .into_iter()
+                    .map(|line| styled_chat_history_line(&line))
+                    .collect::<Vec<Line>>();
+                total_lines += lines.len();
+                if index + 1 < self.chat_history.len() {
+                    lines.push(Line::from(""));
+                    total_lines += 1;
+                }
+                built_items.push(ListItem::new(lines));
+            }
+            (built_items, total_lines)
         };
 
-        frame.render_widget(
-            Paragraph::new(history_text)
-                .block(Block::default().borders(Borders::ALL).title("Chat History")),
-            left[0],
+        let mut list_state = ListState::default();
+        if !self.chat_history.is_empty() {
+            list_state.select(Some(self.chat_history.len() - 1));
+        }
+
+        let list = List::new(items).style(Style::default().fg(Color::White));
+        frame.render_stateful_widget(list, history_columns[0], &mut list_state);
+
+        let visible_rows = usize::from(history_columns[0].height).max(1);
+        let content_len = history_line_count.max(1);
+        let scroll_position = content_len.saturating_sub(visible_rows);
+        let mut scrollbar_state = ScrollbarState::new(content_len).position(scroll_position);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            history_columns[1],
+            &mut scrollbar_state,
         );
 
         let local = self
@@ -1081,28 +1112,18 @@ impl App {
             .map(|selection| format!("{:?}: {}", selection.provider, selection.model))
             .unwrap_or_else(|| "(unset)".to_string());
 
-        let lpm_points = self
+        let lpm_values = self
             .loops_per_minute_history
             .iter()
-            .enumerate()
-            .map(|(index, value)| (index as f64, *value))
-            .collect::<Vec<(f64, f64)>>();
-        let lpm_max = lpm_points
-            .iter()
-            .map(|(_, value)| *value)
-            .fold(1.0_f64, f64::max);
-        let lpm_chart = Chart::new(vec![
-            Dataset::default()
-                .name("LPM")
-                .graph_type(GraphType::Line)
-                .marker(symbols::Marker::Braille)
+            .map(|value| value.round().max(0.0) as u64)
+            .collect::<Vec<u64>>();
+        frame.render_widget(
+            Sparkline::default()
+                .block(Block::default().borders(Borders::ALL).title("Looper LPM"))
                 .style(Style::default().fg(Color::Cyan))
-                .data(&lpm_points),
-        ])
-        .block(Block::default().borders(Borders::ALL).title("Looper LPM"))
-        .x_axis(Axis::default().bounds([0.0, lpm_points.len().max(1) as f64]))
-        .y_axis(Axis::default().bounds([0.0, lpm_max]));
-        frame.render_widget(lpm_chart, right[0]);
+                .data(&lpm_values),
+            right[0],
+        );
 
         frame.render_widget(
             Paragraph::new(format!("local={local}\nfrontier={frontier}"))
@@ -1174,6 +1195,14 @@ impl App {
         }
     }
 
+    fn push_me_message(&mut self, message: &str) {
+        self.push_chat_history(&format_chat_entry("[Me]", message));
+    }
+
+    fn push_looper_message(&mut self, message: &str) {
+        self.push_chat_history(&format_chat_entry("[Looper]", message));
+    }
+
     fn record_loops_per_minute(&mut self, loops_per_minute: f64) {
         self.loops_per_minute_history
             .push(loops_per_minute.max(0.0));
@@ -1193,6 +1222,92 @@ fn setup_line(label: &str, value: &str, active: bool) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label}: "), style),
         Span::styled(value.to_string(), Style::default().fg(Color::Gray)),
+    ])
+}
+
+fn format_chat_entry(prefix: &str, message: &str) -> String {
+    const CONTENT_OFFSET: usize = 10;
+    let padding = " ".repeat(CONTENT_OFFSET.saturating_sub(prefix.chars().count()));
+    let continuation_indent = " ".repeat(CONTENT_OFFSET);
+    let normalized = message.replace('\n', &format!("\n{continuation_indent}"));
+    format!("{prefix}{padding}{normalized}")
+}
+
+fn wrap_chat_entry_lines(entry: &str, max_width: usize) -> Vec<String> {
+    let mut wrapped = Vec::new();
+    for raw_line in entry.lines() {
+        wrapped.extend(wrap_line_preserving_indent(raw_line, max_width));
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+fn wrap_line_preserving_indent(line: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+
+    let chars = line.chars().collect::<Vec<char>>();
+    if chars.len() <= max_width {
+        return vec![line.to_string()];
+    }
+
+    let indent_len = line
+        .chars()
+        .take_while(|ch| ch.is_ascii_whitespace())
+        .count()
+        .min(max_width.saturating_sub(1));
+    let indent = " ".repeat(indent_len);
+    let mut out = Vec::new();
+
+    let mut index = 0;
+    out.push(chars[index..(index + max_width)].iter().collect::<String>());
+    index += max_width;
+
+    let continuation_width = max_width.saturating_sub(indent_len).max(1);
+    while index < chars.len() {
+        let end = (index + continuation_width).min(chars.len());
+        let segment = chars[index..end].iter().collect::<String>();
+        out.push(format!("{indent}{segment}"));
+        index = end;
+    }
+
+    out
+}
+
+fn styled_chat_history_line(line: &str) -> Line<'static> {
+    for prefix in ["[Looper]", "[Me]"] {
+        if let Some(rest) = line.strip_prefix(prefix) {
+            let pad_len = rest.chars().take_while(|ch| *ch == ' ').count();
+            let suffix = rest.chars().skip(pad_len).collect::<String>();
+
+            if pad_len > 0 {
+                let gray_fill_len = pad_len.saturating_sub(1);
+                return Line::from(vec![
+                    Span::raw(prefix.to_string()),
+                    Span::styled(":".repeat(gray_fill_len), Style::default().fg(Color::DarkGray)),
+                    Span::raw(" "),
+                    Span::raw(suffix),
+                ]);
+            }
+        }
+    }
+
+    let leading_spaces = line.chars().take_while(|ch| *ch == ' ').count();
+    if leading_spaces == 0 {
+        return Line::from(line.to_string());
+    }
+
+    let suffix = line.chars().skip(leading_spaces).collect::<String>();
+    let gray_fill_len = leading_spaces.saturating_sub(1);
+    Line::from(vec![
+        Span::styled(":".repeat(gray_fill_len), Style::default().fg(Color::DarkGray)),
+        Span::raw(" "),
+        Span::raw(suffix),
     ])
 }
 
