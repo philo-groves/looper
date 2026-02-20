@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = [
+    "looper-harness",
+    "looper-terminal"
+]
+
+[workspace.dependencies]
+fiddlesticks = { path = "../fiddlesticks" }
