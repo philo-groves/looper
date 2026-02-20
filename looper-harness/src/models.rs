@@ -8,6 +8,7 @@ use fiddlesticks::{
     Message, ModelProvider, ModelRequest, OutputItem, ProviderBuildConfig, ProviderId, Role,
     build_provider_with_config,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Action, ModelProviderKind, Percept, RecommendedAction};
@@ -304,13 +305,93 @@ async fn complete_json(
 }
 
 fn parse_local_contract(raw: &str) -> Result<LocalModelResponse> {
-    serde_json::from_str(raw)
-        .map_err(|error| anyhow!("failed to parse local model contract: {error}"))
+    parse_json_contract(raw, "local")
 }
 
 fn parse_frontier_contract(raw: &str) -> Result<FrontierModelResponse> {
-    serde_json::from_str(raw)
-        .map_err(|error| anyhow!("failed to parse frontier model contract: {error}"))
+    parse_json_contract(raw, "frontier")
+}
+
+fn parse_json_contract<T>(raw: &str, contract_name: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let trimmed = raw.trim();
+    if let Ok(parsed) = serde_json::from_str::<T>(trimmed) {
+        return Ok(parsed);
+    }
+
+    if let Some(parsed) = parse_json_from_embedded_payload::<T>(trimmed) {
+        return Ok(parsed);
+    }
+
+    Err(anyhow!(
+        "failed to parse {contract_name} model contract: expected valid JSON object in model output"
+    ))
+}
+
+fn parse_json_from_embedded_payload<T>(raw: &str) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    for (start, ch) in raw.char_indices() {
+        if ch != '{' && ch != '[' {
+            continue;
+        }
+
+        let Some(candidate) = extract_json_value(raw, start) else {
+            continue;
+        };
+        if let Ok(parsed) = serde_json::from_str::<T>(candidate) {
+            return Some(parsed);
+        }
+    }
+
+    None
+}
+
+fn extract_json_value(input: &str, start: usize) -> Option<&str> {
+    let mut in_string = false;
+    let mut escaping = false;
+    let mut stack = Vec::new();
+
+    for (offset, ch) in input[start..].char_indices() {
+        if in_string {
+            if escaping {
+                escaping = false;
+                continue;
+            }
+
+            if ch == '\\' {
+                escaping = true;
+                continue;
+            }
+
+            if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+
+                if stack.is_empty() {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(&input[start..end]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn extract_shell_command(message: &str) -> String {
@@ -349,4 +430,28 @@ fn build_provider(
     let key = api_key.unwrap_or_default();
     build_provider_with_config(ProviderBuildConfig::new(provider_id, key).with_timeout(timeout))
         .map_err(|error| anyhow!("failed to build {provider_kind:?} provider: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_local_contract_accepts_markdown_fence() {
+        let raw =
+            "```json\n{\"surprising_indices\":[0],\"rationale\":\"ok\",\"token_usage\":12}\n```";
+        let parsed = parse_local_contract(raw).expect("fenced payload should parse");
+        assert_eq!(parsed.surprising_indices, vec![0]);
+        assert_eq!(parsed.rationale, "ok");
+        assert_eq!(parsed.token_usage, 12);
+    }
+
+    #[test]
+    fn parse_frontier_contract_accepts_prefixed_text() {
+        let raw = "Sure, here is the JSON response:\n{\"actions\":[],\"rationale\":\"none\",\"token_usage\":3}";
+        let parsed = parse_frontier_contract(raw).expect("prefixed json should parse");
+        assert!(parsed.actions.is_empty());
+        assert_eq!(parsed.rationale, "none");
+        assert_eq!(parsed.token_usage, 3);
+    }
 }
