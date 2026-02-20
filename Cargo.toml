@@ -6,4 +6,4 @@ members = [
 ]
 
 [workspace.dependencies]
-fiddlesticks = { path = "../fiddlesticks" }
+fiddlesticks = { path = "../fiddlesticks/fiddlesticks" }
