@@ -1,7 +1,9 @@
 use std::io;
+use std::io::Write;
 use std::process::Command;
 use std::time::{Duration, Instant};
 use std::{fs, path::PathBuf};
+use std::{fs::OpenOptions, path::Path};
 
 use anyhow::{Result, anyhow};
 use arboard::Clipboard;
@@ -26,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    clear_terminal_log();
     let args = std::env::args().skip(1).collect::<Vec<String>>();
     if matches!(args.first().map(String::as_str), Some("serve")) {
         return run_server().await;
@@ -39,6 +42,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_server() -> Result<()> {
+    append_terminal_log("starting server mode");
     let runtime = LooperRuntime::with_internal_defaults()?;
     let state = AppState::new(runtime);
     let app = build_router(state);
@@ -49,6 +53,7 @@ async fn run_server() -> Result<()> {
 }
 
 async fn run_one_shot(message: String) -> Result<()> {
+    append_terminal_log(&format!("starting one-shot mode message={}", message));
     let mut runtime = LooperRuntime::with_internal_defaults()?;
     configure_runtime_from_env(&mut runtime)?;
     runtime.start()?;
@@ -77,6 +82,7 @@ async fn run_one_shot(message: String) -> Result<()> {
 }
 
 async fn run_tui() -> Result<()> {
+    append_terminal_log("starting tui mode");
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -89,6 +95,7 @@ async fn run_tui() -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    append_terminal_log("tui exited");
     result
 }
 
@@ -321,9 +328,39 @@ impl App {
                             report.action_results.len()
                         );
                         self.latest_loop_state_log = self.status.clone();
+                        for result in &report.action_results {
+                            match result {
+                                ExecutionResult::Executed { output }
+                                    if !output.trim().is_empty() =>
+                                {
+                                    self.push_chat_history(&format!(
+                                        "assistant: {}",
+                                        output.trim()
+                                    ));
+                                }
+                                ExecutionResult::Denied(reason) => {
+                                    self.push_chat_history(&format!(
+                                        "system: action denied ({reason})"
+                                    ));
+                                }
+                                ExecutionResult::RequiresHitl { approval_id } => {
+                                    self.push_chat_history(&format!(
+                                        "system: action requires HITL (approval id: {approval_id})"
+                                    ));
+                                }
+                                _ => {}
+                            }
+                        }
+                        if report.sensed_percepts.len() > 0
+                            || report.surprising_percepts.len() > 0
+                            || report.action_results.len() > 0
+                        {
+                            append_terminal_log(&self.status);
+                        }
                     }
                     Err(error) => {
                         self.status = format!("loop error: {error}");
+                        append_terminal_log(&self.status);
                     }
                 }
                 last_tick = Instant::now();
@@ -677,6 +714,10 @@ impl App {
                 } else if !self.chat_input.trim().is_empty() {
                     self.runtime.enqueue_chat_message(self.chat_input.clone())?;
                     self.push_chat_history(&format!("you: {}", self.chat_input.trim()));
+                    append_terminal_log(&format!(
+                        "chat message queued: {}",
+                        self.chat_input.trim()
+                    ));
                     self.chat_input.clear();
                     self.status = "chat percept queued".to_string();
                 }
@@ -788,6 +829,12 @@ impl App {
         }
         self.runtime.start()?;
         self.status = "setup complete, now running".to_string();
+        append_terminal_log(&format!(
+            "setup complete local={} frontier_provider={} frontier_model={}",
+            local_model,
+            provider_label(frontier_provider),
+            frontier_model
+        ));
         Ok(())
     }
 
@@ -1536,6 +1583,39 @@ fn write_persisted_setup_config(config: &PersistedSetupConfig) -> Result<()> {
 
 fn terminal_setup_config_path() -> PathBuf {
     user_looper_dir().join("terminal-setup.json")
+}
+
+fn terminal_log_path() -> PathBuf {
+    user_looper_dir().join("terminal.log")
+}
+
+fn append_terminal_log(message: &str) {
+    if message.trim().is_empty() {
+        return;
+    }
+
+    let _ = append_terminal_log_inner(terminal_log_path().as_path(), message);
+}
+
+fn clear_terminal_log() {
+    let path = terminal_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if path.exists() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn append_terminal_log_inner(path: &Path, message: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    writeln!(file, "[{timestamp}] {message}")?;
+    Ok(())
 }
 
 fn user_looper_dir() -> PathBuf {

@@ -64,6 +64,8 @@ pub struct Sensor {
     pub description: String,
     /// Whether the sensor is currently active.
     pub enabled: bool,
+    /// Sensitivity score for surprise detection, from 0 to 100.
+    pub sensitivity_score: u8,
     queue: VecDeque<Percept>,
     unread_start: usize,
 }
@@ -71,10 +73,20 @@ pub struct Sensor {
 impl Sensor {
     /// Creates a new enabled sensor.
     pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self::with_sensitivity_score(name, description, 50)
+    }
+
+    /// Creates a new enabled sensor with a specific sensitivity score.
+    pub fn with_sensitivity_score(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        sensitivity_score: u8,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             enabled: true,
+            sensitivity_score: sensitivity_score.min(100),
             queue: VecDeque::new(),
             unread_start: 0,
         }

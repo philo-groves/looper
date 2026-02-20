@@ -10,12 +10,19 @@ pub struct SensorCreateRequest {
     pub name: String,
     /// Description of the percept stream.
     pub description: String,
+    /// Optional sensitivity score from 0 to 100.
+    #[serde(default)]
+    pub sensitivity_score: Option<u8>,
 }
 
 impl SensorCreateRequest {
     /// Converts the request into a runtime sensor.
     pub fn into_sensor(self) -> Sensor {
-        Sensor::new(self.name, self.description)
+        Sensor::with_sensitivity_score(
+            self.name,
+            self.description,
+            self.sensitivity_score.unwrap_or(50),
+        )
     }
 }
 

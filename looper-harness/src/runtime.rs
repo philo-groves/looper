@@ -20,6 +20,8 @@ use crate::models::{
 };
 use crate::storage::{PersistedIteration, SqliteStore};
 
+const FORCE_SURPRISE_SENSITIVITY_THRESHOLD: u8 = 90;
+
 /// Phases of a loop iteration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum LoopPhase {
@@ -179,9 +181,10 @@ impl LooperRuntime {
 
     pub fn with_internal_defaults() -> Result<Self> {
         let mut runtime = Self::new();
-        runtime.add_sensor(Sensor::new(
+        runtime.add_sensor(Sensor::with_sensitivity_score(
             "chat",
             "Receiver of chat messages in percept form",
+            100,
         ));
 
         runtime.add_actuator(Actuator::internal(
@@ -409,6 +412,24 @@ impl LooperRuntime {
             .into_iter()
             .filter_map(|index| sensed.get(index).cloned())
             .collect::<Vec<_>>();
+
+        let high_sensitivity_surprises = sensed
+            .iter()
+            .filter(|percept| {
+                self.sensors
+                    .get(&percept.sensor_name)
+                    .map(|sensor| sensor.sensitivity_score >= FORCE_SURPRISE_SENSITIVITY_THRESHOLD)
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut surprising = surprising;
+        for percept in high_sensitivity_surprises {
+            if !surprising.contains(&percept) {
+                surprising.push(percept);
+            }
+        }
 
         if surprising.is_empty() {
             let mut report = IterationReport {
@@ -714,7 +735,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn non_surprising_percept_ends_early() {
+    async fn chat_sensor_is_always_surprising_when_sensitivity_is_high() {
         let mut runtime = LooperRuntime::with_internal_defaults().expect("defaults should build");
         runtime.use_rule_models_for_testing();
         runtime.disable_store();
@@ -727,8 +748,8 @@ mod tests {
             .run_iteration()
             .await
             .expect("iteration should complete");
-        assert!(report.ended_after_surprise_detection);
-        assert!(report.planned_actions.is_empty());
+        assert!(!report.ended_after_surprise_detection);
+        assert!(!report.surprising_percepts.is_empty());
     }
 
     #[tokio::test]

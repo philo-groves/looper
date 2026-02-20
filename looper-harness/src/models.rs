@@ -265,7 +265,10 @@ impl FrontierModel for FiddlesticksFrontierModel {
             let instruction = "You are the frontier planner in a sensory loop. Return only strict JSON with this shape: {\"actions\": [{\"actuator_name\": string, \"action\": object}], \"rationale\": string, \"token_usage\": number}. action must match one of: ChatResponse, Grep, Glob, Shell, WebSearch enum representations.";
             let response =
                 complete_json(&*self.provider, &self.model, instruction, &payload, 1024).await?;
-            parse_frontier_contract(&response)
+            match parse_frontier_contract(&response) {
+                Ok(parsed) => Ok(parsed),
+                Err(_) => Ok(frontier_fallback_from_plain_text(&response)),
+            }
         })
     }
 }
@@ -309,7 +312,145 @@ fn parse_local_contract(raw: &str) -> Result<LocalModelResponse> {
 }
 
 fn parse_frontier_contract(raw: &str) -> Result<FrontierModelResponse> {
-    parse_json_contract(raw, "frontier")
+    if let Ok(parsed) = parse_json_contract(raw, "frontier") {
+        return Ok(parsed);
+    }
+
+    parse_frontier_contract_lenient(raw)
+}
+
+fn parse_frontier_contract_lenient(raw: &str) -> Result<FrontierModelResponse> {
+    let trimmed = raw.trim();
+    let parsed_value = if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        value
+    } else if let Some(payload) = parse_json_from_embedded_payload::<serde_json::Value>(trimmed) {
+        payload
+    } else {
+        return Err(anyhow!(
+            "failed to parse frontier model contract: expected valid JSON object in model output"
+        ));
+    };
+
+    let object = parsed_value
+        .as_object()
+        .ok_or_else(|| anyhow!("failed to parse frontier model contract: expected JSON object"))?;
+
+    let actions = object
+        .get("actions")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut normalized_actions = Vec::new();
+    for item in actions {
+        let Some(action_obj) = item.as_object() else {
+            continue;
+        };
+
+        let actuator_name = action_obj
+            .get("actuator_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("chat")
+            .to_string();
+
+        let action = action_obj
+            .get("action")
+            .and_then(parse_lenient_action)
+            .unwrap_or(Action::ChatResponse {
+                message: "I noticed a surprising percept and queued it for review.".to_string(),
+            });
+
+        normalized_actions.push(RecommendedAction {
+            actuator_name,
+            action,
+        });
+    }
+
+    let rationale = object
+        .get("rationale")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("frontier model lenient contract parse")
+        .to_string();
+
+    let token_usage = object
+        .get("token_usage")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    Ok(FrontierModelResponse {
+        actions: normalized_actions,
+        rationale,
+        token_usage,
+    })
+}
+
+fn parse_lenient_action(value: &serde_json::Value) -> Option<Action> {
+    let obj = value.as_object()?;
+
+    if let Some(kind) = obj.get("type").and_then(serde_json::Value::as_str) {
+        return match kind {
+            "ChatResponse" => {
+                let message = obj
+                    .get("message")
+                    .or_else(|| obj.get("content"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                Some(Action::ChatResponse { message })
+            }
+            "Grep" => Some(Action::Grep {
+                pattern: obj
+                    .get("pattern")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(".")
+                    .to_string(),
+                path: obj
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(".")
+                    .to_string(),
+            }),
+            "Glob" => Some(Action::Glob {
+                pattern: obj
+                    .get("pattern")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("**/*")
+                    .to_string(),
+                path: obj
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(".")
+                    .to_string(),
+            }),
+            "Shell" => Some(Action::Shell {
+                command: obj
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            "WebSearch" => Some(Action::WebSearch {
+                query: obj
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
+            _ => None,
+        };
+    }
+
+    if let Some(chat_value) = obj.get("ChatResponse") {
+        let message = chat_value
+            .get("message")
+            .or_else(|| chat_value.get("content"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return Some(Action::ChatResponse { message });
+    }
+
+    None
 }
 
 fn parse_json_contract<T>(raw: &str, contract_name: &str) -> Result<T>
@@ -416,6 +557,24 @@ fn estimate_tokens(percepts: &[Percept]) -> u64 {
         .sum()
 }
 
+fn frontier_fallback_from_plain_text(raw: &str) -> FrontierModelResponse {
+    let message = raw.trim();
+    let content = if message.is_empty() {
+        "I received your message and am ready to help.".to_string()
+    } else {
+        message.to_string()
+    };
+
+    FrontierModelResponse {
+        actions: vec![RecommendedAction {
+            actuator_name: "chat".to_string(),
+            action: Action::ChatResponse { message: content },
+        }],
+        rationale: "frontier model returned non-JSON output; used chat fallback".to_string(),
+        token_usage: (raw.split_whitespace().count() as u64).saturating_add(4),
+    }
+}
+
 fn build_provider(
     provider_kind: ModelProviderKind,
     api_key: Option<&str>,
@@ -453,5 +612,46 @@ mod tests {
         assert!(parsed.actions.is_empty());
         assert_eq!(parsed.rationale, "none");
         assert_eq!(parsed.token_usage, 3);
+    }
+
+    #[test]
+    fn frontier_fallback_wraps_plain_text_as_chat_action() {
+        let raw = "Sure thing - I can help with that.";
+        let parsed = frontier_fallback_from_plain_text(raw);
+        assert_eq!(parsed.actions.len(), 1);
+        assert_eq!(
+            parsed.rationale,
+            "frontier model returned non-JSON output; used chat fallback"
+        );
+        match &parsed.actions[0].action {
+            Action::ChatResponse { message } => assert_eq!(message, raw),
+            _ => panic!("expected chat response fallback action"),
+        }
+    }
+
+    #[test]
+    fn parse_frontier_contract_accepts_type_content_action_shape() {
+        let raw = r#"{
+            "actions": [
+                {
+                    "actuator_name": "chat",
+                    "action": {
+                        "type": "ChatResponse",
+                        "content": "Hello. What would you like to do?"
+                    }
+                }
+            ],
+            "rationale": "ok",
+            "token_usage": 11
+        }"#;
+
+        let parsed = parse_frontier_contract(raw).expect("lenient action shape should parse");
+        assert_eq!(parsed.actions.len(), 1);
+        match &parsed.actions[0].action {
+            Action::ChatResponse { message } => {
+                assert_eq!(message, "Hello. What would you like to do?")
+            }
+            _ => panic!("expected chat response action"),
+        }
     }
 }
