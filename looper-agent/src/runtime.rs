@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,7 @@ pub struct Observability {
     pub failed_tool_executions: u64,
     pub total_iterations: u64,
     start: Instant,
+    started_at_unix: i64,
 }
 
 impl Default for Observability {
@@ -62,6 +63,10 @@ impl Default for Observability {
             failed_tool_executions: 0,
             total_iterations: 0,
             start: Instant::now(),
+            started_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
         }
     }
 }
@@ -109,6 +114,7 @@ impl Observability {
             failed_tool_execution_percent: self.failed_tool_execution_percent(),
             total_iterations: self.total_iterations,
             loops_per_minute: self.loops_per_minute(),
+            started_at_unix: self.started_at_unix,
         }
     }
 }
@@ -125,6 +131,7 @@ pub struct ObservabilitySnapshot {
     pub failed_tool_execution_percent: f64,
     pub total_iterations: u64,
     pub loops_per_minute: f64,
+    pub started_at_unix: i64,
 }
 
 /// Output of a completed loop iteration.

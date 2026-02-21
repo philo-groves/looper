@@ -8,7 +8,7 @@ use std::{fs::OpenOptions, path::Path};
 
 use anyhow::{Result, anyhow};
 use arboard::Clipboard;
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -21,14 +21,15 @@ use looper_agent::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState, Sparkline,
+    Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Sparkline,
 };
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -299,13 +300,23 @@ struct App {
     pending_missing_models: Vec<String>,
     install_prompt_index: usize,
     chat_input: String,
+    chat_cursor_index: usize,
     status: String,
     activity_log: Vec<String>,
     chat_history: Vec<String>,
-    latest_loop_state_log: String,
+    show_history_popup: bool,
+    pending_chat_responses: usize,
+    agent_started_at_unix: i64,
     start_timestamp: String,
-    started_at: Instant,
     loops_per_minute_history: Vec<f64>,
+    refresh_task: Option<JoinHandle<Result<RefreshPayload>>>,
+}
+
+struct RefreshPayload {
+    state: AgentStateResponse,
+    observability: ObservabilitySnapshot,
+    loop_status: LoopStatusResponse,
+    iterations: Vec<PersistedIteration>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -332,6 +343,7 @@ fn empty_observability_snapshot() -> ObservabilitySnapshot {
         failed_tool_execution_percent: 0.0,
         total_iterations: 0,
         loops_per_minute: 0.0,
+        started_at_unix: 0,
     }
 }
 
@@ -379,13 +391,16 @@ impl App {
             pending_missing_models: Vec::new(),
             install_prompt_index: 0,
             chat_input: String::new(),
+            chat_cursor_index: 0,
             status: "Setup: use arrows + Enter. Ctrl+V/right-click to paste.".to_string(),
             activity_log: Vec::new(),
             chat_history: Vec::new(),
-            latest_loop_state_log: "(no loop state yet)".to_string(),
-            start_timestamp: format_start_timestamp(Local::now()),
-            started_at: Instant::now(),
+            show_history_popup: false,
+            pending_chat_responses: 0,
+            agent_started_at_unix: 0,
+            start_timestamp: "(unknown)".to_string(),
             loops_per_minute_history: vec![0.0],
+            refresh_task: None,
         };
 
         if let Err(error) = app.refresh_agent_status().await {
@@ -496,6 +511,8 @@ impl App {
         self.stop_reason = state.reason;
 
         self.observability = self.client.metrics().await?;
+        self.agent_started_at_unix = self.observability.started_at_unix;
+        self.start_timestamp = format_start_timestamp_from_unix(self.agent_started_at_unix);
         self.record_loops_per_minute(self.observability.loops_per_minute);
 
         let loop_status = self.client.loop_status().await?;
@@ -541,13 +558,6 @@ impl App {
     fn consume_iterations(&mut self, iterations: Vec<PersistedIteration>) {
         for iteration in iterations {
             self.latest_iteration_id = Some(iteration.id);
-            self.latest_loop_state_log = format!(
-                "loop: sensed={} surprising={} actions={}",
-                iteration.sensed_percepts.len(),
-                iteration.surprising_percepts.len(),
-                iteration.action_results.len()
-            );
-
             for result in &iteration.action_results {
                 match result {
                     ExecutionResult::Executed { output } if !output.trim().is_empty() => {
@@ -600,11 +610,33 @@ impl App {
                 }
             }
 
-            if last_tick.elapsed() >= Duration::from_millis(500) {
-                if let Err(error) = self.refresh_agent_status().await {
-                    self.status = format!("agent refresh error: {error}");
-                    append_terminal_log(&self.status);
+            if self
+                .refresh_task
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                let refresh_task = self.refresh_task.take().expect("refresh task missing");
+                match refresh_task.await {
+                    Ok(Ok(payload)) => {
+                        self.apply_refresh_payload(payload);
+                    }
+                    Ok(Err(error)) => {
+                        self.status = format!("agent refresh error: {error}");
+                        append_terminal_log(&self.status);
+                    }
+                    Err(error) => {
+                        self.status = format!("agent refresh task failed: {error}");
+                        append_terminal_log(&self.status);
+                    }
                 }
+            }
+
+            if last_tick.elapsed() >= Duration::from_millis(500) && self.refresh_task.is_none() {
+                let client = self.client.clone();
+                let after_id = self.latest_iteration_id;
+                self.refresh_task = Some(tokio::spawn(async move {
+                    fetch_refresh_payload(client, after_id).await
+                }));
                 last_tick = Instant::now();
             }
         }
@@ -622,6 +654,19 @@ impl App {
             {
                 self.handle_paste(content);
             }
+            return Ok(false);
+        }
+
+        if code == KeyCode::Char('h')
+            && modifiers.contains(KeyModifiers::CONTROL)
+            && self.agent_state != AgentState::Setup
+        {
+            self.show_history_popup = !self.show_history_popup;
+            self.status = if self.show_history_popup {
+                "conversation history opened".to_string()
+            } else {
+                "conversation history closed".to_string()
+            };
             return Ok(false);
         }
 
@@ -944,18 +989,24 @@ impl App {
     }
 
     async fn handle_runtime_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
+        if self.show_history_popup {
+            if code == KeyCode::Esc {
+                self.show_history_popup = false;
+                self.status = "conversation history closed".to_string();
+            }
+            return Ok(());
+        }
+
         if modifiers.contains(KeyModifiers::CONTROL) {
             return Ok(());
         }
 
         match code {
             KeyCode::Backspace => {
-                self.chat_input.pop();
+                self.delete_chat_char();
             }
             KeyCode::Enter => {
-                if modifiers.contains(KeyModifiers::SHIFT) {
-                    self.chat_input.push('\n');
-                } else if !self.chat_input.trim().is_empty() {
+                if !self.chat_input.trim().is_empty() {
                     let queued_message = self.chat_input.trim().to_string();
                     self.client
                         .enqueue_chat_message(self.chat_input.clone())
@@ -963,11 +1014,25 @@ impl App {
                     self.push_me_message(&queued_message);
                     append_terminal_log(&format!("chat message queued: {queued_message}"));
                     self.chat_input.clear();
+                    self.chat_cursor_index = 0;
+                    self.pending_chat_responses = self.pending_chat_responses.saturating_add(1);
                     self.status = "chat percept queued".to_string();
                 }
             }
+            KeyCode::Left => {
+                self.move_chat_cursor_left();
+            }
+            KeyCode::Right => {
+                self.move_chat_cursor_right();
+            }
+            KeyCode::Home => {
+                self.chat_cursor_index = 0;
+            }
+            KeyCode::End => {
+                self.chat_cursor_index = self.chat_input.chars().count();
+            }
             KeyCode::Char(ch) => {
-                self.chat_input.push(ch);
+                self.insert_chat_char(ch);
             }
             _ => {}
         }
@@ -987,7 +1052,7 @@ impl App {
             return;
         }
 
-        self.chat_input.push_str(&text);
+        self.insert_chat_text(&text);
         self.status = "pasted into chat input".to_string();
     }
 
@@ -1139,6 +1204,11 @@ impl App {
     }
 
     fn draw_setup(&self, frame: &mut ratatui::Frame<'_>) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Rgb(36, 36, 36))),
+            frame.area(),
+        );
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1295,29 +1365,46 @@ impl App {
     }
 
     fn draw_runtime(&self, frame: &mut ratatui::Frame<'_>) {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Rgb(36, 36, 36))),
+            frame.area(),
+        );
+
+        let root = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(frame.area());
+
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(frame.area());
+            .split(root[0]);
 
         let left = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(8)])
+            .constraints([Constraint::Min(8), Constraint::Length(4)])
             .split(columns[0]);
 
         let right = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(5),
-                Constraint::Length(5),
-                Constraint::Min(6),
-                Constraint::Length(4),
+                Constraint::Length(1),
+                Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(6),
+                Constraint::Length(1),
+                Constraint::Length(6),
             ])
             .split(columns[1]);
 
-        let history_block = Block::default().borders(Borders::ALL).title("Chat History");
-        let history_inner = history_block.inner(left[0]);
-        frame.render_widget(history_block, left[0]);
+        let history_with_top_margin = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(left[0]);
+        let history_inner = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .split(history_with_top_margin[1])[1];
 
         let history_columns = Layout::default()
             .direction(Direction::Horizontal)
@@ -1379,25 +1466,35 @@ impl App {
             .iter()
             .map(|value| value.round().max(0.0) as u64)
             .collect::<Vec<u64>>();
-        frame.render_widget(
-            Sparkline::default()
-                .block(Block::default().borders(Borders::ALL).title("Looper LPM"))
-                .style(Style::default().fg(Color::Cyan))
-                .data(&lpm_values),
-            right[0],
-        );
-
-        frame.render_widget(
-            Paragraph::new(format!(
-                "local={local}\nfrontier={frontier}\nconfigured={}\nloop={} ({}ms)",
-                self.configured, self.loop_running, self.loop_interval_ms
-            ))
-            .block(Block::default().borders(Borders::ALL).title("Model Config")),
-            right[1],
-        );
-
         let observability = &self.observability;
-        let start_ago = format_elapsed_ago(self.started_at.elapsed());
+        let start_ago = format_agent_uptime(self.agent_started_at_unix)
+            .unwrap_or_else(|| "unknown".to_string());
+        let summary_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(right[1])[0];
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Rgb(24, 24, 24))),
+            summary_area,
+        );
+        let summary_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(summary_area);
+        frame.render_widget(
+            Paragraph::new("Execution Summary")
+                .style(Style::default().fg(Color::Gray).bg(Color::Rgb(24, 24, 24)))
+                .alignment(Alignment::Left),
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(summary_rows[0])[1],
+        );
         frame.render_widget(
             Paragraph::new(format!(
                 "start={} ({} ago)\nloops={} ({:.2}/min)\nfailed_tool_exec={} ({:.1}%)\nfalse_positive_surprises={} ({:.1}%)",
@@ -1410,34 +1507,150 @@ impl App {
                 observability.false_positive_surprises,
                 observability.false_positive_surprise_percent,
             ))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Execution Summary"),
-            ),
-            right[2],
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 24))),
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+                .split(summary_rows[2])[1],
         );
 
+        let model_config_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(right[3])[0];
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Rgb(24, 24, 24))),
+            model_config_area,
+        );
+        let model_config_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(model_config_area);
+        frame.render_widget(
+            Paragraph::new("Model Config")
+                .style(Style::default().fg(Color::Gray).bg(Color::Rgb(24, 24, 24)))
+                .alignment(Alignment::Left),
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(model_config_rows[0])[1],
+        );
         frame.render_widget(
             Paragraph::new(format!(
-                "{}\nstop_reason={}",
-                self.latest_loop_state_log,
-                self.stop_reason.as_deref().unwrap_or("(none)")
+                "local={local}\nfrontier={frontier}\nconfigured={}\nloop={} ({}ms)",
+                self.configured, self.loop_running, self.loop_interval_ms
             ))
-            .block(Block::default().borders(Borders::ALL).title("Loop State")),
-            right[3],
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 24))),
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+                .split(model_config_rows[2])[1],
         );
+
+        let loop_rate_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .split(right[5])[0];
+
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Rgb(24, 24, 24))),
+            loop_rate_area,
+        );
+
+        let loop_rate_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(loop_rate_area);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Loops: {} ({:.2}/min)",
+                observability.total_iterations, observability.loops_per_minute
+            ))
+                .style(Style::default().fg(Color::Gray).bg(Color::Rgb(24, 24, 24)))
+                .alignment(Alignment::Left),
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(loop_rate_rows[0])[1],
+        );
+
+        let loop_rate_inner = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .split(loop_rate_rows[2]);
+        frame.render_widget(
+            Sparkline::default()
+                .style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .bg(Color::Rgb(24, 24, 24)),
+                )
+                .data(&lpm_values),
+            loop_rate_inner[1],
+        );
+
+        let input_with_margin = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .split(left[1]);
+        let input_area = input_with_margin[1];
+        let input_block = Block::default().padding(Padding::new(1, 1, 0, 1));
+        let input_inner = input_block.inner(input_area);
 
         frame.render_widget(
             Paragraph::new(self.chat_input.as_str())
-                .style(Style::default().fg(Color::Yellow))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title("Chat Input (Enter send, Shift+Enter newline, Ctrl+V paste)"),
-                ),
-            left[1],
+                .style(Style::default().fg(Color::White).bg(Color::Rgb(28, 28, 28)))
+                .block(input_block),
+            input_area,
         );
+
+        if !self.show_history_popup {
+            let (cursor_x, cursor_y) =
+                chat_input_cursor_position(input_inner, &self.chat_input, self.chat_cursor_index);
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+
+        let footer_columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+            .split(
+                Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+                    .split(root[1])[1],
+            );
+
+        frame.render_widget(
+            Paragraph::new(self.footer_status_message()).style(
+                if self.pending_chat_responses == 0 {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                },
+            ),
+            footer_columns[0],
+        );
+
+        frame.render_widget(
+            Paragraph::new("CTRL+H History")
+                .style(Style::default().fg(Color::White))
+                .alignment(Alignment::Right),
+            footer_columns[1],
+        );
+
+        if self.show_history_popup {
+            self.draw_history_popup(frame);
+        }
     }
 
     fn push_log(&mut self, line: &str) {
@@ -1470,6 +1683,60 @@ impl App {
 
     fn push_looper_message(&mut self, message: &str) {
         self.push_chat_history(&format_chat_entry("[Looper]", message));
+        if self.pending_chat_responses > 0 {
+            self.pending_chat_responses -= 1;
+        }
+    }
+
+    fn insert_chat_char(&mut self, ch: char) {
+        let byte_index = self.chat_byte_index();
+        self.chat_input.insert(byte_index, ch);
+        self.move_chat_cursor_right();
+    }
+
+    fn insert_chat_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let byte_index = self.chat_byte_index();
+        self.chat_input.insert_str(byte_index, text);
+        self.chat_cursor_index = self
+            .chat_cursor_index
+            .saturating_add(text.chars().count())
+            .min(self.chat_input.chars().count());
+    }
+
+    fn delete_chat_char(&mut self) {
+        if self.chat_cursor_index == 0 {
+            return;
+        }
+
+        let current = self.chat_cursor_index;
+        let left = current - 1;
+        let before = self.chat_input.chars().take(left);
+        let after = self.chat_input.chars().skip(current);
+        self.chat_input = before.chain(after).collect();
+        self.chat_cursor_index = left;
+    }
+
+    fn move_chat_cursor_left(&mut self) {
+        self.chat_cursor_index = self.chat_cursor_index.saturating_sub(1);
+    }
+
+    fn move_chat_cursor_right(&mut self) {
+        self.chat_cursor_index = self
+            .chat_cursor_index
+            .saturating_add(1)
+            .min(self.chat_input.chars().count());
+    }
+
+    fn chat_byte_index(&self) -> usize {
+        self.chat_input
+            .char_indices()
+            .map(|(index, _)| index)
+            .nth(self.chat_cursor_index)
+            .unwrap_or(self.chat_input.len())
     }
 
     fn record_loops_per_minute(&mut self, loops_per_minute: f64) {
@@ -1480,6 +1747,125 @@ impl App {
                 .drain(0..(self.loops_per_minute_history.len() - 60));
         }
     }
+
+    fn apply_refresh_payload(&mut self, payload: RefreshPayload) {
+        let was_initialized = self.iterations_initialized;
+        if !self.iterations_initialized {
+            self.latest_iteration_id = payload.state.latest_iteration_id;
+            self.iterations_initialized = true;
+        }
+
+        self.agent_state = payload.state.state;
+        self.configured = payload.state.configured;
+        self.local_selection = payload.state.local_selection;
+        self.frontier_selection = payload.state.frontier_selection;
+        self.stop_reason = payload.state.reason;
+
+        self.observability = payload.observability;
+        self.agent_started_at_unix = self.observability.started_at_unix;
+        self.start_timestamp = format_start_timestamp_from_unix(self.agent_started_at_unix);
+        self.record_loops_per_minute(self.observability.loops_per_minute);
+
+        self.loop_running = payload.loop_status.running;
+        self.loop_interval_ms = payload.loop_status.interval_ms;
+
+        if was_initialized {
+            self.consume_iterations(payload.iterations);
+        }
+    }
+
+    fn footer_status_message(&self) -> String {
+        if self.pending_chat_responses > 0 {
+            return "Waiting for agent...".to_string();
+        }
+
+        "Ready".to_string()
+    }
+
+    fn draw_history_popup(&self, frame: &mut ratatui::Frame<'_>) {
+        let popup_area = centered_rect(90, 70, frame.area());
+        frame.render_widget(Clear, popup_area);
+
+        let popup_block = Block::default()
+            .borders(Borders::ALL)
+            .title("Conversation History (Esc to close)");
+        let popup_inner = popup_block.inner(popup_area);
+        frame.render_widget(popup_block, popup_area);
+
+        let content_width = usize::from(popup_inner.width.saturating_sub(1)).max(1);
+        let max_lines = usize::from(popup_inner.height).max(1);
+
+        let mut lines = if self.chat_history.is_empty() {
+            vec![Line::from("(no chat yet)")]
+        } else {
+            let mut built = Vec::new();
+            for (index, entry) in self.chat_history.iter().enumerate() {
+                for wrapped in wrap_chat_entry_lines(entry, content_width) {
+                    built.push(styled_chat_history_line(&wrapped));
+                }
+                if index + 1 < self.chat_history.len() {
+                    built.push(Line::from(""));
+                }
+            }
+            built
+        };
+
+        if lines.len() > max_lines {
+            lines = lines.split_off(lines.len() - max_lines);
+        }
+
+        frame.render_widget(Paragraph::new(lines), popup_inner);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn chat_input_cursor_position(area: Rect, input: &str, cursor_index: usize) -> (u16, u16) {
+    if area.width == 0 || area.height == 0 {
+        return (area.x, area.y);
+    }
+
+    let prefix = input.chars().take(cursor_index).collect::<String>();
+    let line_index = prefix.lines().count().saturating_sub(1);
+    let column_index = prefix.lines().last().map(|line| line.chars().count()).unwrap_or(0);
+
+    let x = area.x + (column_index as u16).min(area.width.saturating_sub(1));
+    let y = area.y + (line_index as u16).min(area.height.saturating_sub(1));
+    (x, y)
+}
+
+async fn fetch_refresh_payload(client: AgentClient, after_id: Option<i64>) -> Result<RefreshPayload> {
+    client.health().await?;
+
+    let state = client.state().await?;
+    let observability = client.metrics().await?;
+    let loop_status = client.loop_status().await?;
+    let iterations = client.list_iterations_after(after_id, 100).await?;
+
+    Ok(RefreshPayload {
+        state,
+        observability,
+        loop_status,
+        iterations,
+    })
 }
 
 fn setup_line(label: &str, value: &str, active: bool) -> Line<'static> {
@@ -1900,8 +2286,16 @@ fn split_model_and_version(model: &str) -> (&str, &str) {
     model.split_once(':').unwrap_or((model, "latest"))
 }
 
-fn format_start_timestamp(now: chrono::DateTime<Local>) -> String {
-    let formatted = now.format("%b %-d, %-I:%M%P").to_string();
+fn format_start_timestamp_from_unix(started_at_unix: i64) -> String {
+    if started_at_unix <= 0 {
+        return "(unknown)".to_string();
+    }
+
+    let Some(date_time) = Local.timestamp_opt(started_at_unix, 0).single() else {
+        return "(unknown)".to_string();
+    };
+
+    let formatted = date_time.format("%b %-d, %-I:%M%P").to_string();
     if let Some(trimmed) = formatted.strip_suffix("am") {
         return format!("{trimmed}a");
     }
@@ -1909,6 +2303,16 @@ fn format_start_timestamp(now: chrono::DateTime<Local>) -> String {
         return format!("{trimmed}p");
     }
     formatted
+}
+
+fn format_agent_uptime(started_at_unix: i64) -> Option<String> {
+    if started_at_unix <= 0 {
+        return None;
+    }
+
+    let now_unix = Local::now().timestamp();
+    let elapsed_seconds = now_unix.saturating_sub(started_at_unix) as u64;
+    Some(format_elapsed_ago(Duration::from_secs(elapsed_seconds)))
 }
 
 fn format_elapsed_ago(elapsed: Duration) -> String {
