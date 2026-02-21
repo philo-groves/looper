@@ -4,7 +4,7 @@ An experimental general purpose agent designed to act continuously and autonomou
 
 ## Projects
 
-- `looper-harness`: Core agent runtime functionality
+- `looper-agent`: Core agent runtime functionality
 - `looper-terminal`: TUI for communicating with the agent
 - `looper-web`: Next.js-based web application
 
