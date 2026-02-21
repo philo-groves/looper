@@ -62,6 +62,7 @@ Each sensor acts as a windowed queue. At the beginning of each sensory loop, the
 New sensors can be added to the agent for extending its functionality. Setting up a new sensor is relatively simple, you just need:
 
 - Name of the sensor
+- Policy of the sensor
 - Description of its percepts (helps the agent understand)
 
 #### Add a Sensor through Terminal
@@ -93,6 +94,7 @@ Body Format:
 Actuators are the primary mechanism for Looper to perform actions. They allow for scalable output from the agent and the ability to interact with the world. There are several types of actuators: internal tools, MCP servers, and agentic workflows. To get started, you will need:
 
 - Name of the actuator
+- Policy of the actuator
 - Description of its actions (helps the agent understand)
 - Type of the actuator
 - Any details required for that actuator type
