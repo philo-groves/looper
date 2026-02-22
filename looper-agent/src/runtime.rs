@@ -54,7 +54,7 @@ pub enum LocalLoopStep {
 pub enum FrontierLoopStep {
     DeeperPerceptInvestigation,
     PlanActions,
-    NoActionRequired,
+    PerformingActions,
 }
 
 /// High-level current phase of the loop runtime.
@@ -688,8 +688,6 @@ impl LooperRuntime {
 
         if planned_actions.is_empty() {
             self.observability.false_positive_surprises += 1;
-            self.loop_visualization.frontier_current_step =
-                Some(FrontierLoopStep::NoActionRequired);
             self.transition_phase(LoopRuntimePhase::Idle);
             let mut report = IterationReport {
                 iteration_id: None,
@@ -706,6 +704,7 @@ impl LooperRuntime {
 
         self.observability.bump_phase(LoopPhase::PerformActions);
         self.loop_visualization.action_required = true;
+        self.loop_visualization.frontier_current_step = Some(FrontierLoopStep::PerformingActions);
         self.transition_phase(LoopRuntimePhase::ExecuteActions);
         let mut action_results = Vec::with_capacity(planned_actions.len());
         for recommendation in &planned_actions {

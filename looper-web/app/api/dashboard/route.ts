@@ -32,7 +32,7 @@ type AgentDashboardPayload = {
     frontier_current_step:
       | "deeper_percept_investigation"
       | "plan_actions"
-      | "no_action_required"
+      | "performing_actions"
       | null;
     surprise_found: boolean;
     action_required: boolean;
