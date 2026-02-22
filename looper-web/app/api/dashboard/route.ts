@@ -23,6 +23,22 @@ type AgentDashboardPayload = {
     frontier_model_tokens: number;
     failed_tool_execution_percent: number;
   };
+  loop_visualization: {
+    local_current_step:
+      | "gather_new_percepts"
+      | "check_for_surprises"
+      | "no_surprise"
+      | "surprise_found";
+    frontier_current_step:
+      | "deeper_percept_investigation"
+      | "plan_actions"
+      | "no_action_required"
+      | null;
+    surprise_found: boolean;
+    action_required: boolean;
+    local_loop_count: number;
+    frontier_loop_count: number;
+  };
   local_model: {
     configured: boolean;
     provider: string | null;

@@ -14,7 +14,7 @@ use crate::model::{
     Actuator, ActuatorType, AgentState, ExecutionResult, ModelProviderKind, ModelSelection,
     RateLimit,
 };
-use crate::runtime::{LooperRuntime, ObservabilitySnapshot};
+use crate::runtime::{LoopVisualizationSnapshot, LooperRuntime, ObservabilitySnapshot};
 use crate::storage::PersistedIteration;
 
 /// Shared HTTP state for Looper API handlers.
@@ -334,6 +334,7 @@ pub async fn dashboard_handler(
         state: state_response,
         loop_status,
         observability: runtime.observability_snapshot(),
+        loop_visualization: runtime.loop_visualization_snapshot(),
         local_model: model_process_status(local_selection, runtime_state, loop_running),
         frontier_model: model_process_status(frontier_selection, runtime_state, loop_running),
         sensors,
@@ -515,6 +516,8 @@ pub struct DashboardResponse {
     pub loop_status: LoopStatusResponse,
     /// Runtime observability metrics.
     pub observability: ObservabilitySnapshot,
+    /// Current loop step and branch state for visualization.
+    pub loop_visualization: LoopVisualizationSnapshot,
     /// Current local model process details.
     pub local_model: ModelProcessStatus,
     /// Current frontier model process details.

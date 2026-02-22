@@ -30,6 +30,78 @@ pub enum LoopPhase {
     PerformActions,
 }
 
+/// Local model loop step for dashboard visualization.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalLoopStep {
+    GatherNewPercepts,
+    CheckForSurprises,
+    NoSurprise,
+    SurpriseFound,
+}
+
+/// Frontier model loop step for dashboard visualization.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrontierLoopStep {
+    DeeperPerceptInvestigation,
+    PlanActions,
+    NoActionRequired,
+}
+
+/// Serialization-friendly loop state payload for dashboard rendering.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LoopVisualizationSnapshot {
+    /// Current local loop step.
+    pub local_current_step: LocalLoopStep,
+    /// Current frontier loop step, if the frontier loop is active.
+    pub frontier_current_step: Option<FrontierLoopStep>,
+    /// Whether the latest local check found a surprise.
+    pub surprise_found: bool,
+    /// Whether the latest frontier plan requires actions.
+    pub action_required: bool,
+    /// Total local loop count.
+    pub local_loop_count: u64,
+    /// Total frontier loop count.
+    pub frontier_loop_count: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LoopVisualizationState {
+    local_current_step: LocalLoopStep,
+    frontier_current_step: Option<FrontierLoopStep>,
+    surprise_found: bool,
+    action_required: bool,
+    local_loop_count: u64,
+    frontier_loop_count: u64,
+}
+
+impl Default for LoopVisualizationState {
+    fn default() -> Self {
+        Self {
+            local_current_step: LocalLoopStep::GatherNewPercepts,
+            frontier_current_step: None,
+            surprise_found: false,
+            action_required: false,
+            local_loop_count: 0,
+            frontier_loop_count: 0,
+        }
+    }
+}
+
+impl LoopVisualizationState {
+    fn snapshot(self) -> LoopVisualizationSnapshot {
+        LoopVisualizationSnapshot {
+            local_current_step: self.local_current_step,
+            frontier_current_step: self.frontier_current_step,
+            surprise_found: self.surprise_found,
+            action_required: self.action_required,
+            local_loop_count: self.local_loop_count,
+            frontier_loop_count: self.frontier_loop_count,
+        }
+    }
+}
+
 impl LoopPhase {
     fn as_key(self) -> &'static str {
         match self {
@@ -163,6 +235,7 @@ pub struct LooperRuntime {
     pending_approvals: HashMap<u64, PendingApproval>,
     next_approval_id: u64,
     store: Option<SqliteStore>,
+    loop_visualization: LoopVisualizationState,
 }
 
 impl LooperRuntime {
@@ -183,6 +256,7 @@ impl LooperRuntime {
             pending_approvals: HashMap::new(),
             next_approval_id: 1,
             store: None,
+            loop_visualization: LoopVisualizationState::default(),
         }
     }
 
@@ -434,12 +508,25 @@ impl LooperRuntime {
         self.observability.snapshot()
     }
 
+    /// Returns the latest loop visualization state for dashboard rendering.
+    pub fn loop_visualization_snapshot(&self) -> LoopVisualizationSnapshot {
+        self.loop_visualization.snapshot()
+    }
+
     pub async fn run_iteration(&mut self) -> Result<IterationReport> {
         if self.agent_state != AgentState::Running {
             return Err(anyhow!("runtime is not running"));
         }
 
         self.observability.total_iterations += 1;
+        self.loop_visualization.local_loop_count =
+            self.loop_visualization.local_loop_count.saturating_add(1);
+        self.loop_visualization.local_current_step = LocalLoopStep::GatherNewPercepts;
+        self.loop_visualization.frontier_current_step = None;
+        self.loop_visualization.surprise_found = false;
+        self.loop_visualization.action_required = false;
+
+        self.loop_visualization.local_current_step = LocalLoopStep::CheckForSurprises;
         self.observability.bump_phase(LoopPhase::SurpriseDetection);
 
         let sensed = self.collect_new_percepts();
@@ -481,6 +568,7 @@ impl LooperRuntime {
         }
 
         if surprising.is_empty() {
+            self.loop_visualization.local_current_step = LocalLoopStep::NoSurprise;
             let mut report = IterationReport {
                 iteration_id: None,
                 sensed_percepts: sensed,
@@ -494,7 +582,17 @@ impl LooperRuntime {
             return Ok(report);
         }
 
+        self.loop_visualization.local_current_step = LocalLoopStep::SurpriseFound;
+        self.loop_visualization.surprise_found = true;
+        self.loop_visualization.frontier_loop_count = self
+            .loop_visualization
+            .frontier_loop_count
+            .saturating_add(1);
+        self.loop_visualization.frontier_current_step =
+            Some(FrontierLoopStep::DeeperPerceptInvestigation);
+
         self.observability.bump_phase(LoopPhase::Reasoning);
+        self.loop_visualization.frontier_current_step = Some(FrontierLoopStep::PlanActions);
         let frontier_model = self
             .frontier_model
             .as_ref()
@@ -519,6 +617,8 @@ impl LooperRuntime {
 
         if planned_actions.is_empty() {
             self.observability.false_positive_surprises += 1;
+            self.loop_visualization.frontier_current_step =
+                Some(FrontierLoopStep::NoActionRequired);
             let mut report = IterationReport {
                 iteration_id: None,
                 sensed_percepts: sensed,
@@ -533,6 +633,7 @@ impl LooperRuntime {
         }
 
         self.observability.bump_phase(LoopPhase::PerformActions);
+        self.loop_visualization.action_required = true;
         let mut action_results = Vec::with_capacity(planned_actions.len());
         for recommendation in &planned_actions {
             let result = self.execute_recommendation(recommendation, false)?;
@@ -877,5 +978,55 @@ mod tests {
             Some(ExecutionResult::Denied(_))
         ));
         assert_eq!(runtime.observability().failed_tool_executions, 1);
+    }
+
+    #[tokio::test]
+    async fn loop_visualization_tracks_no_surprise_outcome() {
+        let mut runtime = LooperRuntime::with_internal_defaults().expect("defaults should build");
+        runtime.use_rule_models_for_testing();
+        runtime.disable_store();
+        runtime.start().expect("start should succeed");
+
+        let report = runtime
+            .run_iteration()
+            .await
+            .expect("iteration should complete");
+        assert!(report.ended_after_surprise_detection);
+
+        let snapshot = runtime.loop_visualization_snapshot();
+        assert_eq!(snapshot.local_current_step, LocalLoopStep::NoSurprise);
+        assert_eq!(snapshot.frontier_current_step, None);
+        assert!(!snapshot.surprise_found);
+        assert!(!snapshot.action_required);
+        assert_eq!(snapshot.local_loop_count, 1);
+        assert_eq!(snapshot.frontier_loop_count, 0);
+    }
+
+    #[tokio::test]
+    async fn loop_visualization_tracks_frontier_action_outcome() {
+        let mut runtime = LooperRuntime::with_internal_defaults().expect("defaults should build");
+        runtime.use_rule_models_for_testing();
+        runtime.disable_store();
+        runtime.start().expect("start should succeed");
+        runtime
+            .enqueue_chat_message("please search docs for model guidance")
+            .expect("chat sensor should exist");
+
+        let report = runtime
+            .run_iteration()
+            .await
+            .expect("iteration should complete");
+        assert!(!report.action_results.is_empty());
+
+        let snapshot = runtime.loop_visualization_snapshot();
+        assert_eq!(snapshot.local_current_step, LocalLoopStep::SurpriseFound);
+        assert_eq!(
+            snapshot.frontier_current_step,
+            Some(FrontierLoopStep::PlanActions)
+        );
+        assert!(snapshot.surprise_found);
+        assert!(snapshot.action_required);
+        assert_eq!(snapshot.local_loop_count, 1);
+        assert_eq!(snapshot.frontier_loop_count, 1);
     }
 }

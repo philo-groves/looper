@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
 type ProcessStatus = {
   configured: boolean;
@@ -26,6 +26,22 @@ type DashboardPayload = {
     local_model_tokens: number;
     frontier_model_tokens: number;
     failed_tool_execution_percent: number;
+  };
+  loop_visualization: {
+    local_current_step:
+      | "gather_new_percepts"
+      | "check_for_surprises"
+      | "no_surprise"
+      | "surprise_found";
+    frontier_current_step:
+      | "deeper_percept_investigation"
+      | "plan_actions"
+      | "no_action_required"
+      | null;
+    surprise_found: boolean;
+    action_required: boolean;
+    local_loop_count: number;
+    frontier_loop_count: number;
   };
   local_model: ProcessStatus;
   frontier_model: ProcessStatus;
@@ -77,6 +93,36 @@ const FRONTIER_STEPS = [
   "Plan Actions",
   "No Action Required",
 ];
+
+function localStepIndex(
+  step: DashboardPayload["loop_visualization"]["local_current_step"] | undefined,
+): number | null {
+  if (step === "gather_new_percepts") {
+    return 0;
+  }
+  if (step === "check_for_surprises" || step === "surprise_found") {
+    return 1;
+  }
+  if (step === "no_surprise") {
+    return 2;
+  }
+  return null;
+}
+
+function frontierStepIndex(
+  step: DashboardPayload["loop_visualization"]["frontier_current_step"] | undefined,
+): number | null {
+  if (step === "deeper_percept_investigation") {
+    return 0;
+  }
+  if (step === "plan_actions") {
+    return 1;
+  }
+  if (step === "no_action_required") {
+    return 2;
+  }
+  return null;
+}
 
 function pointOnCircle(cx: number, cy: number, radius: number, angleDegrees: number) {
   const angle = ((angleDegrees - 90) * Math.PI) / 180;
@@ -155,11 +201,13 @@ function LoopRing({
   modelLabel,
   steps,
   activeStep,
+  totalLoops,
 }: {
   title: string;
   modelLabel: string;
   steps: string[];
   activeStep: number | null;
+  totalLoops: number;
 }) {
   const ringRadius = 122;
   const labelRadius = 145;
@@ -168,6 +216,7 @@ function LoopRing({
   return (
     <article className="rounded-2xl border border-zinc-300 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-950">
       <h3 className="mb-3 text-center text-base font-semibold">{title}</h3>
+      <p className="mb-3 text-center text-xs text-zinc-600 dark:text-zinc-300">Total loops: {totalLoops}</p>
       <div className="relative mx-auto h-80 w-80">
         <svg viewBox="0 0 320 320" className="h-full w-full">
           {steps.map((step, index) => {
@@ -237,9 +286,9 @@ export function Dashboard() {
     return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
   });
   const [data, setData] = useState<DashboardResponse | null>(null);
-  const [tick, setTick] = useState(0);
   const [sensors, setSensors] = useState<EditableSensor[]>([]);
   const [actuators, setActuators] = useState<EditableActuator[]>([]);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -260,12 +309,10 @@ export function Dashboard() {
             setSensors((existing) => mergeSensors(existing, dashboard.sensors));
             setActuators((existing) => mergeActuators(existing, dashboard.actuators));
           }
-          setTick((current) => current + 1);
         }
       } catch {
         if (active) {
           setData({ connected: false, error: "Failed to fetch dashboard." });
-          setTick((current) => current + 1);
         }
       }
     }
@@ -282,58 +329,103 @@ export function Dashboard() {
   }, []);
 
   const snapshot = data?.dashboard;
-  const updatedAtText = data?.updated_at
-    ? new Date(data.updated_at).toLocaleTimeString()
-    : "No live data yet";
 
-  const loopState = useMemo(() => {
-    const iteration = snapshot?.state.latest_iteration_id ?? tick;
-    const localStep = iteration % 3;
-    const surpriseFound = localStep === 1 && iteration % 4 === 0;
-    const frontierActive = surpriseFound || snapshot?.frontier_model.process_state === "running";
-    const frontierStep = frontierActive ? iteration % 3 : null;
-    const actionRequired = frontierStep === 1 && iteration % 2 === 0;
-
-    return {
-      localStep,
-      surpriseFound,
-      frontierStep,
-      actionRequired,
-    };
-  }, [snapshot?.state.latest_iteration_id, snapshot?.frontier_model.process_state, tick]);
+  const loopState = snapshot?.loop_visualization;
 
   const localModelLabel = `${snapshot?.local_model.provider ?? "Local"} / ${snapshot?.local_model.model ?? "Unassigned"}`;
   const frontierModelLabel = `${snapshot?.frontier_model.provider ?? "Frontier"} / ${snapshot?.frontier_model.model ?? "Unassigned"}`;
 
   return (
-    <main className="min-h-screen bg-zinc-100 px-4 py-6 text-zinc-900 dark:bg-black dark:text-zinc-100 sm:px-6 lg:px-8">
-      <div className="mx-auto flex w-full max-w-[1600px] flex-col gap-5">
-        <header className="rounded-2xl border border-zinc-300 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-950">
-          <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <p className="text-xs uppercase tracking-[0.18em] text-zinc-500 dark:text-zinc-400">
-                Looper Agent Interface
-              </p>
-              <h1 className="mt-1 text-2xl font-semibold">Dashboard</h1>
-              <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">Updated {updatedAtText}</p>
-            </div>
-
-            <div className="flex items-center gap-3">
-              <span className={`rounded-full px-3 py-1 text-xs font-medium ${statusPill(Boolean(data?.connected))}`}>
-                {data?.connected ? "Agent Connected" : "Agent Offline"}
-              </span>
-              <button
-                type="button"
-                onClick={() => setTheme((current) => (current === "light" ? "dark" : "light"))}
-                className="rounded-lg border border-zinc-300 bg-zinc-100 px-3 py-2 text-sm font-medium transition hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800"
-              >
-                {theme === "light" ? "Switch to Dark" : "Switch to Light"}
-              </button>
-            </div>
+    <main className="min-h-screen w-full bg-zinc-100 text-zinc-900 dark:bg-black dark:text-zinc-100">
+      <div className="flex min-h-screen w-full">
+        <aside
+          className={`shrink-0 border-r border-zinc-300 bg-white transition-all duration-300 dark:border-zinc-800 dark:bg-zinc-950 ${
+            isSidebarOpen ? "w-72" : "w-16"
+          }`}
+        >
+          <div className="flex items-center justify-between border-b border-zinc-300 p-3 dark:border-zinc-800">
+            {isSidebarOpen ? <p className="text-sm font-semibold">Looper Workspace</p> : <span className="text-xs">Nav</span>}
+            <button
+              type="button"
+              onClick={() => setIsSidebarOpen((current) => !current)}
+              className="rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 text-xs font-medium dark:border-zinc-700 dark:bg-zinc-900"
+            >
+              {isSidebarOpen ? "Collapse" : "Expand"}
+            </button>
           </div>
-        </header>
 
-        <section className="grid gap-5 lg:grid-cols-12">
+          <nav className="p-3 text-sm">
+            {isSidebarOpen ? (
+              <ul className="space-y-3">
+                <li className="relative rounded-md bg-zinc-200 px-2 py-1 pl-4 font-medium dark:bg-zinc-800">
+                  <span className="absolute inset-y-0 left-0 w-1 rounded-l-md bg-zinc-500 dark:bg-zinc-400" />
+                  Dashboard
+                </li>
+                <li>
+                  <p className="rounded-md px-2 py-1 font-medium">Conversations</p>
+                  <ul className="mt-1 space-y-1 pl-4 text-zinc-600 dark:text-zinc-300">
+                    <li className="rounded-md px-2 py-1">New Chat</li>
+                    <li className="rounded-md px-2 py-1">Chat History</li>
+                  </ul>
+                </li>
+                <li>
+                  <p className="rounded-md px-2 py-1 font-medium">Sensors</p>
+                  <ul className="mt-1 space-y-1 pl-4 text-zinc-600 dark:text-zinc-300">
+                    <li className="rounded-md px-2 py-1">Add a Sensor</li>
+                    <li className="rounded-md px-2 py-1">All Sensors</li>
+                    <li className="rounded-md px-2 py-1">Percept History</li>
+                  </ul>
+                </li>
+                <li>
+                  <p className="rounded-md px-2 py-1 font-medium">Actuators</p>
+                  <ul className="mt-1 space-y-1 pl-4 text-zinc-600 dark:text-zinc-300">
+                    <li className="rounded-md px-2 py-1">Add an Actuator</li>
+                    <li className="rounded-md px-2 py-1">All Actuators</li>
+                    <li className="rounded-md px-2 py-1">Action History</li>
+                  </ul>
+                </li>
+                <li>
+                  <p className="rounded-md px-2 py-1 font-medium">Agent Settings</p>
+                  <ul className="mt-1 space-y-1 pl-4 text-zinc-600 dark:text-zinc-300">
+                    <li className="rounded-md px-2 py-1">Agent Identity</li>
+                    <li className="rounded-md px-2 py-1">Loop Configuration</li>
+                    <li className="rounded-md px-2 py-1">Providers &amp; Models</li>
+                  </ul>
+                </li>
+              </ul>
+            ) : (
+              <ul className="space-y-2 text-center text-xs font-medium">
+                <li className="rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-900">D</li>
+                <li className="rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-900">C</li>
+                <li className="rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-900">S</li>
+                <li className="rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-900">A</li>
+                <li className="rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-900">G</li>
+              </ul>
+            )}
+          </nav>
+        </aside>
+
+        <div className="flex min-w-0 flex-1 flex-col gap-5">
+          <header className="w-full border-b py-3 px-4 sm:px-6 border-zinc-300 bg-white dark:border-zinc-700 dark:bg-zinc-950">
+            <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+              <span>{/* Add "Looper Workspace" here only when the sidenav is collapsed */}</span>
+
+              <div className="flex items-center gap-3">
+                <span className={`rounded-full px-3 py-1 text-xs font-medium ${statusPill(Boolean(data?.connected))}`}>
+                  {data?.connected ? "Agent Connected" : "Agent Offline"}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setTheme((current) => (current === "light" ? "dark" : "light"))}
+                  className="rounded-lg border border-zinc-300 bg-zinc-100 px-3 py-1 text-xs font-medium transition hover:bg-zinc-200 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800"
+                >
+                  {theme === "light" ? "Switch to Dark" : "Switch to Light"}
+                </button>
+              </div>
+            </div>
+          </header>
+
+          <section className="grid gap-5 px-4 pb-4 sm:px-6 sm:pb-6 lg:grid-cols-12">
           <article className="rounded-2xl border border-zinc-300 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-950 lg:col-span-3">
             <h2 className="text-lg font-semibold">Sensors</h2>
             <button
@@ -407,13 +499,15 @@ export function Dashboard() {
                 title="Local Model Loop"
                 modelLabel={localModelLabel}
                 steps={LOCAL_STEPS}
-                activeStep={loopState.localStep}
+                activeStep={localStepIndex(loopState?.local_current_step)}
+                totalLoops={loopState?.local_loop_count ?? 0}
               />
               <LoopRing
                 title="Frontier Model Loop"
                 modelLabel={frontierModelLabel}
                 steps={FRONTIER_STEPS}
-                activeStep={loopState.frontierStep}
+                activeStep={frontierStepIndex(loopState?.frontier_current_step)}
+                totalLoops={loopState?.frontier_loop_count ?? 0}
               />
             </div>
 
@@ -421,23 +515,23 @@ export function Dashboard() {
               <div className="rounded-lg border border-zinc-300 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-950">
                 <p className="font-semibold">Local Branch</p>
                 <p className="mt-1 text-zinc-600 dark:text-zinc-300">
-                  After Check For Surprises: {loopState.surpriseFound ? "Surprise Found" : "No Surprise"}
+                  After Check For Surprises: {loopState?.surprise_found ? "Surprise Found" : "No Surprise"}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-300 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-950">
                 <p className="font-semibold">Frontier Branch</p>
                 <p className="mt-1 text-zinc-600 dark:text-zinc-300">
-                  After Plan Actions: {loopState.actionRequired ? "Action Required" : "No Action Required"}
+                  After Plan Actions: {loopState?.action_required ? "Action Required" : "No Action Required"}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-300 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-950 sm:col-span-2">
                 <p className="font-semibold">Loop Flow</p>
                 <p className="mt-1 text-zinc-600 dark:text-zinc-300">
                   {`Sensors -> Local Model -> ${
-                    loopState.surpriseFound ? "Frontier Model" : "Gather New Percepts"
+                    loopState?.surprise_found ? "Frontier Model" : "Gather New Percepts"
                   }${
-                    loopState.surpriseFound
-                      ? ` -> ${loopState.actionRequired ? "Actuators" : "No Action Required"} -> Gather New Percepts`
+                    loopState?.surprise_found
+                      ? ` -> ${loopState.action_required ? "Actuators" : "No Action Required"} -> Gather New Percepts`
                       : ""
                   }`}
                 </p>
@@ -516,7 +610,8 @@ export function Dashboard() {
               )}
             </div>
           </article>
-        </section>
+          </section>
+        </div>
       </div>
     </main>
   );
