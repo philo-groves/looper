@@ -27,6 +27,6 @@ pub use models::{
 pub use runtime::{
     FrontierLoopStep, IterationReport, LocalLoopStep, LoopPhase, LoopPhaseTransitionEvent,
     LoopRuntimePhase, LoopVisualizationSnapshot, LooperRuntime, Observability,
-    ObservabilitySnapshot,
+    ObservabilitySnapshot, default_agent_workspace_dir,
 };
 pub use storage::{PersistedIteration, SqliteStore};

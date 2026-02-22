@@ -18,7 +18,7 @@ use fiddlesticks::{ProviderId, list_models_with_api_key};
 use futures_util::{SinkExt, StreamExt};
 use looper_agent::{
     AgentState, ExecutionResult, ModelProviderKind, ModelSelection, ObservabilitySnapshot,
-    PersistedIteration,
+    PersistedIteration, default_agent_workspace_dir,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -2434,7 +2434,7 @@ fn write_persisted_setup_config(config: &PersistedSetupConfig) -> Result<()> {
 }
 
 fn terminal_setup_config_path() -> PathBuf {
-    workspace_dir().join("terminal-setup.json")
+    default_agent_workspace_dir().join("agent-settings.json")
 }
 
 fn terminal_log_path() -> PathBuf {
@@ -2476,10 +2476,6 @@ fn user_looper_dir() -> PathBuf {
     }
 
     std::env::temp_dir().join(".looper")
-}
-
-fn workspace_dir() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
 }
 
 fn user_home_dir() -> Option<PathBuf> {

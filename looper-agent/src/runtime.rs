@@ -22,6 +22,14 @@ use crate::storage::{PersistedIteration, SqliteStore};
 
 const FORCE_SURPRISE_SENSITIVITY_THRESHOLD: u8 = 90;
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedAgentSettings {
+    local_provider: ModelProviderKind,
+    local_model: String,
+    frontier_provider: ModelProviderKind,
+    frontier_model: String,
+}
+
 /// Phases of a loop iteration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum LoopPhase {
@@ -269,6 +277,7 @@ pub struct LooperRuntime {
     executions_per_actuator: HashMap<String, u32>,
     pending_approvals: HashMap<u64, PendingApproval>,
     next_approval_id: u64,
+    workspace_root: PathBuf,
     store: Option<SqliteStore>,
     loop_visualization: LoopVisualizationState,
     phase_events: VecDeque<LoopPhaseTransitionEvent>,
@@ -292,6 +301,7 @@ impl LooperRuntime {
             executions_per_actuator: HashMap::new(),
             pending_approvals: HashMap::new(),
             next_approval_id: 1,
+            workspace_root: default_agent_workspace_dir(),
             store: None,
             loop_visualization: LoopVisualizationState::default(),
             phase_events: VecDeque::new(),
@@ -347,6 +357,7 @@ impl LooperRuntime {
         )?);
 
         let workspace_root = workspace_root.into();
+        runtime.workspace_root = workspace_root.clone();
         runtime.register_internal_executor(
             InternalActuatorKind::Chat,
             Box::<ChatActuatorExecutor>::default(),
@@ -370,6 +381,7 @@ impl LooperRuntime {
 
         runtime.attach_store(SqliteStore::new(default_store_path())?);
         runtime.load_persisted_api_keys()?;
+        runtime.load_persisted_settings()?;
         Ok(runtime)
     }
 
@@ -402,6 +414,7 @@ impl LooperRuntime {
         if self.agent_state == AgentState::Setup {
             self.stop_reason = None;
         }
+        self.persist_settings()?;
         Ok(())
     }
 
@@ -886,7 +899,7 @@ impl LooperRuntime {
     }
 
     fn persist_api_keys(&self) -> Result<()> {
-        let path = api_key_store_path();
+        let path = self.api_key_store_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -896,8 +909,29 @@ impl LooperRuntime {
         Ok(())
     }
 
+    fn persist_settings(&self) -> Result<()> {
+        let (Some(local), Some(frontier)) = (&self.local_selection, &self.frontier_selection)
+        else {
+            return Ok(());
+        };
+
+        let path = self.settings_store_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let encoded = serde_json::to_string_pretty(&PersistedAgentSettings {
+            local_provider: local.provider,
+            local_model: local.model.clone(),
+            frontier_provider: frontier.provider,
+            frontier_model: frontier.model.clone(),
+        })?;
+        fs::write(path, encoded)?;
+        Ok(())
+    }
+
     fn load_persisted_api_keys(&mut self) -> Result<()> {
-        let path = api_key_store_path();
+        let path = self.api_key_store_path();
         if !path.exists() {
             return Ok(());
         }
@@ -917,6 +951,41 @@ impl LooperRuntime {
             .collect();
         Ok(())
     }
+
+    fn load_persisted_settings(&mut self) -> Result<()> {
+        let path = self.settings_store_path();
+        if !path.exists() {
+            return Ok(());
+        }
+
+        let raw = fs::read_to_string(path)?;
+        let parsed = serde_json::from_str::<PersistedAgentSettings>(&raw)?;
+        let local = ModelSelection {
+            provider: parsed.local_provider,
+            model: parsed.local_model,
+        };
+        let frontier = ModelSelection {
+            provider: parsed.frontier_provider,
+            model: parsed.frontier_model,
+        };
+
+        if self.configure_models(local, frontier).is_err() {
+            self.local_selection = None;
+            self.frontier_selection = None;
+            self.local_model = None;
+            self.frontier_model = None;
+        }
+
+        Ok(())
+    }
+
+    fn api_key_store_path(&self) -> PathBuf {
+        self.workspace_root.join("keys.json")
+    }
+
+    fn settings_store_path(&self) -> PathBuf {
+        self.workspace_root.join("agent-settings.json")
+    }
 }
 
 impl Default for LooperRuntime {
@@ -929,12 +998,13 @@ fn default_store_path() -> PathBuf {
     looper_user_dir().join("looper.db")
 }
 
-fn api_key_store_path() -> PathBuf {
-    workspace_dir().join("keys.json")
-}
+/// Returns the default storage directory used by the agent.
+pub fn default_agent_workspace_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("LOOPER_WORKSPACE_ROOT") {
+        return PathBuf::from(path);
+    }
 
-fn workspace_dir() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+    looper_user_dir().join("workspace")
 }
 
 fn now_unix_ms() -> i64 {
