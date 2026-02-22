@@ -15,6 +15,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use fiddlesticks::{ProviderId, list_models_with_api_key};
+use futures_util::{SinkExt, StreamExt};
 use looper_agent::{
     AgentState, ExecutionResult, ModelProviderKind, ModelSelection, ObservabilitySnapshot,
     PersistedIteration,
@@ -30,6 +31,7 @@ use ratatui::widgets::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,26 +61,18 @@ async fn run_one_shot(message: String) -> Result<()> {
 
 #[derive(Clone)]
 struct AgentClient {
-    base_url: String,
-    http: reqwest::Client,
+    ws_url: String,
 }
 
 impl AgentClient {
     fn new(base_url: String) -> Self {
         Self {
-            base_url,
-            http: reqwest::Client::new(),
+            ws_url: to_ws_url(&base_url),
         }
     }
 
     async fn health(&self) -> Result<()> {
-        let response = self
-            .http
-            .get(format!("{}/api/health", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?;
-        let body = response.json::<HealthResponse>().await?;
+        let body: HealthResponse = self.request("health", serde_json::json!({})).await?;
         if body.status != "ok" {
             return Err(anyhow!("agent reported unhealthy status: {}", body.status));
         }
@@ -86,49 +80,24 @@ impl AgentClient {
     }
 
     async fn state(&self) -> Result<AgentStateResponse> {
-        Ok(self
-            .http
-            .get(format!("{}/api/state", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        self.request("state", serde_json::json!({})).await
     }
 
     async fn metrics(&self) -> Result<ObservabilitySnapshot> {
-        Ok(self
-            .http
-            .get(format!("{}/api/metrics", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        self.request("metrics", serde_json::json!({})).await
     }
 
     async fn enqueue_chat_message(&self, message: String) -> Result<()> {
-        self.http
-            .post(format!("{}/api/percepts/chat", self.base_url))
-            .json(&ChatPerceptRequest { message })
-            .send()
-            .await?
-            .error_for_status()?;
+        let _: serde_json::Value = self
+            .request("enqueue_chat_message", ChatPerceptRequest { message })
+            .await?;
         Ok(())
     }
 
     async fn register_api_key(&self, provider: ModelProviderKind, api_key: String) -> Result<()> {
-        let response = self
-            .http
-            .post(format!("{}/api/config/keys", self.base_url))
-            .json(&ApiKeyRequest { provider, api_key })
-            .send()
+        let _: serde_json::Value = self
+            .request("register_api_key", ApiKeyRequest { provider, api_key })
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("register key failed ({status}): {body}"));
-        }
         Ok(())
     }
 
@@ -137,43 +106,24 @@ impl AgentClient {
         local: ModelSelection,
         frontier: ModelSelection,
     ) -> Result<()> {
-        let response = self
-            .http
-            .post(format!("{}/api/config/models", self.base_url))
-            .json(&ModelConfigRequest { local, frontier })
-            .send()
+        let _: serde_json::Value = self
+            .request("configure_models", ModelConfigRequest { local, frontier })
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("configure models failed ({status}): {body}"));
-        }
         Ok(())
     }
 
     async fn start_loop(&self, interval_ms: u64) -> Result<LoopStatusResponse> {
-        Ok(self
-            .http
-            .post(format!("{}/api/loop/start", self.base_url))
-            .json(&LoopStartRequest {
+        self.request(
+            "loop_start",
+            LoopStartRequest {
                 interval_ms: Some(interval_ms),
-            })
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            },
+        )
+        .await
     }
 
     async fn loop_status(&self) -> Result<LoopStatusResponse> {
-        Ok(self
-            .http
-            .get(format!("{}/api/loop/status", self.base_url))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        self.request("loop_status", serde_json::json!({})).await
     }
 
     async fn list_iterations_after(
@@ -181,15 +131,67 @@ impl AgentClient {
         after_id: Option<i64>,
         limit: usize,
     ) -> Result<Vec<PersistedIteration>> {
-        let response = self
-            .http
-            .get(format!("{}/api/iterations", self.base_url))
-            .query(&[("after_id", after_id), ("limit", Some(limit as i64))])
-            .send()
-            .await?
-            .error_for_status()?;
-        let body = response.json::<IterationsResponse>().await?;
+        let body: IterationsResponse = self
+            .request(
+                "list_iterations",
+                IterationListParams {
+                    after_id,
+                    limit: Some(limit),
+                },
+            )
+            .await?;
         Ok(body.iterations)
+    }
+
+    async fn request<P, R>(&self, method: &str, params: P) -> Result<R>
+    where
+        P: Serialize,
+        R: for<'de> Deserialize<'de>,
+    {
+        let (mut socket, _) = connect_async(&self.ws_url).await?;
+        let request = WsRequest {
+            id: Some(1),
+            method: method.to_string(),
+            params: serde_json::to_value(params)?,
+        };
+        socket
+            .send(Message::Text(serde_json::to_string(&request)?))
+            .await?;
+
+        while let Some(message) = socket.next().await {
+            let message = message?;
+            let Message::Text(text) = message else {
+                continue;
+            };
+
+            let envelope: WsEnvelope = serde_json::from_str(&text)?;
+            if envelope.kind != "response" {
+                continue;
+            }
+            if envelope.id != Some(1) {
+                continue;
+            }
+
+            let ok = envelope
+                .ok
+                .ok_or_else(|| anyhow!("missing websocket response 'ok' field"))?;
+
+            if !ok {
+                return Err(anyhow!(
+                    envelope
+                        .error
+                        .unwrap_or_else(|| "websocket request failed".to_string())
+                ));
+            }
+
+            let value = envelope
+                .result
+                .ok_or_else(|| anyhow!("missing websocket result"))?;
+            let parsed = serde_json::from_value::<R>(value)?;
+            return Ok(parsed);
+        }
+
+        Err(anyhow!("websocket connection closed before response"))
     }
 }
 
@@ -241,8 +243,45 @@ struct LoopStartRequest {
     interval_ms: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct IterationListParams {
+    after_id: Option<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct WsRequest {
+    id: Option<u64>,
+    method: String,
+    params: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WsEnvelope {
+    #[serde(rename = "type")]
+    kind: String,
+    id: Option<u64>,
+    ok: Option<bool>,
+    result: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
 fn default_agent_base_url() -> String {
     env::var("LOOPER_AGENT_URL").unwrap_or_else(|_| "http://127.0.0.1:10001".to_string())
+}
+
+fn to_ws_url(base_url: &str) -> String {
+    if let Ok(explicit) = env::var("LOOPER_AGENT_WS_URL") {
+        return explicit;
+    }
+
+    if let Some(rest) = base_url.strip_prefix("https://") {
+        return format!("wss://{rest}/api/ws");
+    }
+    if let Some(rest) = base_url.strip_prefix("http://") {
+        return format!("ws://{rest}/api/ws");
+    }
+    format!("ws://{base_url}/api/ws")
 }
 
 async fn run_tui() -> Result<()> {
@@ -2395,7 +2434,7 @@ fn write_persisted_setup_config(config: &PersistedSetupConfig) -> Result<()> {
 }
 
 fn terminal_setup_config_path() -> PathBuf {
-    user_looper_dir().join("terminal-setup.json")
+    workspace_dir().join("terminal-setup.json")
 }
 
 fn terminal_log_path() -> PathBuf {
@@ -2437,6 +2476,10 @@ fn user_looper_dir() -> PathBuf {
     }
 
     std::env::temp_dir().join(".looper")
+}
+
+fn workspace_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
 }
 
 fn user_home_dir() -> Option<PathBuf> {

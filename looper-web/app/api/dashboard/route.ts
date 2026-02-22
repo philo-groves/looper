@@ -38,6 +38,14 @@ type AgentDashboardPayload = {
     action_required: boolean;
     local_loop_count: number;
     frontier_loop_count: number;
+    current_phase:
+      | "gather_new_percepts"
+      | "check_for_surprises"
+      | "deeper_percept_investigation"
+      | "plan_actions"
+      | "execute_actions"
+      | "idle";
+    current_phase_started_at_unix_ms: number;
   };
   local_model: {
     configured: boolean;

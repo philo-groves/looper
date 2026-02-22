@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -49,6 +49,18 @@ pub enum FrontierLoopStep {
     NoActionRequired,
 }
 
+/// High-level current phase of the loop runtime.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopRuntimePhase {
+    GatherNewPercepts,
+    CheckForSurprises,
+    DeeperPerceptInvestigation,
+    PlanActions,
+    ExecuteActions,
+    Idle,
+}
+
 /// Serialization-friendly loop state payload for dashboard rendering.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LoopVisualizationSnapshot {
@@ -64,6 +76,23 @@ pub struct LoopVisualizationSnapshot {
     pub local_loop_count: u64,
     /// Total frontier loop count.
     pub frontier_loop_count: u64,
+    /// Current runtime phase.
+    pub current_phase: LoopRuntimePhase,
+    /// Unix timestamp in milliseconds when the current phase started.
+    pub current_phase_started_at_unix_ms: i64,
+}
+
+/// Phase transition event for websocket consumers.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LoopPhaseTransitionEvent {
+    /// Monotonic event sequence.
+    pub sequence: u64,
+    /// Active runtime phase after this transition.
+    pub phase: LoopRuntimePhase,
+    /// Loop visualization snapshot at transition time.
+    pub loop_visualization: LoopVisualizationSnapshot,
+    /// Unix timestamp in milliseconds when this event was emitted.
+    pub emitted_at_unix_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -74,6 +103,8 @@ struct LoopVisualizationState {
     action_required: bool,
     local_loop_count: u64,
     frontier_loop_count: u64,
+    current_phase: LoopRuntimePhase,
+    current_phase_started_at_unix_ms: i64,
 }
 
 impl Default for LoopVisualizationState {
@@ -85,6 +116,8 @@ impl Default for LoopVisualizationState {
             action_required: false,
             local_loop_count: 0,
             frontier_loop_count: 0,
+            current_phase: LoopRuntimePhase::Idle,
+            current_phase_started_at_unix_ms: now_unix_ms(),
         }
     }
 }
@@ -98,6 +131,8 @@ impl LoopVisualizationState {
             action_required: self.action_required,
             local_loop_count: self.local_loop_count,
             frontier_loop_count: self.frontier_loop_count,
+            current_phase: self.current_phase,
+            current_phase_started_at_unix_ms: self.current_phase_started_at_unix_ms,
         }
     }
 }
@@ -236,6 +271,8 @@ pub struct LooperRuntime {
     next_approval_id: u64,
     store: Option<SqliteStore>,
     loop_visualization: LoopVisualizationState,
+    phase_events: VecDeque<LoopPhaseTransitionEvent>,
+    next_phase_event_sequence: u64,
 }
 
 impl LooperRuntime {
@@ -257,6 +294,8 @@ impl LooperRuntime {
             next_approval_id: 1,
             store: None,
             loop_visualization: LoopVisualizationState::default(),
+            phase_events: VecDeque::new(),
+            next_phase_event_sequence: 1,
         }
     }
 
@@ -513,6 +552,20 @@ impl LooperRuntime {
         self.loop_visualization.snapshot()
     }
 
+    /// Returns phase transition events newer than `after_sequence`.
+    pub fn loop_phase_events_since(&self, after_sequence: u64) -> Vec<LoopPhaseTransitionEvent> {
+        self.phase_events
+            .iter()
+            .filter(|event| event.sequence > after_sequence)
+            .cloned()
+            .collect()
+    }
+
+    /// Returns latest emitted phase transition sequence.
+    pub fn latest_phase_event_sequence(&self) -> u64 {
+        self.next_phase_event_sequence.saturating_sub(1)
+    }
+
     pub async fn run_iteration(&mut self) -> Result<IterationReport> {
         if self.agent_state != AgentState::Running {
             return Err(anyhow!("runtime is not running"));
@@ -525,8 +578,10 @@ impl LooperRuntime {
         self.loop_visualization.frontier_current_step = None;
         self.loop_visualization.surprise_found = false;
         self.loop_visualization.action_required = false;
+        self.transition_phase(LoopRuntimePhase::GatherNewPercepts);
 
         self.loop_visualization.local_current_step = LocalLoopStep::CheckForSurprises;
+        self.transition_phase(LoopRuntimePhase::CheckForSurprises);
         self.observability.bump_phase(LoopPhase::SurpriseDetection);
 
         let sensed = self.collect_new_percepts();
@@ -569,6 +624,7 @@ impl LooperRuntime {
 
         if surprising.is_empty() {
             self.loop_visualization.local_current_step = LocalLoopStep::NoSurprise;
+            self.transition_phase(LoopRuntimePhase::Idle);
             let mut report = IterationReport {
                 iteration_id: None,
                 sensed_percepts: sensed,
@@ -590,9 +646,11 @@ impl LooperRuntime {
             .saturating_add(1);
         self.loop_visualization.frontier_current_step =
             Some(FrontierLoopStep::DeeperPerceptInvestigation);
+        self.transition_phase(LoopRuntimePhase::DeeperPerceptInvestigation);
 
         self.observability.bump_phase(LoopPhase::Reasoning);
         self.loop_visualization.frontier_current_step = Some(FrontierLoopStep::PlanActions);
+        self.transition_phase(LoopRuntimePhase::PlanActions);
         let frontier_model = self
             .frontier_model
             .as_ref()
@@ -619,6 +677,7 @@ impl LooperRuntime {
             self.observability.false_positive_surprises += 1;
             self.loop_visualization.frontier_current_step =
                 Some(FrontierLoopStep::NoActionRequired);
+            self.transition_phase(LoopRuntimePhase::Idle);
             let mut report = IterationReport {
                 iteration_id: None,
                 sensed_percepts: sensed,
@@ -634,6 +693,7 @@ impl LooperRuntime {
 
         self.observability.bump_phase(LoopPhase::PerformActions);
         self.loop_visualization.action_required = true;
+        self.transition_phase(LoopRuntimePhase::ExecuteActions);
         let mut action_results = Vec::with_capacity(planned_actions.len());
         for recommendation in &planned_actions {
             let result = self.execute_recommendation(recommendation, false)?;
@@ -653,7 +713,27 @@ impl LooperRuntime {
             ended_after_reasoning: false,
         };
         self.persist_iteration(&mut report)?;
+        self.transition_phase(LoopRuntimePhase::Idle);
         Ok(report)
+    }
+
+    fn transition_phase(&mut self, phase: LoopRuntimePhase) {
+        self.loop_visualization.current_phase = phase;
+        self.loop_visualization.current_phase_started_at_unix_ms = now_unix_ms();
+
+        let sequence = self.next_phase_event_sequence;
+        self.next_phase_event_sequence = self.next_phase_event_sequence.saturating_add(1);
+
+        self.phase_events.push_back(LoopPhaseTransitionEvent {
+            sequence,
+            phase,
+            loop_visualization: self.loop_visualization.snapshot(),
+            emitted_at_unix_ms: now_unix_ms(),
+        });
+
+        while self.phase_events.len() > 512 {
+            let _ = self.phase_events.pop_front();
+        }
     }
 
     fn collect_new_percepts(&mut self) -> Vec<Percept> {
@@ -850,7 +930,18 @@ fn default_store_path() -> PathBuf {
 }
 
 fn api_key_store_path() -> PathBuf {
-    looper_user_dir().join("keys.json")
+    workspace_dir().join("keys.json")
+}
+
+fn workspace_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+}
+
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 fn looper_user_dir() -> PathBuf {

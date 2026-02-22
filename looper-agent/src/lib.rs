@@ -25,7 +25,8 @@ pub use models::{
     RuleBasedFrontierModel, RuleBasedLocalModel,
 };
 pub use runtime::{
-    FrontierLoopStep, IterationReport, LocalLoopStep, LoopPhase, LoopVisualizationSnapshot,
-    LooperRuntime, Observability, ObservabilitySnapshot,
+    FrontierLoopStep, IterationReport, LocalLoopStep, LoopPhase, LoopPhaseTransitionEvent,
+    LoopRuntimePhase, LoopVisualizationSnapshot, LooperRuntime, Observability,
+    ObservabilitySnapshot,
 };
 pub use storage::{PersistedIteration, SqliteStore};

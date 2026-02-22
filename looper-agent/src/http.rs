@@ -1,11 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use fiddlesticks::{ProviderId, list_models_with_api_key};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::select;
 use tokio::sync::{Mutex, oneshot};
 
@@ -50,6 +53,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/loop/status", get(loop_status_handler))
         .route("/api/state", get(state_handler))
         .route("/api/dashboard", get(dashboard_handler))
+        .route("/api/ws", get(websocket_handler))
         .route("/api/iterations", get(list_iterations_handler))
         .route("/api/iterations/{id}", get(get_iteration_handler))
         .route("/api/approvals", get(list_approvals_handler))
@@ -173,56 +177,13 @@ pub async fn loop_start_handler(
     Json(request): Json<LoopStartRequest>,
 ) -> Result<Json<LoopStatusResponse>, (StatusCode, Json<ApiError>)> {
     let interval_ms = request.interval_ms.unwrap_or(200);
-
-    {
-        let mut runtime = state.runtime.lock().await;
-        runtime
-            .start()
-            .map_err(|error| bad_request(error.to_string()))?;
-    }
-
-    {
-        let loop_control = state.loop_control.lock().await;
-        if loop_control.running {
-            return Ok(Json(loop_control.status_response()));
-        }
-    }
-
-    let runtime = state.runtime.clone();
-    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
-    let state_for_task = state.clone();
-
-    let join_handle = tokio::spawn(async move {
-        loop {
-            select! {
-                _ = &mut stop_rx => {
-                    break;
-                }
-                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {
-                    let run_result = {
-                        let mut runtime_guard = runtime.lock().await;
-                        runtime_guard.run_iteration().await
-                    };
-
-                    if run_result.is_err() {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                }
-            }
-        }
-
-        let mut loop_control = state_for_task.loop_control.lock().await;
-        loop_control.running = false;
-        loop_control.join_handle = None;
-        loop_control.stop_sender = None;
-    });
-
-    let mut loop_control = state.loop_control.lock().await;
-    loop_control.running = true;
-    loop_control.interval_ms = interval_ms;
-    loop_control.stop_sender = Some(stop_tx);
-    loop_control.join_handle = Some(join_handle);
-    Ok(Json(loop_control.status_response()))
+    let status = loop_start_impl(&state, interval_ms)
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            bad_request(message)
+        })?;
+    Ok(Json(status))
 }
 
 /// Stops continuous loop execution.
@@ -283,64 +244,10 @@ pub async fn state_handler(
 pub async fn dashboard_handler(
     State(state): State<AppState>,
 ) -> Result<Json<DashboardResponse>, (StatusCode, Json<ApiError>)> {
-    let loop_status = {
-        let loop_control = state.loop_control.lock().await;
-        loop_control.status_response()
-    };
-
-    let runtime = state.runtime.lock().await;
-    let latest_iteration_id = runtime
-        .latest_iteration_id()
+    let snapshot = dashboard_snapshot(&state)
+        .await
         .map_err(|error| internal_error(error.to_string()))?;
-
-    let runtime_state = runtime.state();
-    let local_selection = runtime.local_selection().cloned();
-    let frontier_selection = runtime.frontier_selection().cloned();
-    let state_response = AgentStateResponse {
-        state: runtime_state,
-        reason: runtime.stop_reason().map(str::to_string),
-        configured: runtime.is_configured(),
-        local_selection: local_selection.clone(),
-        frontier_selection: frontier_selection.clone(),
-        latest_iteration_id,
-    };
-
-    let sensors = runtime
-        .sensors()
-        .into_iter()
-        .map(|sensor| {
-            let queued_percepts = sensor.queued_count();
-            let unread_percepts = sensor.unread_count();
-            SensorStatus {
-                name: sensor.name,
-                description: sensor.description,
-                enabled: sensor.enabled,
-                sensitivity_score: sensor.sensitivity_score,
-                queued_percepts,
-                unread_percepts,
-            }
-        })
-        .collect();
-
-    let actuators = runtime
-        .actuators()
-        .into_iter()
-        .map(actuator_status)
-        .collect();
-
-    let loop_running = loop_status.running;
-
-    Ok(Json(DashboardResponse {
-        state: state_response,
-        loop_status,
-        observability: runtime.observability_snapshot(),
-        loop_visualization: runtime.loop_visualization_snapshot(),
-        local_model: model_process_status(local_selection, runtime_state, loop_running),
-        frontier_model: model_process_status(frontier_selection, runtime_state, loop_running),
-        sensors,
-        actuators,
-        pending_approval_count: runtime.pending_approvals().len(),
-    }))
+    Ok(Json(snapshot))
 }
 
 /// Returns one persisted iteration.
@@ -620,6 +527,258 @@ pub struct ApiError {
     pub error: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WsRequestMessage {
+    id: Option<u64>,
+    method: String,
+    #[serde(default)]
+    params: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum WsServerMessage {
+    #[serde(rename = "response")]
+    Response {
+        id: Option<u64>,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result: Option<Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    #[serde(rename = "event")]
+    Event { event: &'static str, data: Value },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WsLoopStartParams {
+    interval_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WsListProviderModelsParams {
+    provider: ModelProviderKind,
+    api_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WsOllamaModelVersionsParams {
+    model: String,
+}
+
+/// Upgrades to a websocket session for realtime bidirectional updates.
+pub async fn websocket_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| websocket_session(socket, state))
+}
+
+async fn websocket_session(mut socket: WebSocket, state: AppState) {
+    let mut snapshot_ticker = tokio::time::interval(Duration::from_millis(1000));
+    let mut phase_ticker = tokio::time::interval(Duration::from_millis(150));
+    let mut last_phase_sequence = {
+        let runtime = state.runtime.lock().await;
+        runtime.latest_phase_event_sequence()
+    };
+
+    if let Ok(snapshot) = dashboard_snapshot(&state).await {
+        let payload = WsServerMessage::Event {
+            event: "dashboard_snapshot",
+            data: serde_json::to_value(snapshot).unwrap_or(Value::Null),
+        };
+        if send_ws_message(&mut socket, payload).await.is_err() {
+            return;
+        }
+    }
+
+    loop {
+        select! {
+            _ = snapshot_ticker.tick() => {
+                match dashboard_snapshot(&state).await {
+                    Ok(snapshot) => {
+                        let payload = WsServerMessage::Event {
+                            event: "dashboard_snapshot",
+                            data: serde_json::to_value(snapshot).unwrap_or(Value::Null),
+                        };
+                        if send_ws_message(&mut socket, payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
+            }
+            _ = phase_ticker.tick() => {
+                let phase_events = {
+                    let runtime = state.runtime.lock().await;
+                    runtime.loop_phase_events_since(last_phase_sequence)
+                };
+
+                for event in phase_events {
+                    last_phase_sequence = event.sequence;
+                    let payload = WsServerMessage::Event {
+                        event: "loop_phase_transition",
+                        data: serde_json::to_value(event).unwrap_or(Value::Null),
+                    };
+                    if send_ws_message(&mut socket, payload).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            incoming = socket.recv() => {
+                let Some(Ok(message)) = incoming else {
+                    break;
+                };
+
+                let Message::Text(text) = message else {
+                    continue;
+                };
+
+                let response = match serde_json::from_str::<WsRequestMessage>(&text) {
+                    Ok(request) => ws_dispatch_request(&state, request).await,
+                    Err(error) => WsServerMessage::Response {
+                        id: None,
+                        ok: false,
+                        result: None,
+                        error: Some(format!("invalid request: {error}")),
+                    },
+                };
+
+                if send_ws_message(&mut socket, response).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+async fn send_ws_message(socket: &mut WebSocket, payload: WsServerMessage) -> anyhow::Result<()> {
+    let encoded = serde_json::to_string(&payload)?;
+    socket.send(Message::Text(encoded.into())).await?;
+    Ok(())
+}
+
+async fn ws_dispatch_request(state: &AppState, request: WsRequestMessage) -> WsServerMessage {
+    let result = ws_handle_request(state, &request.method, request.params).await;
+    match result {
+        Ok(value) => WsServerMessage::Response {
+            id: request.id,
+            ok: true,
+            result: Some(value),
+            error: None,
+        },
+        Err(error) => WsServerMessage::Response {
+            id: request.id,
+            ok: false,
+            result: None,
+            error: Some(error),
+        },
+    }
+}
+
+async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Result<Value, String> {
+    match method {
+        "health" => Ok(serde_json::json!({ "status": "ok" })),
+        "state" => {
+            let runtime = state.runtime.lock().await;
+            let latest_iteration_id = runtime
+                .latest_iteration_id()
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(AgentStateResponse {
+                state: runtime.state(),
+                reason: runtime.stop_reason().map(str::to_string),
+                configured: runtime.is_configured(),
+                local_selection: runtime.local_selection().cloned(),
+                frontier_selection: runtime.frontier_selection().cloned(),
+                latest_iteration_id,
+            })
+            .map_err(|error| error.to_string())?)
+        }
+        "metrics" => {
+            let runtime = state.runtime.lock().await;
+            Ok(serde_json::to_value(runtime.observability_snapshot())
+                .map_err(|error| error.to_string())?)
+        }
+        "loop_status" => {
+            let loop_control = state.loop_control.lock().await;
+            Ok(serde_json::to_value(loop_control.status_response())
+                .map_err(|error| error.to_string())?)
+        }
+        "loop_start" => {
+            let payload: WsLoopStartParams =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let status = loop_start_impl(state, payload.interval_ms.unwrap_or(200))
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(status).map_err(|error| error.to_string())?)
+        }
+        "enqueue_chat_message" => {
+            let payload: ChatPerceptRequest =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let mut runtime = state.runtime.lock().await;
+            runtime
+                .enqueue_chat_message(payload.message)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "status": "accepted" }))
+        }
+        "register_api_key" => {
+            let payload: ApiKeyRequest =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let mut runtime = state.runtime.lock().await;
+            runtime
+                .register_api_key(payload.provider, payload.api_key)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
+        "configure_models" => {
+            let payload: ModelConfigRequest =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let mut runtime = state.runtime.lock().await;
+            runtime
+                .configure_models(payload.local, payload.frontier)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
+        "list_provider_models" => {
+            let payload: WsListProviderModelsParams =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let models = list_provider_models(payload.provider, payload.api_key)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "models": models }))
+        }
+        "list_ollama_base_models" => {
+            let models = scrape_ollama_library_base_models()
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "models": models }))
+        }
+        "list_ollama_model_versions" => {
+            let payload: WsOllamaModelVersionsParams =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let versions = scrape_ollama_model_versions(&payload.model)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "versions": versions }))
+        }
+        "list_iterations" => {
+            let payload: IterationListQuery =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let limit = payload.limit.unwrap_or(50).clamp(1, 500);
+            let runtime = state.runtime.lock().await;
+            let iterations = runtime
+                .list_iterations_after(payload.after_id, limit)
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(IterationsResponse { iterations })
+                .map_err(|error| error.to_string())?)
+        }
+        _ => Err(format!("unsupported method '{method}'")),
+    }
+}
+
 #[derive(Default)]
 struct LoopControl {
     running: bool,
@@ -635,6 +794,327 @@ impl LoopControl {
             interval_ms: self.interval_ms,
         }
     }
+}
+
+async fn loop_start_impl(state: &AppState, interval_ms: u64) -> anyhow::Result<LoopStatusResponse> {
+    {
+        let mut runtime = state.runtime.lock().await;
+        runtime.start()?;
+    }
+
+    {
+        let loop_control = state.loop_control.lock().await;
+        if loop_control.running {
+            return Ok(loop_control.status_response());
+        }
+    }
+
+    let runtime = state.runtime.clone();
+    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let state_for_task = state.clone();
+
+    let join_handle = tokio::spawn(async move {
+        loop {
+            select! {
+                _ = &mut stop_rx => {
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {
+                    let run_result = {
+                        let mut runtime_guard = runtime.lock().await;
+                        runtime_guard.run_iteration().await
+                    };
+
+                    if run_result.is_err() {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
+
+        let mut loop_control = state_for_task.loop_control.lock().await;
+        loop_control.running = false;
+        loop_control.join_handle = None;
+        loop_control.stop_sender = None;
+    });
+
+    let mut loop_control = state.loop_control.lock().await;
+    loop_control.running = true;
+    loop_control.interval_ms = interval_ms;
+    loop_control.stop_sender = Some(stop_tx);
+    loop_control.join_handle = Some(join_handle);
+    Ok(loop_control.status_response())
+}
+
+async fn dashboard_snapshot(state: &AppState) -> anyhow::Result<DashboardResponse> {
+    let loop_status = {
+        let loop_control = state.loop_control.lock().await;
+        loop_control.status_response()
+    };
+
+    let runtime = state.runtime.lock().await;
+    let latest_iteration_id = runtime.latest_iteration_id()?;
+
+    let runtime_state = runtime.state();
+    let local_selection = runtime.local_selection().cloned();
+    let frontier_selection = runtime.frontier_selection().cloned();
+    let state_response = AgentStateResponse {
+        state: runtime_state,
+        reason: runtime.stop_reason().map(str::to_string),
+        configured: runtime.is_configured(),
+        local_selection: local_selection.clone(),
+        frontier_selection: frontier_selection.clone(),
+        latest_iteration_id,
+    };
+
+    let sensors = runtime
+        .sensors()
+        .into_iter()
+        .map(|sensor| {
+            let queued_percepts = sensor.queued_count();
+            let unread_percepts = sensor.unread_count();
+            SensorStatus {
+                name: sensor.name,
+                description: sensor.description,
+                enabled: sensor.enabled,
+                sensitivity_score: sensor.sensitivity_score,
+                queued_percepts,
+                unread_percepts,
+            }
+        })
+        .collect();
+
+    let actuators = runtime
+        .actuators()
+        .into_iter()
+        .map(actuator_status)
+        .collect();
+
+    let loop_running = loop_status.running;
+
+    Ok(DashboardResponse {
+        state: state_response,
+        loop_status,
+        observability: runtime.observability_snapshot(),
+        loop_visualization: runtime.loop_visualization_snapshot(),
+        local_model: model_process_status(local_selection, runtime_state, loop_running),
+        frontier_model: model_process_status(frontier_selection, runtime_state, loop_running),
+        sensors,
+        actuators,
+        pending_approval_count: runtime.pending_approvals().len(),
+    })
+}
+
+async fn list_provider_models(
+    provider: ModelProviderKind,
+    api_key: Option<String>,
+) -> anyhow::Result<Vec<String>> {
+    let normalized_key = normalize_api_key(api_key.as_deref().unwrap_or_default());
+    let mut models = match provider {
+        ModelProviderKind::Ollama => scrape_ollama_library_models().await.unwrap_or_else(|_| {
+            vec![
+                "gemma3:4b".to_string(),
+                "qwen3:8b".to_string(),
+                "gpt-oss:20b".to_string(),
+            ]
+        }),
+        ModelProviderKind::OpenAi => list_openai_models(&normalized_key).await?,
+        ModelProviderKind::OpenCodeZen => {
+            list_models_with_api_key(ProviderId::OpenCodeZen, &normalized_key)
+                .await
+                .unwrap_or_default()
+        }
+    };
+
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+async fn list_openai_models(api_key: &str) -> anyhow::Result<Vec<String>> {
+    if api_key.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let response = reqwest::Client::new()
+        .get("https://api.openai.com/v1/models")
+        .bearer_auth(api_key)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let value = response.json::<serde_json::Value>().await?;
+    let mut models = value
+        .get("data")
+        .and_then(|items| items.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+
+    models.sort();
+    Ok(models)
+}
+
+fn normalize_api_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let unprefixed = trimmed
+        .strip_prefix("Bearer ")
+        .or_else(|| trimmed.strip_prefix("bearer "))
+        .unwrap_or(trimmed);
+    let unquoted = unprefixed
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+    unquoted.to_string()
+}
+
+async fn scrape_ollama_library_models() -> anyhow::Result<Vec<String>> {
+    let html = scrape_ollama_library_html().await?;
+    Ok(parse_ollama_library_tagged_models(&html))
+}
+
+async fn scrape_ollama_library_base_models() -> anyhow::Result<Vec<String>> {
+    let html = scrape_ollama_library_html().await?;
+    Ok(parse_ollama_library_base_models(&html))
+}
+
+async fn scrape_ollama_model_versions(model: &str) -> anyhow::Result<Vec<String>> {
+    let url = format!("https://ollama.com/library/{model}");
+    let html = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+    Ok(parse_ollama_model_versions(&html, model))
+}
+
+async fn scrape_ollama_library_html() -> anyhow::Result<String> {
+    Ok(reqwest::Client::new()
+        .get("https://ollama.com/library")
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?)
+}
+
+fn parse_ollama_library_base_models(html: &str) -> Vec<String> {
+    let mut models = Vec::new();
+    let marker = "href=\"/library/";
+    let mut cursor = 0usize;
+
+    while let Some(rel) = html[cursor..].find(marker) {
+        let start = cursor + rel + marker.len();
+        let tail = &html[start..];
+        let Some(end) = tail.find('"') else {
+            break;
+        };
+
+        let candidate = tail[..end].trim();
+        if candidate.is_empty() || candidate.contains(':') || candidate.contains('/') {
+            cursor = start + end;
+            continue;
+        }
+
+        models.push(candidate.to_string());
+        cursor = start + end;
+    }
+
+    models.sort();
+    models.dedup();
+    models
+}
+
+fn parse_ollama_library_tagged_models(html: &str) -> Vec<String> {
+    let bases = parse_ollama_library_base_models(html);
+    let mut tagged = Vec::new();
+
+    for base in bases {
+        let tags = extract_size_tags_for_model_card(html, &base);
+        if tags.is_empty() {
+            tagged.push(format!("{base}:latest"));
+        } else {
+            for tag in tags {
+                tagged.push(format!("{base}:{tag}"));
+            }
+        }
+    }
+
+    tagged.sort();
+    tagged.dedup();
+    tagged
+}
+
+fn parse_ollama_model_versions(html: &str, model: &str) -> Vec<String> {
+    let href_marker = format!("href=\"/library/{model}:");
+    let mut versions = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = html[cursor..].find(&href_marker) {
+        let start = cursor + rel + href_marker.len();
+        let tail = &html[start..];
+        let Some(end) = tail.find('"') else {
+            break;
+        };
+
+        let version = tail[..end].trim().to_lowercase();
+        if !version.is_empty() && !version.contains('/') {
+            versions.push(version);
+        }
+
+        cursor = start + end;
+    }
+
+    versions.sort();
+    versions.dedup();
+    versions
+}
+
+fn extract_size_tags_for_model_card(html: &str, model: &str) -> Vec<String> {
+    let anchor = format!("href=\"/library/{model}\"");
+    let Some(model_pos) = html.find(&anchor) else {
+        return Vec::new();
+    };
+
+    let block_start = html[..model_pos]
+        .rfind("<li x-test-model")
+        .unwrap_or(model_pos);
+    let block_tail = &html[block_start..];
+    let block_end_rel = block_tail.find("</li>").unwrap_or(block_tail.len());
+    let block = &block_tail[..block_end_rel];
+
+    let mut tags = Vec::new();
+    let marker = "x-test-size";
+    let mut cursor = 0usize;
+    while let Some(rel) = block[cursor..].find(marker) {
+        let marker_pos = cursor + rel;
+        let Some(gt_rel) = block[marker_pos..].find('>') else {
+            break;
+        };
+        let content_start = marker_pos + gt_rel + 1;
+        let Some(lt_rel) = block[content_start..].find('<') else {
+            break;
+        };
+        let value = block[content_start..content_start + lt_rel]
+            .trim()
+            .to_lowercase();
+        if !value.is_empty() {
+            tags.push(value);
+        }
+        cursor = content_start + lt_rel;
+    }
+
+    tags.sort();
+    tags.dedup();
+    tags
 }
 
 fn bad_request(message: String) -> (StatusCode, Json<ApiError>) {
