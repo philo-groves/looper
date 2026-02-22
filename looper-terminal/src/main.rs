@@ -1403,7 +1403,11 @@ impl App {
             .split(left[0]);
         let history_inner = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .split(history_with_top_margin[1])[1];
 
         let history_columns = Layout::default()
@@ -1548,7 +1552,11 @@ impl App {
             .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 24))),
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
                 .split(model_config_rows[2])[1],
         );
 
@@ -1576,8 +1584,8 @@ impl App {
                 "Loops: {} ({:.2}/min)",
                 observability.total_iterations, observability.loops_per_minute
             ))
-                .style(Style::default().fg(Color::Gray).bg(Color::Rgb(24, 24, 24)))
-                .alignment(Alignment::Left),
+            .style(Style::default().fg(Color::Gray).bg(Color::Rgb(24, 24, 24)))
+            .alignment(Alignment::Left),
             Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
@@ -1586,22 +1594,26 @@ impl App {
 
         let loop_rate_inner = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .split(loop_rate_rows[2]);
         frame.render_widget(
             Sparkline::default()
-                .style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .bg(Color::Rgb(24, 24, 24)),
-                )
+                .style(Style::default().fg(Color::Cyan).bg(Color::Rgb(24, 24, 24)))
                 .data(&lpm_values),
             loop_rate_inner[1],
         );
 
         let input_with_margin = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .split(left[1]);
         let input_area = input_with_margin[1];
         let input_block = Block::default().padding(Padding::new(1, 1, 0, 1));
@@ -1626,7 +1638,11 @@ impl App {
             .split(
                 Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                    ])
                     .split(root[1])[1],
             );
 
@@ -1845,14 +1861,21 @@ fn chat_input_cursor_position(area: Rect, input: &str, cursor_index: usize) -> (
 
     let prefix = input.chars().take(cursor_index).collect::<String>();
     let line_index = prefix.lines().count().saturating_sub(1);
-    let column_index = prefix.lines().last().map(|line| line.chars().count()).unwrap_or(0);
+    let column_index = prefix
+        .lines()
+        .last()
+        .map(|line| line.chars().count())
+        .unwrap_or(0);
 
     let x = area.x + (column_index as u16).min(area.width.saturating_sub(1));
     let y = area.y + (line_index as u16).min(area.height.saturating_sub(1));
     (x, y)
 }
 
-async fn fetch_refresh_payload(client: AgentClient, after_id: Option<i64>) -> Result<RefreshPayload> {
+async fn fetch_refresh_payload(
+    client: AgentClient,
+    after_id: Option<i64>,
+) -> Result<RefreshPayload> {
     client.health().await?;
 
     let state = client.state().await?;

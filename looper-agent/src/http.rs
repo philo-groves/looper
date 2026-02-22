@@ -10,7 +10,10 @@ use tokio::select;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::dto::{ActuatorCreateRequest, SensorCreateRequest};
-use crate::model::{AgentState, ExecutionResult, ModelProviderKind, ModelSelection};
+use crate::model::{
+    Actuator, ActuatorType, AgentState, ExecutionResult, ModelProviderKind, ModelSelection,
+    RateLimit,
+};
 use crate::runtime::{LooperRuntime, ObservabilitySnapshot};
 use crate::storage::PersistedIteration;
 
@@ -46,6 +49,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/loop/stop", post(loop_stop_handler))
         .route("/api/loop/status", get(loop_status_handler))
         .route("/api/state", get(state_handler))
+        .route("/api/dashboard", get(dashboard_handler))
         .route("/api/iterations", get(list_iterations_handler))
         .route("/api/iterations/{id}", get(get_iteration_handler))
         .route("/api/approvals", get(list_approvals_handler))
@@ -275,6 +279,69 @@ pub async fn state_handler(
     }))
 }
 
+/// Returns dashboard snapshot for the web interface.
+pub async fn dashboard_handler(
+    State(state): State<AppState>,
+) -> Result<Json<DashboardResponse>, (StatusCode, Json<ApiError>)> {
+    let loop_status = {
+        let loop_control = state.loop_control.lock().await;
+        loop_control.status_response()
+    };
+
+    let runtime = state.runtime.lock().await;
+    let latest_iteration_id = runtime
+        .latest_iteration_id()
+        .map_err(|error| internal_error(error.to_string()))?;
+
+    let runtime_state = runtime.state();
+    let local_selection = runtime.local_selection().cloned();
+    let frontier_selection = runtime.frontier_selection().cloned();
+    let state_response = AgentStateResponse {
+        state: runtime_state,
+        reason: runtime.stop_reason().map(str::to_string),
+        configured: runtime.is_configured(),
+        local_selection: local_selection.clone(),
+        frontier_selection: frontier_selection.clone(),
+        latest_iteration_id,
+    };
+
+    let sensors = runtime
+        .sensors()
+        .into_iter()
+        .map(|sensor| {
+            let queued_percepts = sensor.queued_count();
+            let unread_percepts = sensor.unread_count();
+            SensorStatus {
+                name: sensor.name,
+                description: sensor.description,
+                enabled: sensor.enabled,
+                sensitivity_score: sensor.sensitivity_score,
+                queued_percepts,
+                unread_percepts,
+            }
+        })
+        .collect();
+
+    let actuators = runtime
+        .actuators()
+        .into_iter()
+        .map(actuator_status)
+        .collect();
+
+    let loop_running = loop_status.running;
+
+    Ok(Json(DashboardResponse {
+        state: state_response,
+        loop_status,
+        observability: runtime.observability_snapshot(),
+        local_model: model_process_status(local_selection, runtime_state, loop_running),
+        frontier_model: model_process_status(frontier_selection, runtime_state, loop_running),
+        sensors,
+        actuators,
+        pending_approval_count: runtime.pending_approvals().len(),
+    }))
+}
+
 /// Returns one persisted iteration.
 pub async fn get_iteration_handler(
     Path(id): Path<i64>,
@@ -439,6 +506,78 @@ pub struct AgentStateResponse {
     pub latest_iteration_id: Option<i64>,
 }
 
+/// Dashboard payload for the web interface.
+#[derive(Clone, Debug, Serialize)]
+pub struct DashboardResponse {
+    /// Runtime state details.
+    pub state: AgentStateResponse,
+    /// Loop task details.
+    pub loop_status: LoopStatusResponse,
+    /// Runtime observability metrics.
+    pub observability: ObservabilitySnapshot,
+    /// Current local model process details.
+    pub local_model: ModelProcessStatus,
+    /// Current frontier model process details.
+    pub frontier_model: ModelProcessStatus,
+    /// Registered sensors and queue health.
+    pub sensors: Vec<SensorStatus>,
+    /// Registered actuators and policy details.
+    pub actuators: Vec<ActuatorStatus>,
+    /// Pending human approvals.
+    pub pending_approval_count: usize,
+}
+
+/// One model process status for the dashboard.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelProcessStatus {
+    /// Whether a model selection is configured.
+    pub configured: bool,
+    /// Optional provider name.
+    pub provider: Option<ModelProviderKind>,
+    /// Optional model identifier.
+    pub model: Option<String>,
+    /// Derived lifecycle status for display.
+    pub process_state: String,
+}
+
+/// Sensor details displayed on the dashboard.
+#[derive(Clone, Debug, Serialize)]
+pub struct SensorStatus {
+    /// Sensor name.
+    pub name: String,
+    /// Sensor description.
+    pub description: String,
+    /// Whether this sensor is enabled.
+    pub enabled: bool,
+    /// Surprise sensitivity score (0-100).
+    pub sensitivity_score: u8,
+    /// Number of percepts retained.
+    pub queued_percepts: usize,
+    /// Number of unread percepts.
+    pub unread_percepts: usize,
+}
+
+/// Actuator details displayed on the dashboard.
+#[derive(Clone, Debug, Serialize)]
+pub struct ActuatorStatus {
+    /// Actuator name.
+    pub name: String,
+    /// Actuator description.
+    pub description: String,
+    /// Actuator kind label.
+    pub kind: String,
+    /// Whether this actuator requires human approval.
+    pub require_hitl: bool,
+    /// Whether this actuator is sandboxed.
+    pub sandboxed: bool,
+    /// Number of allowlisted action keywords.
+    pub allowlist_count: usize,
+    /// Number of denylisted action keywords.
+    pub denylist_count: usize,
+    /// Optional rate limit policy.
+    pub rate_limit: Option<RateLimit>,
+}
+
 /// Successful mutation response payload.
 #[derive(Clone, Debug, Serialize)]
 pub struct MutationResponse {
@@ -504,4 +643,52 @@ fn internal_error(message: String) -> (StatusCode, Json<ApiError>) {
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ApiError { error: message }),
     )
+}
+
+fn model_process_status(
+    selection: Option<ModelSelection>,
+    runtime_state: AgentState,
+    loop_running: bool,
+) -> ModelProcessStatus {
+    let process_state = if selection.is_none() {
+        "not_configured"
+    } else if runtime_state == AgentState::Running && loop_running {
+        "running"
+    } else if runtime_state == AgentState::Stopped {
+        "stopped"
+    } else {
+        "idle"
+    };
+
+    let (provider, model) = match selection {
+        Some(selected) => (Some(selected.provider), Some(selected.model)),
+        None => (None, None),
+    };
+
+    ModelProcessStatus {
+        configured: provider.is_some(),
+        provider,
+        model,
+        process_state: process_state.to_string(),
+    }
+}
+
+fn actuator_status(actuator: Actuator) -> ActuatorStatus {
+    let kind = match &actuator.kind {
+        ActuatorType::Internal(_) => "internal",
+        ActuatorType::Mcp(_) => "mcp",
+        ActuatorType::Workflow(_) => "workflow",
+    }
+    .to_string();
+
+    ActuatorStatus {
+        name: actuator.name,
+        description: actuator.description,
+        kind,
+        require_hitl: actuator.policy.require_hitl,
+        sandboxed: actuator.policy.sandboxed,
+        allowlist_count: actuator.policy.allowlist.map_or(0, |entries| entries.len()),
+        denylist_count: actuator.policy.denylist.map_or(0, |entries| entries.len()),
+        rate_limit: actuator.policy.rate_limit,
+    }
 }

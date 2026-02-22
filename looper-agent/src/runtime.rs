@@ -372,8 +372,22 @@ impl LooperRuntime {
         self.sensors.insert(sensor.name.clone(), sensor);
     }
 
+    /// Returns all configured sensors ordered by name.
+    pub fn sensors(&self) -> Vec<Sensor> {
+        let mut sensors = self.sensors.values().cloned().collect::<Vec<_>>();
+        sensors.sort_by(|left, right| left.name.cmp(&right.name));
+        sensors
+    }
+
     pub fn add_actuator(&mut self, actuator: Actuator) {
         self.actuators.insert(actuator.name.clone(), actuator);
+    }
+
+    /// Returns all configured actuators ordered by name.
+    pub fn actuators(&self) -> Vec<Actuator> {
+        let mut actuators = self.actuators.values().cloned().collect::<Vec<_>>();
+        actuators.sort_by(|left, right| left.name.cmp(&right.name));
+        actuators
     }
 
     pub fn register_internal_executor(

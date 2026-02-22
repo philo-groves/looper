@@ -114,6 +114,16 @@ impl Sensor {
         self.unread_start = self.queue.len();
         percepts
     }
+
+    /// Returns total queued percepts retained by this sensor.
+    pub fn queued_count(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Returns queued percepts that have not yet been consumed.
+    pub fn unread_count(&self) -> usize {
+        self.queue.len().saturating_sub(self.unread_start)
+    }
 }
 
 /// Internal action types supported in this first pass.
