@@ -9,6 +9,14 @@ This file provides rules for AI agents modifying this Rust codebase.
 - Avoid `unwrap()` in production code. Use `?` for propagation or `match`/`if let` for handling.
 - Use `4 spaces` for indentation.
 
+## 🌐 Web Interface Rules & Conventions
+- Use Tailwind utility classes for styling; avoid raw CSS for component styling.
+- Support both light and dark themes with explicit user switching.
+- Theme palette should remain monochrome: black on white (light), white on black (dark), and gray shades for surfaces and controls.
+- Prefer a material-design-like visual language with clear hierarchy, cards, and subtle elevation.
+- Do not use gradient effects in the UI.
+- Build responsive layouts that work on desktop and mobile.
+
 ## 🏗️ Project Structure (Crates)
 - `looper-harness`: Core agent runtime functionality
 - `looper-terminal`: TUI for communicating with the agent
