@@ -28,7 +28,7 @@ export function SideNav({ isOpen, onToggle }: SideNavProps) {
   return (
     <aside
       className={`shrink-0 border-r border-zinc-300 bg-white transition-all duration-300 dark:border-zinc-800 dark:bg-zinc-950 ${
-        isOpen ? "w-[250px]" : "w-16"
+        isOpen ? "w-62.5" : "w-16"
       }`}
     >
       <div className="flex items-center justify-between border-b border-zinc-300 p-3 dark:border-zinc-800">
@@ -149,7 +149,7 @@ export function SideNav({ isOpen, onToggle }: SideNavProps) {
                     {isActive("/agent-settings/identity") ? (
                       <span className="absolute inset-y-0 left-0 w-1 rounded-l-md bg-zinc-500 dark:bg-zinc-400" />
                     ) : null}
-                    Agent Identity
+                    Identification
                   </Link>
                 </li>
                 <li className="w-full">

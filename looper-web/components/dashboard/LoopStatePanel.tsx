@@ -105,14 +105,14 @@ export function LoopStatePanel({
               Surprise Found
             </p>
             <div
-              className={`h-[14px] rounded-full transition-colors duration-200 ${
+              className={`h-3.5 rounded-full transition-colors duration-200 ${
                 surpriseFoundState ? "bg-zinc-900 dark:bg-zinc-100" : "bg-zinc-300 dark:bg-zinc-700"
               }`}
               style={{ width: "calc(100% - 462px)" }}
             />
           </div>
 
-          <div className="absolute inset-x-0 bottom-[3.5rem] flex flex-col items-center gap-2">
+          <div className="absolute inset-x-0 bottom-14 flex flex-col items-center gap-2">
             <p
               className={`rounded-xl border px-2 py-1 text-center text-xs leading-tight transition-colors duration-200 ${
                 actionsCompletedState
@@ -123,7 +123,7 @@ export function LoopStatePanel({
               Actions Completed
             </p>
             <div
-              className={`h-[14px] rounded-full transition-colors duration-200 ${
+              className={`h-3.5 rounded-full transition-colors duration-200 ${
                 actionsCompletedState ? "bg-zinc-900 dark:bg-zinc-100" : "bg-zinc-300 dark:bg-zinc-700"
               }`}
               style={{ width: "calc(100% - 462px)" }}
