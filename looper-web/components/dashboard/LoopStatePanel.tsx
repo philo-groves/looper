@@ -17,7 +17,7 @@ function localStepIndex(
   if (step === "gather_new_percepts") {
     return 1;
   }
-  if (step === "check_for_surprises" || step === "surprise_found") {
+  if (step === "check_for_surprises") {
     return 2;
   }
   return null;
@@ -26,14 +26,11 @@ function localStepIndex(
 function frontierStepIndex(
   step: DashboardPayload["loop_visualization"]["frontier_current_step"] | undefined,
 ): number | null {
-  if (step === "plan_actions") {
+  if (step === "deeper_percept_investigation" || step === "plan_actions") {
     return 0;
   }
   if (step === "performing_actions") {
     return 1;
-  }
-  if (step === "deeper_percept_investigation") {
-    return 2;
   }
   return null;
 }
@@ -66,6 +63,24 @@ export function LoopStatePanel({
   socketConnected,
   socketError,
 }: LoopStatePanelProps) {
+  const frontierWorking =
+    loopState?.current_phase === "deeper_percept_investigation" ||
+    loopState?.current_phase === "plan_actions" ||
+    loopState?.current_phase === "execute_actions";
+
+  const actionsCompletedState =
+    loopState?.current_phase === "idle" && Boolean(loopState?.action_required);
+
+  const surpriseFoundState = loopState?.current_phase === "deeper_percept_investigation";
+
+  const localActiveStep = frontierWorking || actionsCompletedState
+    ? null
+    : localStepIndex(loopState?.local_current_step);
+
+  const frontierActiveStep = actionsCompletedState
+    ? null
+    : frontierStepIndex(loopState?.frontier_current_step);
+
   return (
     <section className="space-y-4 rounded-2xl border border-zinc-300 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-950 lg:col-span-6">
       <h2 className="text-lg font-semibold">Looper State</h2>
@@ -77,7 +92,7 @@ export function LoopStatePanel({
             title="Local Model Loop"
             modelLabel={localModelLabel}
             steps={LOCAL_STEPS}
-            activeStep={localStepIndex(loopState?.local_current_step)}
+            activeStep={localActiveStep}
             totalLoops={loopState?.local_loop_count ?? 0}
             rotationDegrees={30}
           />
@@ -86,7 +101,7 @@ export function LoopStatePanel({
             title="Frontier Model Loop"
             modelLabel={frontierModelLabel}
             steps={FRONTIER_STEPS}
-            activeStep={frontierStepIndex(loopState?.frontier_current_step)}
+            activeStep={frontierActiveStep}
             totalLoops={loopState?.frontier_loop_count ?? 0}
             rotationDegrees={-30}
           />
@@ -94,17 +109,39 @@ export function LoopStatePanel({
 
         <div className="pointer-events-none absolute inset-0 hidden xl:block">
           <div className="absolute inset-x-0 top-[5.4rem] flex flex-col items-center gap-2">
-            <p className="rounded-xl border border-zinc-200 bg-white px-2 py-1 text-center text-xs leading-tight text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+            <p
+              className={`rounded-xl border px-2 py-1 text-center text-xs leading-tight transition-colors duration-200 ${
+                surpriseFoundState
+                  ? "border-zinc-300 bg-zinc-100 text-zinc-900 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-50"
+                  : "border-zinc-200 bg-white text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+              }`}
+            >
               Surprise Found
             </p>
-            <div className="h-[14px] rounded-full bg-zinc-300 dark:bg-zinc-700" style={{ width: "calc(100% - 512px)" }} />
+            <div
+              className={`h-[14px] rounded-full transition-colors duration-200 ${
+                surpriseFoundState ? "bg-zinc-900 dark:bg-zinc-100" : "bg-zinc-300 dark:bg-zinc-700"
+              }`}
+              style={{ width: "calc(100% - 512px)" }}
+            />
           </div>
 
           <div className="absolute inset-x-0 bottom-[3.5rem] flex flex-col items-center gap-2">
-            <p className="rounded-xl border border-zinc-200 bg-white px-2 py-1 text-center text-xs leading-tight text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+            <p
+              className={`rounded-xl border px-2 py-1 text-center text-xs leading-tight transition-colors duration-200 ${
+                actionsCompletedState
+                  ? "border-zinc-300 bg-zinc-100 text-zinc-900 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-50"
+                  : "border-zinc-200 bg-white text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+              }`}
+            >
               Actions Completed
             </p>
-            <div className="h-[14px] rounded-full bg-zinc-300 dark:bg-zinc-700" style={{ width: "calc(100% - 512px)" }} />
+            <div
+              className={`h-[14px] rounded-full transition-colors duration-200 ${
+                actionsCompletedState ? "bg-zinc-900 dark:bg-zinc-100" : "bg-zinc-300 dark:bg-zinc-700"
+              }`}
+              style={{ width: "calc(100% - 512px)" }}
+            />
           </div>
         </div>
       </div>

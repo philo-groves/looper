@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   DashboardPayload,
@@ -30,6 +30,39 @@ export function useDashboardSocket(
   const [data, setData] = useState<DashboardPayload | null>(null);
   const [socketConnected, setSocketConnected] = useState(false);
   const [socketError, setSocketError] = useState<string | null>(null);
+  const phaseQueueRef = useRef<LoopPhaseTransitionPayload[]>([]);
+  const phaseTimerRef = useRef<number | null>(null);
+  const latestPhaseStartRef = useRef<number>(0);
+
+  const flushPhaseQueue = useCallback(() => {
+    if (phaseTimerRef.current !== null) {
+      return;
+    }
+
+    const processNext = () => {
+      const next = phaseQueueRef.current.shift();
+      if (!next) {
+        phaseTimerRef.current = null;
+        return;
+      }
+
+      setData((current) => {
+        if (!current) {
+          latestPhaseStartRef.current = next.loop_visualization.current_phase_started_at_unix_ms;
+          return current;
+        }
+        latestPhaseStartRef.current = next.loop_visualization.current_phase_started_at_unix_ms;
+        return {
+          ...current,
+          loop_visualization: next.loop_visualization,
+        };
+      });
+
+      phaseTimerRef.current = window.setTimeout(processNext, 200);
+    };
+
+    phaseTimerRef.current = window.setTimeout(processNext, 0);
+  }, []);
 
   const wsCommand = useCallback(async function wsCommand<T>(method: string, params: unknown): Promise<T> {
     const socket = new window.WebSocket(resolveWsUrl());
@@ -105,22 +138,53 @@ export function useDashboardSocket(
           const payload = JSON.parse(event.data) as DashboardResponse;
           if (payload.type === "event" && payload.event === "dashboard_snapshot" && payload.data) {
             const snapshot = payload.data;
-            setData(snapshot);
+            setData((current) => {
+              if (!current) {
+                latestPhaseStartRef.current =
+                  snapshot.loop_visualization.current_phase_started_at_unix_ms;
+                return snapshot;
+              }
+
+              if (
+                snapshot.loop_visualization.current_phase_started_at_unix_ms <=
+                latestPhaseStartRef.current
+              ) {
+                return {
+                  ...snapshot,
+                  loop_visualization: current.loop_visualization,
+                };
+              }
+
+              latestPhaseStartRef.current =
+                snapshot.loop_visualization.current_phase_started_at_unix_ms;
+              return snapshot;
+            });
             onSnapshot?.(snapshot);
             return;
           }
 
           if (payload.type === "event" && payload.event === "loop_phase_transition" && payload.data) {
             const phaseEvent = payload.data as unknown as LoopPhaseTransitionPayload;
-            setData((current) => {
-              if (!current) {
-                return current;
-              }
-              return {
-                ...current,
-                loop_visualization: phaseEvent.loop_visualization,
-              };
-            });
+
+            const isNoSurpriseIdleTransition =
+              phaseEvent.phase === "idle" &&
+              phaseEvent.loop_visualization.local_current_step === "no_surprise" &&
+              !phaseEvent.loop_visualization.action_required;
+
+            if (isNoSurpriseIdleTransition) {
+              phaseQueueRef.current.push(phaseEvent);
+              phaseQueueRef.current.push({
+                ...phaseEvent,
+                loop_visualization: {
+                  ...phaseEvent.loop_visualization,
+                  local_current_step: "gather_new_percepts",
+                },
+              });
+            } else {
+              phaseQueueRef.current.push(phaseEvent);
+            }
+
+            flushPhaseQueue();
           }
         } catch {
           setSocketError("Received invalid websocket payload.");
@@ -147,9 +211,14 @@ export function useDashboardSocket(
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }
+      if (phaseTimerRef.current !== null) {
+        window.clearTimeout(phaseTimerRef.current);
+      }
+      phaseTimerRef.current = null;
+      phaseQueueRef.current = [];
       ws?.close();
     };
-  }, [onSnapshot]);
+  }, [flushPhaseQueue, onSnapshot]);
 
   return {
     data,

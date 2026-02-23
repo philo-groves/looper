@@ -860,7 +860,7 @@ async fn loop_start_impl(state: &AppState, interval_ms: u64) -> anyhow::Result<L
                     };
 
                     if run_result.is_err() {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        tokio::time::sleep(Duration::from_millis(0)).await;
                     }
                 }
             }
