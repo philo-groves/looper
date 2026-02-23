@@ -1,5 +1,5 @@
-import { BlankWorkspacePage } from "@/components/window/BlankWorkspacePage";
+import { LoopConfigurationPanel } from "@/components/agent-settings/LoopConfigurationPanel";
 
 export default function LoopConfigurationPage() {
-  return <BlankWorkspacePage title="Loop Configuration" />;
+  return <LoopConfigurationPanel />;
 }

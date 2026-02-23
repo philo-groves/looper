@@ -40,6 +40,8 @@ struct PersistedAgentSettings {
     frontier_model: Option<String>,
     #[serde(default)]
     sensors: Vec<PersistedSensorSettings>,
+    #[serde(default)]
+    actuators: Vec<PersistedActuatorSettings>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -52,6 +54,15 @@ struct PersistedSensorSettings {
     percept_plural_name: String,
     #[serde(default = "default_sensor_ingress")]
     ingress: SensorIngressConfig,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedActuatorSettings {
+    name: String,
+    description: String,
+    policy: SafetyPolicy,
+    action_singular_name: String,
+    action_plural_name: String,
 }
 
 /// Partial update payload for mutable sensor settings.
@@ -69,6 +80,23 @@ pub struct SensorUpdate {
     pub percept_plural_name: Option<String>,
     /// Optional ingress configuration update.
     pub ingress: Option<SensorIngressConfig>,
+}
+
+/// Partial update payload for mutable actuator settings.
+#[derive(Clone, Debug, Default)]
+pub struct ActuatorUpdate {
+    /// Optional new action description.
+    pub description: Option<String>,
+    /// Optional new human-in-the-loop requirement.
+    pub require_hitl: Option<bool>,
+    /// Optional new sandboxed execution setting.
+    pub sandboxed: Option<bool>,
+    /// Optional new rate-limit policy. `Some(None)` clears rate limiting.
+    pub rate_limit: Option<Option<crate::model::RateLimit>>,
+    /// Optional new singular display name for actions.
+    pub action_singular_name: Option<String>,
+    /// Optional new plural display name for actions.
+    pub action_plural_name: Option<String>,
 }
 
 /// Phases of a loop iteration.
@@ -697,6 +725,73 @@ impl LooperRuntime {
 
     pub fn add_actuator(&mut self, actuator: Actuator) {
         self.actuators.insert(actuator.name.clone(), actuator);
+    }
+
+    /// Updates mutable actuator configuration fields for an existing actuator.
+    pub fn update_actuator(&mut self, name: &str, update: ActuatorUpdate) -> Result<()> {
+        let (require_hitl_now, sandboxed_now, singular_now, plural_now) = {
+            let actuator = self
+                .actuators
+                .get_mut(name)
+                .ok_or_else(|| anyhow!("actuator '{name}' not found"))?;
+
+            if let Some(value) = update.description {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow!("description cannot be empty"));
+                }
+                actuator.description = trimmed.to_string();
+            }
+
+            if let Some(value) = update.require_hitl {
+                actuator.policy.require_hitl = value;
+            }
+
+            if let Some(value) = update.sandboxed {
+                actuator.policy.sandboxed = value;
+            }
+
+            if let Some(value) = update.rate_limit {
+                actuator.policy.rate_limit = value;
+            }
+
+            if let Some(value) = update.action_singular_name {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow!("action singular name cannot be empty"));
+                }
+                actuator.action_singular_name = trimmed.to_lowercase();
+            }
+
+            if let Some(value) = update.action_plural_name {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    return Err(anyhow!("action plural name cannot be empty"));
+                }
+                actuator.action_plural_name = trimmed.to_lowercase();
+            }
+
+            actuator.policy.validate()?;
+
+            (
+                actuator.policy.require_hitl,
+                actuator.policy.sandboxed,
+                actuator.action_singular_name.clone(),
+                actuator.action_plural_name.clone(),
+            )
+        };
+
+        self.log_state(
+            "update_actuator",
+            format!(
+                "name={name}, require_hitl={}, sandboxed={}, singular='{}', plural='{}'",
+                require_hitl_now, sandboxed_now, singular_now, plural_now
+            ),
+        );
+
+        self.persist_settings()?;
+
+        Ok(())
     }
 
     /// Returns all configured actuators ordered by name.
@@ -1336,6 +1431,19 @@ impl LooperRuntime {
             .collect::<Vec<_>>();
         sensors.sort_by(|left, right| left.name.cmp(&right.name));
 
+        let mut actuators = self
+            .actuators
+            .values()
+            .map(|actuator| PersistedActuatorSettings {
+                name: actuator.name.clone(),
+                description: actuator.description.clone(),
+                policy: actuator.policy.clone(),
+                action_singular_name: actuator.action_singular_name.clone(),
+                action_plural_name: actuator.action_plural_name.clone(),
+            })
+            .collect::<Vec<_>>();
+        actuators.sort_by(|left, right| left.name.cmp(&right.name));
+
         let encoded = serde_json::to_string_pretty(&PersistedAgentSettings {
             local_provider: self.local_selection.as_ref().map(|item| item.provider),
             local_model: self.local_selection.as_ref().map(|item| item.model.clone()),
@@ -1345,6 +1453,7 @@ impl LooperRuntime {
                 .as_ref()
                 .map(|item| item.model.clone()),
             sensors,
+            actuators,
         })?;
         fs::write(path, encoded)?;
         Ok(())
@@ -1469,6 +1578,38 @@ impl LooperRuntime {
             }
             sensor.ingress = ingress;
             self.sensors.insert(sensor.name.clone(), sensor);
+        }
+
+        for persisted in parsed.actuators {
+            let name = persisted.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+
+            if persisted.policy.validate().is_err() {
+                continue;
+            }
+
+            let Some(actuator) = self.actuators.get_mut(name) else {
+                continue;
+            };
+
+            let description = persisted.description.trim();
+            if !description.is_empty() {
+                actuator.description = description.to_string();
+            }
+
+            let singular = persisted.action_singular_name.trim();
+            if !singular.is_empty() {
+                actuator.action_singular_name = singular.to_lowercase();
+            }
+
+            let plural = persisted.action_plural_name.trim();
+            if !plural.is_empty() {
+                actuator.action_plural_name = plural.to_lowercase();
+            }
+
+            actuator.policy = persisted.policy;
         }
 
         self.log_state("load_persisted_settings", "persisted settings applied");
@@ -1606,7 +1747,7 @@ fn is_frontier_communication_issue(error: &anyhow::Error) -> bool {
 mod tests {
     use std::fs;
 
-    use crate::model::Action;
+    use crate::model::{Action, RateLimit, RateLimitPeriod};
 
     use super::*;
 
@@ -1819,5 +1960,76 @@ mod tests {
                 path: "C:/tmp/inbox".to_string()
             }
         );
+    }
+
+    #[test]
+    fn update_actuator_rejects_empty_description() {
+        let workspace = std::env::temp_dir().join(format!("looper-test-{}", now_unix_ms()));
+        fs::create_dir_all(&workspace).expect("temp workspace should be created");
+
+        let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should build");
+        runtime.disable_store();
+
+        let error = runtime
+            .update_actuator(
+                "web_search",
+                ActuatorUpdate {
+                    description: Some("   ".to_string()),
+                    ..ActuatorUpdate::default()
+                },
+            )
+            .expect_err("empty description should be rejected");
+        assert!(error.to_string().contains("description cannot be empty"));
+    }
+
+    #[test]
+    fn actuator_settings_persist_between_runtime_instances() {
+        let workspace = std::env::temp_dir().join(format!("looper-test-{}", now_unix_ms()));
+        fs::create_dir_all(&workspace).expect("temp workspace should be created");
+
+        let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should build");
+        runtime.disable_store();
+        runtime
+            .update_actuator(
+                "web_search",
+                ActuatorUpdate {
+                    description: Some("Searches external documentation with restrictions".to_string()),
+                    require_hitl: Some(true),
+                    sandboxed: Some(true),
+                    rate_limit: Some(Some(RateLimit {
+                        max: 3,
+                        per: RateLimitPeriod::Hour,
+                    })),
+                    action_singular_name: Some("External Search".to_string()),
+                    action_plural_name: Some("External Searches".to_string()),
+                },
+            )
+            .expect("actuator should update");
+
+        let reloaded = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should reload");
+        let actuator = reloaded
+            .actuators()
+            .into_iter()
+            .find(|item| item.name == "web_search")
+            .expect("persisted actuator should exist");
+
+        assert_eq!(
+            actuator.description,
+            "Searches external documentation with restrictions"
+        );
+        assert!(actuator.policy.require_hitl);
+        assert!(actuator.policy.sandboxed);
+        assert_eq!(
+            actuator.policy.rate_limit,
+            Some(RateLimit {
+                max: 3,
+                per: RateLimitPeriod::Hour,
+            })
+        );
+        assert_eq!(actuator.action_singular_name, "external search");
+        assert_eq!(actuator.action_plural_name, "external searches");
     }
 }

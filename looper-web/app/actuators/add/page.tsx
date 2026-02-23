@@ -1,5 +1,5 @@
-import { BlankWorkspacePage } from "@/components/window/BlankWorkspacePage";
+import { AddActuatorClient } from "@/components/actuators/AddActuatorClient";
 
 export default function AddActuatorPage() {
-  return <BlankWorkspacePage title="Add an Actuator" />;
+  return <AddActuatorClient />;
 }

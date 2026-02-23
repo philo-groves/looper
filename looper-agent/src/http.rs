@@ -26,11 +26,11 @@ use crate::model::{
     RateLimit, SensorIngressConfig, SensorRestFormat,
 };
 use crate::runtime::{
-    LoopVisualizationSnapshot, LooperRuntime, ObservabilitySnapshot, SensorUpdate,
+    ActuatorUpdate, LoopVisualizationSnapshot, LooperRuntime, ObservabilitySnapshot, SensorUpdate,
 };
 use crate::storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration};
 
-const DEFAULT_AUTO_START_INTERVAL_MS: u64 = 500;
+const DEFAULT_LOOP_INTERVAL_MS: u64 = 500;
 
 const DEFAULT_SOUL_MARKDOWN: &str = r#"# Looper Soul
 
@@ -80,15 +80,24 @@ pub struct AppState {
     pub runtime: Arc<Mutex<LooperRuntime>>,
     loop_control: Arc<Mutex<LoopControl>>,
     directory_watchers: Arc<Mutex<HashMap<String, DirectoryWatcherHandle>>>,
+    loop_configuration: Arc<Mutex<LoopConfiguration>>,
+    loop_configuration_path: PathBuf,
 }
 
 impl AppState {
     /// Creates application state from a runtime.
     pub fn new(runtime: LooperRuntime) -> Self {
+        let workspace_root = runtime.workspace_root().to_path_buf();
+        let loop_configuration_path = workspace_root.join("loop-configuration.json");
+        let loop_configuration = load_loop_configuration(&loop_configuration_path)
+            .unwrap_or_else(|_| LoopConfiguration::default());
+
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             loop_control: Arc::new(Mutex::new(LoopControl::default())),
             directory_watchers: Arc::new(Mutex::new(HashMap::new())),
+            loop_configuration: Arc::new(Mutex::new(loop_configuration)),
+            loop_configuration_path,
         }
     }
 }
@@ -382,7 +391,7 @@ pub async fn configure_models_handler(
             .map_err(|error| bad_request(error.to_string()))?;
     }
 
-    loop_start_impl(&state, DEFAULT_AUTO_START_INTERVAL_MS)
+    loop_start_impl(&state, configured_loop_interval_ms(&state).await)
         .await
         .map_err(|error| bad_request(error.to_string()))?;
 
@@ -404,7 +413,7 @@ pub async fn auto_start_loop_if_configured(
         return Ok(None);
     }
 
-    let status = loop_start_impl(state, DEFAULT_AUTO_START_INTERVAL_MS).await?;
+    let status = loop_start_impl(state, configured_loop_interval_ms(state).await).await?;
     Ok(Some(status))
 }
 
@@ -418,7 +427,9 @@ pub async fn loop_start_handler(
     State(state): State<AppState>,
     Json(request): Json<LoopStartRequest>,
 ) -> Result<Json<LoopStatusResponse>, (StatusCode, Json<ApiError>)> {
-    let interval_ms = request.interval_ms.unwrap_or(200);
+    let interval_ms = request
+        .interval_ms
+        .unwrap_or(configured_loop_interval_ms(&state).await);
     let status = loop_start_impl(&state, interval_ms)
         .await
         .map_err(|error| {
@@ -776,6 +787,13 @@ pub struct LoopStartRequest {
     pub interval_ms: Option<u64>,
 }
 
+/// Response payload for loop configuration settings.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LoopConfigurationResponse {
+    /// Default loop interval in milliseconds.
+    pub interval_ms: u64,
+}
+
 /// Response payload for loop status.
 #[derive(Clone, Debug, Serialize)]
 pub struct LoopStatusResponse {
@@ -973,6 +991,11 @@ struct WsLoopStartParams {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct WsUpdateLoopConfigurationParams {
+    interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct WsChatMessagesParams {
     chat_id: String,
     after_id: Option<i64>,
@@ -999,6 +1022,17 @@ struct WsUpdateSensorParams {
     percept_singular_name: Option<String>,
     percept_plural_name: Option<String>,
     ingress: Option<SensorIngressConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WsUpdateActuatorParams {
+    name: String,
+    description: Option<String>,
+    require_hitl: Option<bool>,
+    sandboxed: Option<bool>,
+    rate_limit: Option<Option<RateLimit>>,
+    action_singular_name: Option<String>,
+    action_plural_name: Option<String>,
 }
 
 /// Upgrades to a websocket session for realtime bidirectional updates.
@@ -1144,7 +1178,12 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
         "loop_start" => {
             let payload: WsLoopStartParams =
                 serde_json::from_value(params).map_err(|error| error.to_string())?;
-            let status = loop_start_impl(state, payload.interval_ms.unwrap_or(200))
+            let status = loop_start_impl(
+                state,
+                payload
+                    .interval_ms
+                    .unwrap_or(configured_loop_interval_ms(state).await),
+            )
                 .await
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::to_value(status).map_err(|error| error.to_string())?)
@@ -1176,10 +1215,35 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
                     .configure_models(payload.local, payload.frontier)
                     .map_err(|error| error.to_string())?;
             }
-            loop_start_impl(state, DEFAULT_AUTO_START_INTERVAL_MS)
+            loop_start_impl(state, configured_loop_interval_ms(state).await)
                 .await
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::json!({ "status": "ok" }))
+        }
+        "get_loop_configuration" => {
+            let config = state.loop_configuration.lock().await;
+            Ok(serde_json::to_value(LoopConfigurationResponse {
+                interval_ms: config.interval_ms,
+            })
+            .map_err(|error| error.to_string())?)
+        }
+        "update_loop_configuration" => {
+            let payload: WsUpdateLoopConfigurationParams =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+
+            let updated_interval = normalize_loop_interval_ms(payload.interval_ms);
+
+            {
+                let mut config = state.loop_configuration.lock().await;
+                config.interval_ms = updated_interval;
+                persist_loop_configuration(&state.loop_configuration_path, &config)
+                    .map_err(|error| error.to_string())?;
+            }
+
+            Ok(serde_json::to_value(LoopConfigurationResponse {
+                interval_ms: updated_interval,
+            })
+            .map_err(|error| error.to_string())?)
         }
         "update_sensor" => {
             let payload: WsUpdateSensorParams =
@@ -1201,6 +1265,25 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
             drop(runtime);
             sync_directory_watchers(state)
                 .await
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
+        "update_actuator" => {
+            let payload: WsUpdateActuatorParams =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let mut runtime = state.runtime.lock().await;
+            runtime
+                .update_actuator(
+                    &payload.name,
+                    ActuatorUpdate {
+                        description: payload.description,
+                        require_hitl: payload.require_hitl,
+                        sandboxed: payload.sandboxed,
+                        rate_limit: payload.rate_limit,
+                        action_singular_name: payload.action_singular_name,
+                        action_plural_name: payload.action_plural_name,
+                    },
+                )
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::json!({ "status": "ok" }))
         }
@@ -1331,6 +1414,53 @@ struct LoopControl {
     interval_ms: u64,
     stop_sender: Option<oneshot::Sender<()>>,
     join_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct LoopConfiguration {
+    interval_ms: u64,
+}
+
+impl Default for LoopConfiguration {
+    fn default() -> Self {
+        Self {
+            interval_ms: DEFAULT_LOOP_INTERVAL_MS,
+        }
+    }
+}
+
+fn normalize_loop_interval_ms(raw: u64) -> u64 {
+    raw.clamp(1, 60_000)
+}
+
+fn load_loop_configuration(path: &PathBuf) -> anyhow::Result<LoopConfiguration> {
+    if !path.exists() {
+        return Ok(LoopConfiguration::default());
+    }
+
+    let raw = fs::read_to_string(path)?;
+    let parsed = serde_json::from_str::<LoopConfigurationResponse>(&raw)?;
+    Ok(LoopConfiguration {
+        interval_ms: normalize_loop_interval_ms(parsed.interval_ms),
+    })
+}
+
+fn persist_loop_configuration(path: &PathBuf, config: &LoopConfiguration) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let payload = LoopConfigurationResponse {
+        interval_ms: normalize_loop_interval_ms(config.interval_ms),
+    };
+    let encoded = serde_json::to_string_pretty(&payload)?;
+    fs::write(path, encoded)?;
+    Ok(())
+}
+
+async fn configured_loop_interval_ms(state: &AppState) -> u64 {
+    let config = state.loop_configuration.lock().await;
+    normalize_loop_interval_ms(config.interval_ms)
 }
 
 impl LoopControl {
