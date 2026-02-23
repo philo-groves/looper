@@ -1,5 +1,5 @@
-import { BlankWorkspacePage } from "@/components/window/BlankWorkspacePage";
+import { ChatHistoryClient } from "@/components/conversations/ChatHistoryClient";
 
 export default function ChatHistoryPage() {
-  return <BlankWorkspacePage title="Chat History" />;
+  return <ChatHistoryClient />;
 }

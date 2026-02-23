@@ -43,6 +43,9 @@ pub struct Percept {
     pub sensor_name: String,
     /// Human-readable percept payload.
     pub content: String,
+    /// Optional chat session id when the percept came from chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
 }
 
 impl Percept {
@@ -51,6 +54,16 @@ impl Percept {
         Self {
             sensor_name: sensor_name.into(),
             content: content.into(),
+            chat_id: None,
+        }
+    }
+
+    /// Creates a chat percept with a chat id.
+    pub fn chat(content: impl Into<String>, chat_id: impl Into<String>) -> Self {
+        Self {
+            sensor_name: "chat".to_string(),
+            content: content.into(),
+            chat_id: Some(chat_id.into()),
         }
     }
 }
@@ -109,6 +122,13 @@ impl Sensor {
     /// Enqueues a percept into the sensor.
     pub fn enqueue(&mut self, content: impl Into<String>) {
         self.queue.push_back(Percept::new(&self.name, content));
+    }
+
+    /// Enqueues a percept with an explicit chat id.
+    pub fn enqueue_with_chat_id(&mut self, content: impl Into<String>, chat_id: impl Into<String>) {
+        let mut percept = Percept::new(&self.name, content);
+        percept.chat_id = Some(chat_id.into());
+        self.queue.push_back(percept);
     }
 
     /// Moves the read window to latest and returns percepts from this iteration.

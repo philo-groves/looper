@@ -8,6 +8,38 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ExecutionResult, Percept, RecommendedAction};
 
+/// One stored chat session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersistedChatSession {
+    /// Stable chat identifier.
+    pub id: String,
+    /// Human-readable title derived from first message.
+    pub title: String,
+    /// Session creation timestamp (unix millis).
+    pub created_at_unix_ms: i64,
+    /// Last update timestamp (unix millis).
+    pub updated_at_unix_ms: i64,
+    /// Number of stored messages for this chat.
+    pub message_count: usize,
+}
+
+/// One stored chat message.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersistedChatMessage {
+    /// Auto-incremented message id.
+    pub id: i64,
+    /// Chat session id.
+    pub chat_id: String,
+    /// Message role (`me` or `looper`).
+    pub role: String,
+    /// Message content.
+    pub content: String,
+    /// Message creation timestamp (unix millis).
+    pub created_at_unix_ms: i64,
+    /// Optional source iteration id for Looper responses.
+    pub iteration_id: Option<i64>,
+}
+
 /// Persisted representation of one loop iteration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PersistedIteration {
@@ -187,12 +219,127 @@ impl SqliteStore {
         Ok(windows)
     }
 
+    /// Appends one chat message and ensures the chat session exists.
+    pub fn insert_chat_message(
+        &self,
+        chat_id: &str,
+        role: &str,
+        content: &str,
+        iteration_id: Option<i64>,
+    ) -> Result<i64> {
+        let trimmed_chat_id = chat_id.trim();
+        if trimmed_chat_id.is_empty() {
+            return Err(anyhow!("chat_id cannot be empty"));
+        }
+
+        let trimmed_content = content.trim();
+        if trimmed_content.is_empty() {
+            return Err(anyhow!("chat content cannot be empty"));
+        }
+
+        let now = Self::now_unix_ms();
+        let conn = self.connection()?;
+        let title = self.chat_title_from_first_message(trimmed_content);
+
+        conn.execute(
+            "INSERT INTO chat_sessions (id, title, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+               updated_at_unix_ms = excluded.updated_at_unix_ms,
+               title = CASE
+                 WHEN chat_sessions.title = 'New Chat' AND ?4 = 'me' THEN ?2
+                 ELSE chat_sessions.title
+               END",
+            params![trimmed_chat_id, title, now, role],
+        )?;
+
+        conn.execute(
+            "INSERT INTO chat_messages (chat_id, role, content, created_at_unix_ms, iteration_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![trimmed_chat_id, role, trimmed_content, now, iteration_id],
+        )?;
+
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Lists most recently updated chat sessions.
+    pub fn list_chat_sessions(&self, limit: usize) -> Result<Vec<PersistedChatSession>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT s.id, s.title, s.created_at_unix_ms, s.updated_at_unix_ms, COUNT(m.id)
+             FROM chat_sessions s
+             LEFT JOIN chat_messages m ON m.chat_id = s.id
+             GROUP BY s.id
+             HAVING COUNT(m.id) > 0
+             ORDER BY s.updated_at_unix_ms DESC
+             LIMIT ?1",
+        )?;
+
+        let rows = statement.query_map(params![limit as i64], |row| {
+            Ok(PersistedChatSession {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                created_at_unix_ms: row.get(2)?,
+                updated_at_unix_ms: row.get(3)?,
+                message_count: row.get::<_, i64>(4)?.max(0) as usize,
+            })
+        })?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row?);
+        }
+        Ok(sessions)
+    }
+
+    /// Lists chat messages for one session after an optional id.
+    pub fn list_chat_messages(
+        &self,
+        chat_id: &str,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PersistedChatMessage>> {
+        let conn = self.connection()?;
+        let mut statement = conn.prepare(
+            "SELECT id, chat_id, role, content, created_at_unix_ms, iteration_id
+             FROM chat_messages
+             WHERE chat_id = ?1 AND (?2 IS NULL OR id > ?2)
+             ORDER BY id ASC
+             LIMIT ?3",
+        )?;
+
+        let rows = statement.query_map(params![chat_id, after_id, limit as i64], |row| {
+            Ok(PersistedChatMessage {
+                id: row.get(0)?,
+                chat_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                created_at_unix_ms: row.get(4)?,
+                iteration_id: row.get(5)?,
+            })
+        })?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            messages.push(row?);
+        }
+        Ok(messages)
+    }
+
     /// Returns current unix timestamp in seconds.
     pub fn now_unix() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64
+    }
+
+    /// Returns current unix timestamp in milliseconds.
+    pub fn now_unix_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
     }
 
     fn initialize(&self) -> Result<()> {
@@ -205,9 +352,40 @@ impl SqliteStore {
                 surprising_percepts TEXT NOT NULL,
                 planned_actions TEXT NOT NULL,
                 action_results TEXT NOT NULL
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                updated_at_unix_ms INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at_unix_ms INTEGER NOT NULL,
+                iteration_id INTEGER,
+                FOREIGN KEY(chat_id) REFERENCES chat_sessions(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_chat_id_id
+                ON chat_messages(chat_id, id);
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated
+                ON chat_sessions(updated_at_unix_ms DESC);",
         )?;
         Ok(())
+    }
+
+    fn chat_title_from_first_message(&self, content: &str) -> String {
+        let compact = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed = compact.trim();
+        if trimmed.is_empty() {
+            return "New Chat".to_string();
+        }
+        trimmed.chars().take(48).collect::<String>()
     }
 
     fn connection(&self) -> Result<Connection> {

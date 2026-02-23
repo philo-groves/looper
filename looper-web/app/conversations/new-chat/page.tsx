@@ -1,5 +1,6 @@
-import { BlankWorkspacePage } from "@/components/window/BlankWorkspacePage";
+import { randomUUID } from "node:crypto";
+import { redirect } from "next/navigation";
 
 export default function NewChatPage() {
-  return <BlankWorkspacePage title="New Chat" />;
+  redirect(`/conversations/chat/${randomUUID()}`);
 }

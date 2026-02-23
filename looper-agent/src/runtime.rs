@@ -20,7 +20,7 @@ use crate::models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,
     LocalModel, LocalModelRequest, RuleBasedFrontierModel, RuleBasedLocalModel,
 };
-use crate::storage::{PersistedIteration, SqliteStore};
+use crate::storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration, SqliteStore};
 
 const FORCE_SURPRISE_SENSITIVITY_THRESHOLD: u8 = 90;
 
@@ -617,8 +617,14 @@ impl LooperRuntime {
         self.internal_executors.insert(kind, executor);
     }
 
-    pub fn enqueue_chat_message(&mut self, message: impl Into<String>) -> Result<()> {
+    /// Enqueues one chat message for processing and persists it.
+    pub fn enqueue_chat_message(
+        &mut self,
+        message: impl Into<String>,
+        chat_id: Option<String>,
+    ) -> Result<String> {
         let message = message.into();
+        let chat_id = normalize_chat_id(chat_id);
         let (unread, queued, sensor_enabled, auto_enabled) = {
             let sensor = self
                 .sensors
@@ -629,7 +635,7 @@ impl LooperRuntime {
                 sensor.enabled = true;
                 auto_enabled = true;
             }
-            sensor.enqueue(message.clone());
+            sensor.enqueue_with_chat_id(message.clone(), chat_id.clone());
             (
                 sensor.unread_count(),
                 sensor.queued_count(),
@@ -644,14 +650,41 @@ impl LooperRuntime {
         self.log_state(
             "enqueue_chat_message",
             format!(
-                "len={}, unread={}, queued={}, sensor_enabled={}",
+                "chat_id={}, len={}, unread={}, queued={}, sensor_enabled={}",
+                chat_id,
                 message.len(),
                 unread,
                 queued,
                 sensor_enabled
             ),
         );
-        Ok(())
+
+        if let Some(store) = &self.store {
+            store.insert_chat_message(&chat_id, "me", &message, None)?;
+        }
+
+        Ok(chat_id)
+    }
+
+    /// Lists persisted chat sessions.
+    pub fn list_chat_sessions(&self, limit: usize) -> Result<Vec<PersistedChatSession>> {
+        match &self.store {
+            Some(store) => store.list_chat_sessions(limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Lists persisted chat messages for one chat.
+    pub fn list_chat_messages(
+        &self,
+        chat_id: &str,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PersistedChatMessage>> {
+        match &self.store {
+            Some(store) => store.list_chat_messages(chat_id, after_id, limit),
+            None => Ok(Vec::new()),
+        }
     }
 
     pub fn pending_approvals(&self) -> Vec<PendingApproval> {
@@ -1036,7 +1069,31 @@ impl LooperRuntime {
             planned_actions: report.planned_actions.clone(),
             action_results: report.action_results.clone(),
         };
-        report.iteration_id = Some(store.insert_iteration(&persisted)?);
+        let iteration_id = store.insert_iteration(&persisted)?;
+        report.iteration_id = Some(iteration_id);
+
+        if let Some(chat_id) = report
+            .sensed_percepts
+            .iter()
+            .rev()
+            .find(|percept| percept.sensor_name == "chat")
+            .and_then(|percept| percept.chat_id.as_deref())
+        {
+            for result in &report.action_results {
+                let content = match result {
+                    ExecutionResult::Executed { output } if !output.trim().is_empty() => {
+                        output.trim().to_string()
+                    }
+                    ExecutionResult::Denied(reason) => format!("action denied ({reason})"),
+                    ExecutionResult::RequiresHitl { approval_id } => {
+                        format!("action requires HITL (approval id: {approval_id})")
+                    }
+                    _ => continue,
+                };
+
+                store.insert_chat_message(chat_id, "looper", &content, Some(iteration_id))?;
+            }
+        }
         Ok(())
     }
 
@@ -1206,6 +1263,15 @@ fn now_unix_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn normalize_chat_id(chat_id: Option<String>) -> String {
+    let trimmed = chat_id.unwrap_or_default().trim().to_string();
+    if !trimmed.is_empty() {
+        return trimmed;
+    }
+
+    format!("chat-{}", now_unix_ms())
+}
+
 fn looper_user_dir() -> PathBuf {
     if let Some(home) = user_home_dir() {
         return home.join(".looper");
@@ -1270,7 +1336,7 @@ mod tests {
         runtime.disable_store();
         runtime.start().expect("start should succeed");
         runtime
-            .enqueue_chat_message("routine status update")
+            .enqueue_chat_message("routine status update", None)
             .expect("chat sensor should exist");
 
         let report = runtime
@@ -1288,7 +1354,7 @@ mod tests {
         runtime.disable_store();
         runtime.start().expect("start should succeed");
         runtime
-            .enqueue_chat_message("please search docs for model guidance")
+            .enqueue_chat_message("please search docs for model guidance", None)
             .expect("chat sensor should exist");
 
         let report = runtime
@@ -1321,7 +1387,7 @@ mod tests {
         .expect("policy should be valid");
         runtime.add_actuator(shell);
         runtime
-            .enqueue_chat_message("run cargo test")
+            .enqueue_chat_message("run cargo test", None)
             .expect("chat sensor should exist");
 
         let report = runtime
@@ -1364,7 +1430,7 @@ mod tests {
         runtime.disable_store();
         runtime.start().expect("start should succeed");
         runtime
-            .enqueue_chat_message("please search docs for model guidance")
+            .enqueue_chat_message("please search docs for model guidance", None)
             .expect("chat sensor should exist");
 
         let report = runtime

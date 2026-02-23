@@ -29,4 +29,4 @@ pub use runtime::{
     LoopRuntimePhase, LoopVisualizationSnapshot, LooperRuntime, Observability,
     ObservabilitySnapshot, default_agent_workspace_dir,
 };
-pub use storage::{PersistedIteration, SqliteStore};
+pub use storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration, SqliteStore};

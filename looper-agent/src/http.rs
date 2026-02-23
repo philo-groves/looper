@@ -18,7 +18,7 @@ use crate::model::{
     RateLimit,
 };
 use crate::runtime::{LoopVisualizationSnapshot, LooperRuntime, ObservabilitySnapshot};
-use crate::storage::PersistedIteration;
+use crate::storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration};
 
 const DEFAULT_AUTO_START_INTERVAL_MS: u64 = 500;
 
@@ -46,6 +46,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/sensors", post(add_sensor_handler))
         .route("/api/actuators", post(add_actuator_handler))
         .route("/api/percepts/chat", post(add_chat_percept_handler))
+        .route("/api/chats", get(list_chat_sessions_handler))
+        .route(
+            "/api/chats/{chat_id}/messages",
+            get(list_chat_messages_handler),
+        )
         .route("/api/config/keys", post(register_api_key_handler))
         .route("/api/config/models", post(configure_models_handler))
         .route("/api/metrics", get(metrics_handler))
@@ -124,16 +129,75 @@ pub async fn add_chat_percept_handler(
     Json(request): Json<ChatPerceptRequest>,
 ) -> Result<(StatusCode, Json<SimpleStatusResponse>), (StatusCode, Json<ApiError>)> {
     let mut runtime = state.runtime.lock().await;
-    runtime
-        .enqueue_chat_message(request.message)
+    let chat_id = runtime
+        .enqueue_chat_message(request.message, request.chat_id)
         .map_err(|error| bad_request(error.to_string()))?;
 
     Ok((
         StatusCode::ACCEPTED,
         Json(SimpleStatusResponse {
-            status: "accepted".to_string(),
+            status: format!("accepted:{chat_id}"),
         }),
     ))
+}
+
+/// Query payload for listing chat sessions.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChatSessionListQuery {
+    /// Maximum number of sessions to return.
+    pub limit: Option<usize>,
+}
+
+/// Response payload for listing chat sessions.
+#[derive(Clone, Debug, Serialize)]
+pub struct ChatSessionsResponse {
+    /// Ordered chat sessions.
+    pub chats: Vec<PersistedChatSession>,
+}
+
+/// Lists chat sessions persisted by the agent.
+pub async fn list_chat_sessions_handler(
+    State(state): State<AppState>,
+    Query(query): Query<ChatSessionListQuery>,
+) -> Result<Json<ChatSessionsResponse>, (StatusCode, Json<ApiError>)> {
+    let runtime = state.runtime.lock().await;
+    let chats = runtime
+        .list_chat_sessions(query.limit.unwrap_or(100).clamp(1, 500))
+        .map_err(|error| internal_error(error.to_string()))?;
+    Ok(Json(ChatSessionsResponse { chats }))
+}
+
+/// Query payload for listing chat messages.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ChatMessageListQuery {
+    /// Return messages with id greater than this value.
+    pub after_id: Option<i64>,
+    /// Maximum number of messages.
+    pub limit: Option<usize>,
+}
+
+/// Response payload for listing chat messages.
+#[derive(Clone, Debug, Serialize)]
+pub struct ChatMessagesResponse {
+    /// Ordered message list.
+    pub messages: Vec<PersistedChatMessage>,
+}
+
+/// Lists chat messages for one session.
+pub async fn list_chat_messages_handler(
+    Path(chat_id): Path<String>,
+    State(state): State<AppState>,
+    Query(query): Query<ChatMessageListQuery>,
+) -> Result<Json<ChatMessagesResponse>, (StatusCode, Json<ApiError>)> {
+    let runtime = state.runtime.lock().await;
+    let messages = runtime
+        .list_chat_messages(
+            &chat_id,
+            query.after_id,
+            query.limit.unwrap_or(200).clamp(1, 1000),
+        )
+        .map_err(|error| internal_error(error.to_string()))?;
+    Ok(Json(ChatMessagesResponse { messages }))
 }
 
 /// Returns current runtime metrics.
@@ -386,6 +450,8 @@ pub async fn deny_handler(
 pub struct ChatPerceptRequest {
     /// Chat message content.
     pub message: String,
+    /// Optional chat session id.
+    pub chat_id: Option<String>,
 }
 
 /// Request payload for loop start.
@@ -590,6 +656,13 @@ struct WsLoopStartParams {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct WsChatMessagesParams {
+    chat_id: String,
+    after_id: Option<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct WsListProviderModelsParams {
     provider: ModelProviderKind,
     api_key: Option<String>,
@@ -762,10 +835,10 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
             let payload: ChatPerceptRequest =
                 serde_json::from_value(params).map_err(|error| error.to_string())?;
             let mut runtime = state.runtime.lock().await;
-            runtime
-                .enqueue_chat_message(payload.message)
+            let chat_id = runtime
+                .enqueue_chat_message(payload.message, payload.chat_id)
                 .map_err(|error| error.to_string())?;
-            Ok(serde_json::json!({ "status": "accepted" }))
+            Ok(serde_json::json!({ "status": "accepted", "chat_id": chat_id }))
         }
         "register_api_key" => {
             let payload: ApiKeyRequest =
@@ -837,6 +910,30 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
                 .list_iterations_after(payload.after_id, limit)
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::to_value(IterationsResponse { iterations })
+                .map_err(|error| error.to_string())?)
+        }
+        "list_chat_sessions" => {
+            let payload: ChatSessionListQuery =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let runtime = state.runtime.lock().await;
+            let chats = runtime
+                .list_chat_sessions(payload.limit.unwrap_or(100).clamp(1, 500))
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(ChatSessionsResponse { chats })
+                .map_err(|error| error.to_string())?)
+        }
+        "list_chat_messages" => {
+            let payload: WsChatMessagesParams =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let runtime = state.runtime.lock().await;
+            let messages = runtime
+                .list_chat_messages(
+                    &payload.chat_id,
+                    payload.after_id,
+                    payload.limit.unwrap_or(200).clamp(1, 1000),
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(ChatMessagesResponse { messages })
                 .map_err(|error| error.to_string())?)
         }
         _ => Err(format!("unsupported method '{method}'")),

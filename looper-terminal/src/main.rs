@@ -17,8 +17,8 @@ use crossterm::terminal::{
 use fiddlesticks::{ProviderId, list_models_with_api_key};
 use futures_util::{SinkExt, StreamExt};
 use looper_agent::{
-    AgentState, ExecutionResult, ModelProviderKind, ModelSelection, ObservabilitySnapshot,
-    PersistedIteration, default_agent_workspace_dir,
+    AgentState, ModelProviderKind, ModelSelection, ObservabilitySnapshot,
+    default_agent_workspace_dir,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -54,7 +54,8 @@ async fn run_one_shot(message: String) -> Result<()> {
     append_terminal_log(&format!("starting one-shot mode message={}", message));
     let client = AgentClient::new(default_agent_base_url());
     client.health().await?;
-    client.enqueue_chat_message(message).await?;
+    let chat_id = format!("oneshot-{}", Local::now().timestamp_millis());
+    client.enqueue_chat_message(message, chat_id).await?;
     println!("message accepted by looper-agent");
     Ok(())
 }
@@ -87,11 +88,43 @@ impl AgentClient {
         self.request("metrics", serde_json::json!({})).await
     }
 
-    async fn enqueue_chat_message(&self, message: String) -> Result<()> {
-        let _: serde_json::Value = self
-            .request("enqueue_chat_message", ChatPerceptRequest { message })
+    async fn enqueue_chat_message(&self, message: String, chat_id: String) -> Result<String> {
+        let response: ChatEnqueueResponse = self
+            .request(
+                "enqueue_chat_message",
+                ChatPerceptRequest { message, chat_id },
+            )
             .await?;
-        Ok(())
+        Ok(response.chat_id)
+    }
+
+    async fn list_chat_sessions(&self, limit: usize) -> Result<Vec<ConversationSession>> {
+        let body: ChatSessionsResponse = self
+            .request(
+                "list_chat_sessions",
+                ChatSessionsParams { limit: Some(limit) },
+            )
+            .await?;
+        Ok(body.chats)
+    }
+
+    async fn list_chat_messages(
+        &self,
+        chat_id: String,
+        after_id: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PersistedChatMessage>> {
+        let body: ChatMessagesResponse = self
+            .request(
+                "list_chat_messages",
+                ChatMessagesParams {
+                    chat_id,
+                    after_id,
+                    limit: Some(limit),
+                },
+            )
+            .await?;
+        Ok(body.messages)
     }
 
     async fn register_api_key(&self, provider: ModelProviderKind, api_key: String) -> Result<()> {
@@ -114,23 +147,6 @@ impl AgentClient {
 
     async fn loop_status(&self) -> Result<LoopStatusResponse> {
         self.request("loop_status", serde_json::json!({})).await
-    }
-
-    async fn list_iterations_after(
-        &self,
-        after_id: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<PersistedIteration>> {
-        let body: IterationsResponse = self
-            .request(
-                "list_iterations",
-                IterationListParams {
-                    after_id,
-                    limit: Some(limit),
-                },
-            )
-            .await?;
-        Ok(body.iterations)
     }
 
     async fn request<P, R>(&self, method: &str, params: P) -> Result<R>
@@ -207,13 +223,24 @@ struct LoopStatusResponse {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct IterationsResponse {
-    iterations: Vec<PersistedIteration>,
+struct ChatEnqueueResponse {
+    chat_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ChatSessionsResponse {
+    chats: Vec<ConversationSession>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ChatMessagesResponse {
+    messages: Vec<PersistedChatMessage>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 struct ChatPerceptRequest {
     message: String,
+    chat_id: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -229,9 +256,22 @@ struct ModelConfigRequest {
 }
 
 #[derive(Clone, Debug, Serialize)]
-struct IterationListParams {
+struct ChatSessionsParams {
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ChatMessagesParams {
+    chat_id: String,
     after_id: Option<i64>,
     limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PersistedChatMessage {
+    id: i64,
+    role: String,
+    content: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -334,13 +374,27 @@ struct App {
     start_timestamp: String,
     loops_per_minute_history: Vec<f64>,
     refresh_task: Option<JoinHandle<Result<RefreshPayload>>>,
+    conversation_history: Vec<ConversationSession>,
+    current_conversation_id: String,
+    latest_chat_message_id: Option<i64>,
+    history_popup_selected_index: usize,
 }
 
 struct RefreshPayload {
     state: AgentStateResponse,
     observability: ObservabilitySnapshot,
     loop_status: LoopStatusResponse,
-    iterations: Vec<PersistedIteration>,
+    chat_sessions: Vec<ConversationSession>,
+    chat_messages: Vec<PersistedChatMessage>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ConversationSession {
+    id: String,
+    title: String,
+    created_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+    message_count: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -425,7 +479,13 @@ impl App {
             start_timestamp: "(unknown)".to_string(),
             loops_per_minute_history: vec![0.0],
             refresh_task: None,
+            conversation_history: Vec::new(),
+            current_conversation_id: String::new(),
+            latest_chat_message_id: None,
+            history_popup_selected_index: 0,
         };
+
+        app.start_new_conversation_session()?;
 
         if let Err(error) = app.refresh_agent_status().await {
             app.status = format!("Could not reach looper-agent: {error}");
@@ -543,11 +603,23 @@ impl App {
         self.loop_running = loop_status.running;
         self.loop_interval_ms = loop_status.interval_ms;
 
-        let new_iterations = self
+        self.conversation_history = self.client.list_chat_sessions(100).await?;
+        let new_messages = self
             .client
-            .list_iterations_after(self.latest_iteration_id, 100)
+            .list_chat_messages(
+                self.current_conversation_id.clone(),
+                self.latest_chat_message_id,
+                200,
+            )
             .await?;
-        self.consume_iterations(new_iterations);
+        for message in new_messages {
+            self.latest_chat_message_id = Some(message.id);
+            if message.role.eq_ignore_ascii_case("me") {
+                self.push_me_message(&message.content);
+            } else {
+                self.push_looper_message(&message.content);
+            }
+        }
 
         Ok(())
     }
@@ -578,26 +650,79 @@ impl App {
         Ok(())
     }
 
-    fn consume_iterations(&mut self, iterations: Vec<PersistedIteration>) {
-        for iteration in iterations {
-            self.latest_iteration_id = Some(iteration.id);
-            for result in &iteration.action_results {
-                match result {
-                    ExecutionResult::Executed { output } if !output.trim().is_empty() => {
-                        self.push_looper_message(output.trim());
-                    }
-                    ExecutionResult::Denied(reason) => {
-                        self.push_looper_message(&format!("action denied ({reason})"));
-                    }
-                    ExecutionResult::RequiresHitl { approval_id } => {
-                        self.push_looper_message(&format!(
-                            "action requires HITL (approval id: {approval_id})"
-                        ));
-                    }
-                    _ => {}
-                }
+    fn start_new_conversation_session(&mut self) -> Result<()> {
+        let now = Local::now().timestamp_millis();
+        self.current_conversation_id = format!("session-{now}-{}", std::process::id());
+        self.latest_chat_message_id = None;
+        self.chat_history.clear();
+        Ok(())
+    }
+
+    fn history_sessions_for_popup(&self) -> Vec<ConversationSession> {
+        let mut sessions = self.conversation_history.clone();
+        let now = Local::now().timestamp_millis();
+        if !sessions
+            .iter()
+            .any(|item| item.id == self.current_conversation_id)
+        {
+            sessions.push(ConversationSession {
+                id: self.current_conversation_id.clone(),
+                title: "New Chat".to_string(),
+                created_at_unix_ms: now,
+                updated_at_unix_ms: now,
+                message_count: self.chat_history.len(),
+            });
+        }
+
+        sessions.sort_by(|left, right| {
+            right
+                .updated_at_unix_ms
+                .cmp(&left.updated_at_unix_ms)
+                .then_with(|| right.created_at_unix_ms.cmp(&left.created_at_unix_ms))
+        });
+        sessions
+    }
+
+    fn clamp_history_popup_selection(&mut self) {
+        let sessions = self.history_sessions_for_popup();
+        if sessions.is_empty() {
+            self.history_popup_selected_index = 0;
+            return;
+        }
+
+        self.history_popup_selected_index = self
+            .history_popup_selected_index
+            .min(sessions.len().saturating_sub(1));
+    }
+
+    fn selected_history_session(&self) -> Option<ConversationSession> {
+        let sessions = self.history_sessions_for_popup();
+        sessions
+            .get(
+                self.history_popup_selected_index
+                    .min(sessions.len().saturating_sub(1)),
+            )
+            .cloned()
+    }
+
+    async fn load_conversation_session(&mut self, session_id: String) -> Result<()> {
+        let messages = self
+            .client
+            .list_chat_messages(session_id.clone(), None, 500)
+            .await?;
+
+        self.current_conversation_id = session_id;
+        self.chat_history.clear();
+        self.latest_chat_message_id = None;
+        for message in messages {
+            self.latest_chat_message_id = Some(message.id);
+            if message.role.eq_ignore_ascii_case("me") {
+                self.push_me_message(&message.content);
+            } else {
+                self.push_looper_message(&message.content);
             }
         }
+        Ok(())
     }
 
     async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -656,9 +781,10 @@ impl App {
 
             if last_tick.elapsed() >= Duration::from_millis(500) && self.refresh_task.is_none() {
                 let client = self.client.clone();
-                let after_id = self.latest_iteration_id;
+                let after_chat_message_id = self.latest_chat_message_id;
+                let current_chat_id = self.current_conversation_id.clone();
                 self.refresh_task = Some(tokio::spawn(async move {
-                    fetch_refresh_payload(client, after_id).await
+                    fetch_refresh_payload(client, current_chat_id, after_chat_message_id).await
                 }));
                 last_tick = Instant::now();
             }
@@ -686,7 +812,9 @@ impl App {
         {
             self.show_history_popup = !self.show_history_popup;
             self.status = if self.show_history_popup {
-                "conversation history opened".to_string()
+                self.history_popup_selected_index = 0;
+                self.clamp_history_popup_selection();
+                "conversation history opened (Up/Down to pick)".to_string()
             } else {
                 "conversation history closed".to_string()
             };
@@ -1013,10 +1141,29 @@ impl App {
 
     async fn handle_runtime_key(&mut self, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
         if self.show_history_popup {
-            if code == KeyCode::Esc {
-                self.show_history_popup = false;
-                self.status = "conversation history closed".to_string();
+            match code {
+                KeyCode::Esc => {
+                    self.show_history_popup = false;
+                    self.status = "conversation history closed".to_string();
+                }
+                KeyCode::Up => {
+                    self.history_popup_selected_index =
+                        self.history_popup_selected_index.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.history_popup_selected_index =
+                        self.history_popup_selected_index.saturating_add(1);
+                }
+                KeyCode::Enter => {
+                    if let Some(session) = self.selected_history_session() {
+                        self.load_conversation_session(session.id).await?;
+                        self.show_history_popup = false;
+                        self.status = "loaded conversation history".to_string();
+                    }
+                }
+                _ => {}
             }
+            self.clamp_history_popup_selection();
             return Ok(());
         }
 
@@ -1031,10 +1178,12 @@ impl App {
             KeyCode::Enter => {
                 if !self.chat_input.trim().is_empty() {
                     let queued_message = self.chat_input.trim().to_string();
-                    self.client
-                        .enqueue_chat_message(self.chat_input.clone())
+                    let chat_id = self.current_conversation_id.clone();
+                    let returned_chat_id = self
+                        .client
+                        .enqueue_chat_message(self.chat_input.clone(), chat_id)
                         .await?;
-                    self.push_me_message(&queued_message);
+                    self.current_conversation_id = returned_chat_id;
                     append_terminal_log(&format!("chat message queued: {queued_message}"));
                     self.chat_input.clear();
                     self.chat_cursor_index = 0;
@@ -1787,7 +1936,6 @@ impl App {
     }
 
     fn apply_refresh_payload(&mut self, payload: RefreshPayload) {
-        let was_initialized = self.iterations_initialized;
         if !self.iterations_initialized {
             self.latest_iteration_id = payload.state.latest_iteration_id;
             self.iterations_initialized = true;
@@ -1807,8 +1955,14 @@ impl App {
         self.loop_running = payload.loop_status.running;
         self.loop_interval_ms = payload.loop_status.interval_ms;
 
-        if was_initialized {
-            self.consume_iterations(payload.iterations);
+        self.conversation_history = payload.chat_sessions;
+        for message in payload.chat_messages {
+            self.latest_chat_message_id = Some(message.id);
+            if message.role.eq_ignore_ascii_case("me") {
+                self.push_me_message(&message.content);
+            } else {
+                self.push_looper_message(&message.content);
+            }
         }
     }
 
@@ -1826,33 +1980,98 @@ impl App {
 
         let popup_block = Block::default()
             .borders(Borders::ALL)
-            .title("Conversation History (Esc to close)");
+            .title("Conversation History (Up/Down pick, Esc close)");
         let popup_inner = popup_block.inner(popup_area);
         frame.render_widget(popup_block, popup_area);
 
-        let content_width = usize::from(popup_inner.width.saturating_sub(1)).max(1);
-        let max_lines = usize::from(popup_inner.height).max(1);
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(popup_inner);
 
-        let mut lines = if self.chat_history.is_empty() {
-            vec![Line::from("(no chat yet)")]
+        let sessions = self.history_sessions_for_popup();
+        let selected_index = self
+            .history_popup_selected_index
+            .min(sessions.len().saturating_sub(1));
+
+        let list_items = if sessions.is_empty() {
+            vec![ListItem::new("(no chat sessions yet)")]
         } else {
+            sessions
+                .iter()
+                .map(|session| {
+                    let mut label = format_conversation_timestamp(session.created_at_unix_ms);
+                    if session.id == self.current_conversation_id {
+                        label.push_str(" (current)");
+                    }
+                    if session.message_count == 0 {
+                        label.push_str(" - unsaved");
+                    } else {
+                        label.push_str(&format!(" - {} msgs", session.message_count));
+                    }
+                    ListItem::new(label)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut list_state = ListState::default();
+        if !sessions.is_empty() {
+            list_state.select(Some(selected_index));
+        }
+
+        let list = List::new(list_items)
+            .block(Block::default().borders(Borders::ALL).title("Chats"))
+            .highlight_style(Style::default().fg(Color::Cyan))
+            .highlight_symbol("> ");
+        frame.render_stateful_widget(list, columns[0], &mut list_state);
+
+        let detail_block = Block::default().borders(Borders::ALL).title("Transcript");
+        let detail_inner = detail_block.inner(columns[1]);
+        frame.render_widget(detail_block, columns[1]);
+
+        let content_width = usize::from(detail_inner.width.saturating_sub(1)).max(1);
+        let max_lines = usize::from(detail_inner.height).max(1);
+
+        let mut lines = if let Some(session) = sessions.get(selected_index) {
             let mut built = Vec::new();
-            for (index, entry) in self.chat_history.iter().enumerate() {
-                for wrapped in wrap_chat_entry_lines(entry, content_width) {
-                    built.push(styled_chat_history_line(&wrapped));
-                }
-                if index + 1 < self.chat_history.len() {
+            let heading = if session.id == self.current_conversation_id {
+                format!(
+                    "[Session] {} (current)",
+                    format_conversation_timestamp(session.created_at_unix_ms)
+                )
+            } else {
+                format!(
+                    "[Session] {}",
+                    format_conversation_timestamp(session.created_at_unix_ms)
+                )
+            };
+            built.push(styled_chat_history_line(&heading));
+            built.push(Line::from(""));
+
+            if session.id != self.current_conversation_id {
+                built.push(styled_chat_history_line("Press Enter to load this chat."));
+            } else if self.chat_history.is_empty() {
+                built.push(styled_chat_history_line("(no messages yet)"));
+            } else {
+                for entry in &self.chat_history {
+                    for wrapped in wrap_chat_entry_lines(entry, content_width) {
+                        built.push(styled_chat_history_line(&wrapped));
+                    }
                     built.push(Line::from(""));
                 }
+                built.pop();
             }
+
             built
+        } else {
+            vec![Line::from("Select a chat session")]
         };
 
         if lines.len() > max_lines {
             lines = lines.split_off(lines.len() - max_lines);
         }
 
-        frame.render_widget(Paragraph::new(lines), popup_inner);
+        frame.render_widget(Paragraph::new(lines), detail_inner);
     }
 }
 
@@ -1896,20 +2115,25 @@ fn chat_input_cursor_position(area: Rect, input: &str, cursor_index: usize) -> (
 
 async fn fetch_refresh_payload(
     client: AgentClient,
-    after_id: Option<i64>,
+    current_chat_id: String,
+    after_chat_message_id: Option<i64>,
 ) -> Result<RefreshPayload> {
     client.health().await?;
 
     let state = client.state().await?;
     let observability = client.metrics().await?;
     let loop_status = client.loop_status().await?;
-    let iterations = client.list_iterations_after(after_id, 100).await?;
+    let chat_sessions = client.list_chat_sessions(100).await?;
+    let chat_messages = client
+        .list_chat_messages(current_chat_id, after_chat_message_id, 200)
+        .await?;
 
     Ok(RefreshPayload {
         state,
         observability,
         loop_status,
-        iterations,
+        chat_sessions,
+        chat_messages,
     })
 }
 
@@ -1980,6 +2204,13 @@ fn wrap_line_preserving_indent(line: &str, max_width: usize) -> Vec<String> {
 }
 
 fn styled_chat_history_line(line: &str) -> Line<'static> {
+    if let Some(rest) = line.strip_prefix("[Session]") {
+        return Line::from(vec![
+            Span::styled("[Session]".to_string(), Style::default().fg(Color::Cyan)),
+            Span::raw(rest.to_string()),
+        ]);
+    }
+
     for prefix in ["[Looper]", "[Me]"] {
         if let Some(rest) = line.strip_prefix(prefix) {
             let pad_len = rest.chars().take_while(|ch| *ch == ' ').count();
@@ -2348,6 +2579,18 @@ fn format_start_timestamp_from_unix(started_at_unix: i64) -> String {
         return format!("{trimmed}p");
     }
     formatted
+}
+
+fn format_conversation_timestamp(unix_ms: i64) -> String {
+    if unix_ms <= 0 {
+        return "(unknown start)".to_string();
+    }
+
+    let Some(date_time) = Local.timestamp_millis_opt(unix_ms).single() else {
+        return "(unknown start)".to_string();
+    };
+
+    date_time.format("%Y-%m-%d %H:%M").to_string()
 }
 
 fn format_agent_uptime(started_at_unix: i64) -> Option<String> {
