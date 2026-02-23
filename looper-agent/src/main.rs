@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use looper_agent::{AppState, LooperRuntime, build_router};
+use looper_agent::{AppState, LooperRuntime, auto_start_loop_if_configured, build_router};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -10,6 +10,21 @@ async fn main() -> Result<()> {
     let workspace_root = config.workspace_root.clone();
     let runtime = LooperRuntime::with_internal_defaults_for_workspace(workspace_root)?;
     let state = AppState::new(runtime);
+    match auto_start_loop_if_configured(&state).await {
+        Ok(Some(status)) => {
+            println!(
+                "auto-started loop: running={} interval_ms={}",
+                status.running, status.interval_ms
+            );
+        }
+        Ok(None) => {
+            println!("auto-start skipped: no persisted model configuration found");
+        }
+        Err(error) => {
+            println!("auto-start failed: {error}");
+        }
+    }
+
     let app = build_router(state);
 
     let listener = tokio::net::TcpListener::bind(config.bind_addr)

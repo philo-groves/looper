@@ -239,7 +239,6 @@ export function useSetupFlow({ socketConnected, setupRequired, wsCommand }: UseS
         },
       });
 
-      await wsCommand("loop_start", { interval_ms: 500 });
       setSetupInfo("Setup complete. Waiting for live runtime status...");
     } catch (error) {
       const message = error instanceof Error ? error.message : "Setup failed.";

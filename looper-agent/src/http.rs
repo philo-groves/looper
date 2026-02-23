@@ -20,6 +20,8 @@ use crate::model::{
 use crate::runtime::{LoopVisualizationSnapshot, LooperRuntime, ObservabilitySnapshot};
 use crate::storage::PersistedIteration;
 
+const DEFAULT_AUTO_START_INTERVAL_MS: u64 = 500;
+
 /// Shared HTTP state for Looper API handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -161,14 +163,37 @@ pub async fn configure_models_handler(
     State(state): State<AppState>,
     Json(request): Json<ModelConfigRequest>,
 ) -> Result<Json<SimpleStatusResponse>, (StatusCode, Json<ApiError>)> {
-    let mut runtime = state.runtime.lock().await;
-    runtime
-        .configure_models(request.local, request.frontier)
+    {
+        let mut runtime = state.runtime.lock().await;
+        runtime
+            .configure_models(request.local, request.frontier)
+            .map_err(|error| bad_request(error.to_string()))?;
+    }
+
+    loop_start_impl(&state, DEFAULT_AUTO_START_INTERVAL_MS)
+        .await
         .map_err(|error| bad_request(error.to_string()))?;
 
     Ok(Json(SimpleStatusResponse {
         status: "ok".to_string(),
     }))
+}
+
+/// Starts the background loop when persisted configuration is already available.
+pub async fn auto_start_loop_if_configured(
+    state: &AppState,
+) -> anyhow::Result<Option<LoopStatusResponse>> {
+    let is_configured = {
+        let runtime = state.runtime.lock().await;
+        runtime.is_configured()
+    };
+
+    if !is_configured {
+        return Ok(None);
+    }
+
+    let status = loop_start_impl(state, DEFAULT_AUTO_START_INTERVAL_MS).await?;
+    Ok(Some(status))
 }
 
 /// Starts continuous loop execution.
@@ -754,9 +779,14 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
         "configure_models" => {
             let payload: ModelConfigRequest =
                 serde_json::from_value(params).map_err(|error| error.to_string())?;
-            let mut runtime = state.runtime.lock().await;
-            runtime
-                .configure_models(payload.local, payload.frontier)
+            {
+                let mut runtime = state.runtime.lock().await;
+                runtime
+                    .configure_models(payload.local, payload.frontier)
+                    .map_err(|error| error.to_string())?;
+            }
+            loop_start_impl(state, DEFAULT_AUTO_START_INTERVAL_MS)
+                .await
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::json!({ "status": "ok" }))
         }

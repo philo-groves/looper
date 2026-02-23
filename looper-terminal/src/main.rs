@@ -112,16 +112,6 @@ impl AgentClient {
         Ok(())
     }
 
-    async fn start_loop(&self, interval_ms: u64) -> Result<LoopStatusResponse> {
-        self.request(
-            "loop_start",
-            LoopStartRequest {
-                interval_ms: Some(interval_ms),
-            },
-        )
-        .await
-    }
-
     async fn loop_status(&self) -> Result<LoopStatusResponse> {
         self.request("loop_status", serde_json::json!({})).await
     }
@@ -236,11 +226,6 @@ struct ApiKeyRequest {
 struct ModelConfigRequest {
     local: ModelSelection,
     frontier: ModelSelection,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct LoopStartRequest {
-    interval_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -589,7 +574,6 @@ impl App {
                 },
             )
             .await?;
-        self.client.start_loop(500).await?;
         self.refresh_agent_status().await?;
         Ok(())
     }
@@ -1179,7 +1163,6 @@ impl App {
             self.push_log(&format!("failed to persist setup: {error}"));
         }
 
-        self.client.start_loop(500).await?;
         self.refresh_agent_status().await?;
         self.status = "setup complete, now running".to_string();
         append_terminal_log(&format!(
