@@ -26,6 +26,54 @@ export function WorkspaceShell({ children }: WorkspaceShellProps) {
     window.localStorage.setItem("looper-theme", theme);
   }, [theme]);
 
+  useEffect(() => {
+    const reloadFlag = "looper-chunk-reload";
+
+    function maybeReloadForChunkError(message: string) {
+      const looksLikeChunkError =
+        message.includes("ChunkLoadError") ||
+        message.includes("Failed to load chunk") ||
+        message.includes("Loading chunk") ||
+        message.includes("hmr-client");
+
+      if (!looksLikeChunkError) {
+        return;
+      }
+
+      const alreadyReloaded = window.sessionStorage.getItem(reloadFlag) === "1";
+      if (alreadyReloaded) {
+        return;
+      }
+
+      window.sessionStorage.setItem(reloadFlag, "1");
+      window.location.reload();
+    }
+
+    function onError(event: ErrorEvent) {
+      maybeReloadForChunkError(event.message ?? "");
+    }
+
+    function onUnhandledRejection(event: PromiseRejectionEvent) {
+      const reason = event.reason;
+      const text =
+        typeof reason === "string"
+          ? reason
+          : reason instanceof Error
+            ? `${reason.name}: ${reason.message}`
+            : "";
+      maybeReloadForChunkError(text);
+    }
+
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onUnhandledRejection);
+
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onUnhandledRejection);
+      window.sessionStorage.removeItem(reloadFlag);
+    };
+  }, []);
+
   return (
     <main className="min-h-screen w-full bg-zinc-100 text-zinc-900 dark:bg-black dark:text-zinc-100">
       <div className="flex min-h-screen w-full">

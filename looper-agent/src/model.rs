@@ -66,6 +66,10 @@ pub struct Sensor {
     pub enabled: bool,
     /// Sensitivity score for surprise detection, from 0 to 100.
     pub sensitivity_score: u8,
+    /// Singular display name for percept items.
+    pub percept_singular_name: String,
+    /// Plural display name for percept items.
+    pub percept_plural_name: String,
     queue: VecDeque<Percept>,
     unread_start: usize,
 }
@@ -82,11 +86,21 @@ impl Sensor {
         description: impl Into<String>,
         sensitivity_score: u8,
     ) -> Self {
+        let name = name.into();
+        let singular = name.trim().to_lowercase();
+        let plural = if singular.ends_with('s') {
+            singular.clone()
+        } else {
+            format!("{singular}s")
+        };
+
         Self {
-            name: name.into(),
+            name,
             description: description.into(),
             enabled: true,
             sensitivity_score: sensitivity_score.min(100),
+            percept_singular_name: singular,
+            percept_plural_name: plural,
             queue: VecDeque::new(),
             unread_start: 0,
         }
@@ -316,6 +330,10 @@ pub struct Actuator {
     pub kind: ActuatorType,
     /// Safety policy.
     pub policy: SafetyPolicy,
+    /// Singular display name for action items.
+    pub action_singular_name: String,
+    /// Plural display name for action items.
+    pub action_plural_name: String,
 }
 
 impl Actuator {
@@ -327,11 +345,21 @@ impl Actuator {
         policy: SafetyPolicy,
     ) -> Result<Self> {
         policy.validate()?;
+        let name = name.into();
+        let singular = name.trim().to_lowercase();
+        let plural = if singular.ends_with('s') {
+            singular.clone()
+        } else {
+            format!("{singular}s")
+        };
+
         Ok(Self {
-            name: name.into(),
+            name,
             description: description.into(),
             kind: ActuatorType::Internal(kind),
             policy,
+            action_singular_name: singular,
+            action_plural_name: plural,
         })
     }
 
@@ -344,11 +372,21 @@ impl Actuator {
     ) -> Result<Self> {
         policy.validate()?;
         details.validate()?;
+        let name = name.into();
+        let singular = name.trim().to_lowercase();
+        let plural = if singular.ends_with('s') {
+            singular.clone()
+        } else {
+            format!("{singular}s")
+        };
+
         Ok(Self {
-            name: name.into(),
+            name,
             description: description.into(),
             kind: ActuatorType::Mcp(details),
             policy,
+            action_singular_name: singular,
+            action_plural_name: plural,
         })
     }
 
@@ -361,11 +399,21 @@ impl Actuator {
     ) -> Result<Self> {
         policy.validate()?;
         details.validate()?;
+        let name = name.into();
+        let singular = name.trim().to_lowercase();
+        let plural = if singular.ends_with('s') {
+            singular.clone()
+        } else {
+            format!("{singular}s")
+        };
+
         Ok(Self {
-            name: name.into(),
+            name,
             description: description.into(),
             kind: ActuatorType::Workflow(details),
             policy,
+            action_singular_name: singular,
+            action_plural_name: plural,
         })
     }
 }

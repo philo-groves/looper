@@ -56,6 +56,8 @@ export type DashboardPayload = {
     sensitivity_score: number;
     queued_percepts: number;
     unread_percepts: number;
+    percept_singular_name: string;
+    percept_plural_name: string;
   }>;
   actuators: Array<{
     name: string;
@@ -66,6 +68,8 @@ export type DashboardPayload = {
     allowlist_count: number;
     denylist_count: number;
     rate_limit: { max: number; per: string } | null;
+    action_singular_name: string;
+    action_plural_name: string;
   }>;
   pending_approval_count: number;
 };

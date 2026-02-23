@@ -465,6 +465,10 @@ pub struct SensorStatus {
     pub queued_percepts: usize,
     /// Number of unread percepts.
     pub unread_percepts: usize,
+    /// Singular percept item name.
+    pub percept_singular_name: String,
+    /// Plural percept item name.
+    pub percept_plural_name: String,
 }
 
 /// Actuator details displayed on the dashboard.
@@ -486,6 +490,10 @@ pub struct ActuatorStatus {
     pub denylist_count: usize,
     /// Optional rate limit policy.
     pub rate_limit: Option<RateLimit>,
+    /// Singular action item name.
+    pub action_singular_name: String,
+    /// Plural action item name.
+    pub action_plural_name: String,
 }
 
 /// Successful mutation response payload.
@@ -565,6 +573,16 @@ struct WsListProviderModelsParams {
 #[derive(Clone, Debug, Deserialize)]
 struct WsOllamaModelVersionsParams {
     model: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WsUpdateSensorParams {
+    name: String,
+    enabled: Option<bool>,
+    sensitivity_score: Option<u8>,
+    description: Option<String>,
+    percept_singular_name: Option<String>,
+    percept_plural_name: Option<String>,
 }
 
 /// Upgrades to a websocket session for realtime bidirectional updates.
@@ -742,6 +760,22 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::json!({ "status": "ok" }))
         }
+        "update_sensor" => {
+            let payload: WsUpdateSensorParams =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let mut runtime = state.runtime.lock().await;
+            runtime
+                .update_sensor(
+                    &payload.name,
+                    payload.enabled,
+                    payload.sensitivity_score,
+                    payload.description,
+                    payload.percept_singular_name,
+                    payload.percept_plural_name,
+                )
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
         "list_provider_models" => {
             let payload: WsListProviderModelsParams =
                 serde_json::from_value(params).map_err(|error| error.to_string())?;
@@ -880,6 +914,8 @@ async fn dashboard_snapshot(state: &AppState) -> anyhow::Result<DashboardRespons
                 sensitivity_score: sensor.sensitivity_score,
                 queued_percepts,
                 unread_percepts,
+                percept_singular_name: sensor.percept_singular_name,
+                percept_plural_name: sensor.percept_plural_name,
             }
         })
         .collect();
@@ -1173,5 +1209,7 @@ fn actuator_status(actuator: Actuator) -> ActuatorStatus {
         allowlist_count: actuator.policy.allowlist.map_or(0, |entries| entries.len()),
         denylist_count: actuator.policy.denylist.map_or(0, |entries| entries.len()),
         rate_limit: actuator.policy.rate_limit,
+        action_singular_name: actuator.action_singular_name,
+        action_plural_name: actuator.action_plural_name,
     }
 }

@@ -262,7 +262,7 @@ impl FrontierModel for FiddlesticksFrontierModel {
     ) -> Pin<Box<dyn Future<Output = Result<FrontierModelResponse>> + Send + '_>> {
         Box::pin(async move {
             let payload = serde_json::to_string(&request)?;
-            let instruction = "You are the frontier planner in a sensory loop. Return only strict JSON with this shape: {\"actions\": [{\"actuator_name\": string, \"action\": object}], \"rationale\": string, \"token_usage\": number}. action must match one of: ChatResponse, Grep, Glob, Shell, WebSearch enum representations.";
+            let instruction = "You are the frontier planner in a sensory loop. Return only strict JSON with this shape: {\"actions\": [{\"actuator_name\": string, \"action\": object}], \"token_usage\": number, \"rationale\"?: string}. action must match one of: ChatResponse, Grep, Glob, Shell, WebSearch enum representations. For ChatResponse actions, include only the user-visible reply text in action.message (or action.text). Keep responses concise.";
             let response =
                 complete_json(&*self.provider, &self.model, instruction, &payload, 1024).await?;
             match parse_frontier_contract(&response) {
@@ -356,14 +356,18 @@ fn parse_frontier_contract_lenient(raw: &str) -> Result<FrontierModelResponse> {
         let action = action_obj
             .get("action")
             .and_then(parse_lenient_action)
-            .unwrap_or(Action::ChatResponse {
-                message: "I noticed a surprising percept and queued it for review.".to_string(),
-            });
+            .or_else(|| parse_lenient_action(&item));
 
-        normalized_actions.push(RecommendedAction {
-            actuator_name,
-            action,
-        });
+        if let Some(action) = action {
+            normalized_actions.push(RecommendedAction {
+                actuator_name,
+                action,
+            });
+        }
+    }
+
+    if normalized_actions.is_empty() {
+        return Ok(frontier_fallback_from_plain_text(raw));
     }
 
     let rationale = object
@@ -385,7 +389,24 @@ fn parse_frontier_contract_lenient(raw: &str) -> Result<FrontierModelResponse> {
 }
 
 fn parse_lenient_action(value: &serde_json::Value) -> Option<Action> {
+    if let Some(message) = value.as_str() {
+        return Some(Action::ChatResponse {
+            message: message.to_string(),
+        });
+    }
+
     let obj = value.as_object()?;
+
+    if let Some(message) = obj
+        .get("message")
+        .or_else(|| obj.get("content"))
+        .or_else(|| obj.get("text"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(Action::ChatResponse {
+            message: message.to_string(),
+        });
+    }
 
     if let Some(kind) = obj.get("type").and_then(serde_json::Value::as_str) {
         return match kind {
@@ -393,6 +414,7 @@ fn parse_lenient_action(value: &serde_json::Value) -> Option<Action> {
                 let message = obj
                     .get("message")
                     .or_else(|| obj.get("content"))
+                    .or_else(|| obj.get("text"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default()
                     .to_string();
@@ -650,6 +672,53 @@ mod tests {
         match &parsed.actions[0].action {
             Action::ChatResponse { message } => {
                 assert_eq!(message, "Hello. What would you like to do?")
+            }
+            _ => panic!("expected chat response action"),
+        }
+    }
+
+    #[test]
+    fn parse_frontier_contract_accepts_message_on_action_item() {
+        let raw = r#"{
+            "actions": [
+                {
+                    "actuator_name": "chat",
+                    "message": "Here are my capabilities..."
+                }
+            ],
+            "rationale": "ok",
+            "token_usage": 9
+        }"#;
+
+        let parsed = parse_frontier_contract(raw).expect("message field action should parse");
+        assert_eq!(parsed.actions.len(), 1);
+        match &parsed.actions[0].action {
+            Action::ChatResponse { message } => {
+                assert_eq!(message, "Here are my capabilities...")
+            }
+            _ => panic!("expected chat response action"),
+        }
+    }
+
+    #[test]
+    fn parse_frontier_contract_accepts_text_on_action_payload() {
+        let raw = r#"{
+            "actions": [
+                {
+                    "actuator_name": "ChatResponse",
+                    "action": {
+                        "text": "Hello! How can I help you today?"
+                    }
+                }
+            ],
+            "token_usage": 18
+        }"#;
+
+        let parsed = parse_frontier_contract(raw).expect("text field chat action should parse");
+        assert_eq!(parsed.actions.len(), 1);
+        match &parsed.actions[0].action {
+            Action::ChatResponse { message } => {
+                assert_eq!(message, "Hello! How can I help you today?")
             }
             _ => panic!("expected chat response action"),
         }

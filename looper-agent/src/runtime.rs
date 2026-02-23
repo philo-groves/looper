@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -319,18 +321,24 @@ impl LooperRuntime {
         workspace_root: impl Into<PathBuf>,
     ) -> Result<Self> {
         let mut runtime = Self::new();
-        runtime.add_sensor(Sensor::with_sensitivity_score(
+        let mut chat_sensor = Sensor::with_sensitivity_score(
             "chat",
             "Receiver of chat messages in percept form",
             100,
-        ));
+        );
+        chat_sensor.percept_singular_name = "Incoming Message".to_string();
+        chat_sensor.percept_plural_name = "Incoming Messages".to_string();
+        runtime.add_sensor(chat_sensor);
 
-        runtime.add_actuator(Actuator::internal(
+        let mut chat_actuator = Actuator::internal(
             "chat",
             "Responder of chat messages in action form",
             InternalActuatorKind::Chat,
             SafetyPolicy::default(),
-        )?);
+        )?;
+        chat_actuator.action_singular_name = "Outgoing Message".to_string();
+        chat_actuator.action_plural_name = "Outgoing Messages".to_string();
+        runtime.add_actuator(chat_actuator);
         runtime.add_actuator(Actuator::internal(
             "grep",
             "Searches text-based file contents",
@@ -396,6 +404,7 @@ impl LooperRuntime {
         }
         self.provider_api_keys.insert(provider, value);
         self.persist_api_keys()?;
+        self.log_state("register_api_key", format!("provider={provider:?}"));
         Ok(())
     }
 
@@ -412,9 +421,26 @@ impl LooperRuntime {
         self.local_model = Some(local_model);
         self.frontier_model = Some(frontier_model);
         if self.agent_state == AgentState::Setup {
+            self.agent_state = AgentState::Stopped;
             self.stop_reason = None;
         }
         self.persist_settings()?;
+        self.log_state(
+            "configure_models",
+            format!(
+                "local={:?}:{}, frontier={:?}:{}",
+                self.local_selection.as_ref().map(|item| item.provider),
+                self.local_selection
+                    .as_ref()
+                    .map(|item| item.model.as_str())
+                    .unwrap_or(""),
+                self.frontier_selection.as_ref().map(|item| item.provider),
+                self.frontier_selection
+                    .as_ref()
+                    .map(|item| item.model.as_str())
+                    .unwrap_or("")
+            ),
+        );
         Ok(())
     }
 
@@ -431,12 +457,15 @@ impl LooperRuntime {
         }
         self.agent_state = AgentState::Running;
         self.stop_reason = None;
+        self.log_state("start", "runtime started");
         Ok(())
     }
 
     pub fn stop(&mut self, reason: impl Into<String>) {
         self.agent_state = AgentState::Stopped;
-        self.stop_reason = Some(reason.into());
+        let reason = reason.into();
+        self.stop_reason = Some(reason.clone());
+        self.log_state("stop", reason);
     }
 
     pub fn state(&self) -> AgentState {
@@ -498,6 +527,70 @@ impl LooperRuntime {
         self.sensors.insert(sensor.name.clone(), sensor);
     }
 
+    /// Updates mutable sensor configuration fields for an existing sensor.
+    pub fn update_sensor(
+        &mut self,
+        name: &str,
+        enabled: Option<bool>,
+        sensitivity_score: Option<u8>,
+        description: Option<String>,
+        percept_singular_name: Option<String>,
+        percept_plural_name: Option<String>,
+    ) -> Result<()> {
+        if name == "chat" && matches!(enabled, Some(false)) {
+            return Err(anyhow!("chat sensor cannot be disabled"));
+        }
+
+        let (enabled_now, sensitivity_now, singular_now, plural_now) = {
+            let sensor = self
+                .sensors
+                .get_mut(name)
+                .ok_or_else(|| anyhow!("sensor '{name}' not found"))?;
+
+            if let Some(value) = enabled {
+                sensor.enabled = value;
+            }
+            if let Some(value) = sensitivity_score {
+                sensor.sensitivity_score = value.min(100);
+            }
+            if let Some(value) = description {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    sensor.description = trimmed.to_string();
+                }
+            }
+            if let Some(value) = percept_singular_name {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    sensor.percept_singular_name = trimmed.to_lowercase();
+                }
+            }
+            if let Some(value) = percept_plural_name {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    sensor.percept_plural_name = trimmed.to_lowercase();
+                }
+            }
+
+            (
+                sensor.enabled,
+                sensor.sensitivity_score,
+                sensor.percept_singular_name.clone(),
+                sensor.percept_plural_name.clone(),
+            )
+        };
+
+        self.log_state(
+            "update_sensor",
+            format!(
+                "name={name}, enabled={}, sensitivity={}, singular='{}', plural='{}'",
+                enabled_now, sensitivity_now, singular_now, plural_now
+            ),
+        );
+
+        Ok(())
+    }
+
     /// Returns all configured sensors ordered by name.
     pub fn sensors(&self) -> Vec<Sensor> {
         let mut sensors = self.sensors.values().cloned().collect::<Vec<_>>();
@@ -525,11 +618,39 @@ impl LooperRuntime {
     }
 
     pub fn enqueue_chat_message(&mut self, message: impl Into<String>) -> Result<()> {
-        let sensor = self
-            .sensors
-            .get_mut("chat")
-            .ok_or_else(|| anyhow!("chat sensor is not configured"))?;
-        sensor.enqueue(message);
+        let message = message.into();
+        let (unread, queued, sensor_enabled, auto_enabled) = {
+            let sensor = self
+                .sensors
+                .get_mut("chat")
+                .ok_or_else(|| anyhow!("chat sensor is not configured"))?;
+            let mut auto_enabled = false;
+            if !sensor.enabled {
+                sensor.enabled = true;
+                auto_enabled = true;
+            }
+            sensor.enqueue(message.clone());
+            (
+                sensor.unread_count(),
+                sensor.queued_count(),
+                sensor.enabled,
+                auto_enabled,
+            )
+        };
+
+        if auto_enabled {
+            self.log_state("enqueue_chat_message", "chat sensor auto-enabled");
+        }
+        self.log_state(
+            "enqueue_chat_message",
+            format!(
+                "len={}, unread={}, queued={}, sensor_enabled={}",
+                message.len(),
+                unread,
+                queued,
+                sensor_enabled
+            ),
+        );
         Ok(())
     }
 
@@ -598,6 +719,7 @@ impl LooperRuntime {
         self.observability.bump_phase(LoopPhase::SurpriseDetection);
 
         let sensed = self.collect_new_percepts();
+        self.log_state("run_iteration.sensed", format!("count={}", sensed.len()));
         let prior_windows = self.latest_history_windows()?;
         let local_model = self
             .local_model
@@ -634,6 +756,11 @@ impl LooperRuntime {
                 surprising.push(percept);
             }
         }
+
+        self.log_state(
+            "run_iteration.surprises",
+            format!("surprising_count={}", surprising.len()),
+        );
 
         if surprising.is_empty() {
             self.loop_visualization.local_current_step = LocalLoopStep::NoSurprise;
@@ -688,6 +815,7 @@ impl LooperRuntime {
 
         if planned_actions.is_empty() {
             self.observability.false_positive_surprises += 1;
+            self.log_state("run_iteration.plan", "planned_actions=0");
             self.transition_phase(LoopRuntimePhase::Idle);
             let mut report = IterationReport {
                 iteration_id: None,
@@ -705,15 +833,41 @@ impl LooperRuntime {
         self.observability.bump_phase(LoopPhase::PerformActions);
         self.loop_visualization.action_required = true;
         self.loop_visualization.frontier_current_step = Some(FrontierLoopStep::PerformingActions);
+        self.log_state(
+            "run_iteration.plan",
+            format!("planned_actions={}", planned_actions.len()),
+        );
         self.transition_phase(LoopRuntimePhase::ExecuteActions);
         let mut action_results = Vec::with_capacity(planned_actions.len());
         for recommendation in &planned_actions {
-            let result = self.execute_recommendation(recommendation, false)?;
+            let result = match self.execute_recommendation(recommendation, false) {
+                Ok(result) => result,
+                Err(error) => {
+                    self.log_state(
+                        "run_iteration.execute_error",
+                        format!(
+                            "actuator='{}', action='{}', error={} ",
+                            recommendation.actuator_name,
+                            recommendation.action.keyword(),
+                            error
+                        ),
+                    );
+                    ExecutionResult::Denied(format!(
+                        "execution failed for actuator '{}': {}",
+                        recommendation.actuator_name, error
+                    ))
+                }
+            };
             if matches!(result, ExecutionResult::Denied(_)) {
                 self.observability.failed_tool_executions += 1;
             }
             action_results.push(result);
         }
+
+        self.log_state(
+            "run_iteration.execute_results",
+            format!("count={}", action_results.len()),
+        );
 
         let mut report = IterationReport {
             iteration_id: None,
@@ -732,6 +886,7 @@ impl LooperRuntime {
     fn transition_phase(&mut self, phase: LoopRuntimePhase) {
         self.loop_visualization.current_phase = phase;
         self.loop_visualization.current_phase_started_at_unix_ms = now_unix_ms();
+        self.log_state("phase", format!("{:?}", phase));
 
         let sequence = self.next_phase_event_sequence;
         self.next_phase_event_sequence = self.next_phase_event_sequence.saturating_add(1);
@@ -763,15 +918,26 @@ impl LooperRuntime {
         recommendation: &RecommendedAction,
         bypass_hitl: bool,
     ) -> Result<ExecutionResult> {
+        let requested_name = recommendation.actuator_name.as_str();
         let actuator = self
             .actuators
-            .get(&recommendation.actuator_name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "actuator '{}' is not configured",
-                    recommendation.actuator_name
-                )
-            })?;
+            .get(requested_name)
+            .or_else(|| {
+                self.actuators.iter().find_map(|(name, actuator)| {
+                    if name.eq_ignore_ascii_case(requested_name) {
+                        Some(actuator)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .or_else(|| {
+                let required_kind = recommendation.action.internal_kind();
+                self.actuators.values().find(|candidate| {
+                    matches!(candidate.kind, ActuatorType::Internal(kind) if kind == required_kind)
+                })
+            })
+            .ok_or_else(|| anyhow!("actuator '{}' is not configured", requested_name))?;
 
         if actuator.policy.require_hitl && !bypass_hitl {
             let approval_id = self.next_approval_id;
@@ -932,6 +1098,7 @@ impl LooperRuntime {
     fn load_persisted_api_keys(&mut self) -> Result<()> {
         let path = self.api_key_store_path();
         if !path.exists() {
+            self.log_state("load_persisted_api_keys", "no keys file found");
             return Ok(());
         }
 
@@ -948,12 +1115,17 @@ impl LooperRuntime {
                 }
             })
             .collect();
+        self.log_state(
+            "load_persisted_api_keys",
+            format!("loaded_keys={}", self.provider_api_keys.len()),
+        );
         Ok(())
     }
 
     fn load_persisted_settings(&mut self) -> Result<()> {
         let path = self.settings_store_path();
         if !path.exists() {
+            self.log_state("load_persisted_settings", "no settings file found");
             return Ok(());
         }
 
@@ -973,6 +1145,12 @@ impl LooperRuntime {
             self.frontier_selection = None;
             self.local_model = None;
             self.frontier_model = None;
+            self.log_state(
+                "load_persisted_settings",
+                "failed to apply persisted settings",
+            );
+        } else {
+            self.log_state("load_persisted_settings", "persisted settings applied");
         }
 
         Ok(())
@@ -984,6 +1162,21 @@ impl LooperRuntime {
 
     fn settings_store_path(&self) -> PathBuf {
         self.workspace_root.join("agent-settings.json")
+    }
+
+    fn state_log_path(&self) -> PathBuf {
+        self.workspace_root.join("agent-states.log")
+    }
+
+    fn log_state(&self, event: &str, detail: impl AsRef<str>) {
+        let path = self.state_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{}\t{}\t{}", now_unix_ms(), event, detail.as_ref());
+        }
     }
 }
 
@@ -1066,6 +1259,8 @@ fn is_frontier_communication_issue(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::model::Action;
+
     use super::*;
 
     #[tokio::test]
@@ -1188,5 +1383,25 @@ mod tests {
         assert!(snapshot.action_required);
         assert_eq!(snapshot.local_loop_count, 1);
         assert_eq!(snapshot.frontier_loop_count, 1);
+    }
+
+    #[tokio::test]
+    async fn chat_response_actuator_name_alias_executes_chat_actuator() {
+        let mut runtime = LooperRuntime::with_internal_defaults().expect("defaults should build");
+        runtime.disable_store();
+
+        let result = runtime
+            .execute_recommendation(
+                &RecommendedAction {
+                    actuator_name: "ChatResponse".to_string(),
+                    action: Action::ChatResponse {
+                        message: "Hello".to_string(),
+                    },
+                },
+                false,
+            )
+            .expect("chat alias should execute");
+
+        assert!(matches!(result, ExecutionResult::Executed { .. }));
     }
 }
