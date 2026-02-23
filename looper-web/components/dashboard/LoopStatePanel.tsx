@@ -35,19 +35,6 @@ function frontierStepIndex(
   return null;
 }
 
-function phaseLabel(
-  phase: DashboardPayload["loop_visualization"]["current_phase"] | undefined,
-): string {
-  if (!phase) {
-    return "Unknown";
-  }
-
-  return phase
-    .split("_")
-    .map((chunk) => chunk.charAt(0).toUpperCase() + chunk.slice(1))
-    .join(" ");
-}
-
 type LoopStatePanelProps = {
   loopState: DashboardPayload["loop_visualization"] | undefined;
   localModelLabel: string;
@@ -84,9 +71,8 @@ export function LoopStatePanel({
   return (
     <section className="space-y-4 rounded-2xl border border-zinc-300 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-950 lg:col-span-6">
       <h2 className="text-lg font-semibold">Looper State</h2>
-      <p className="text-sm text-zinc-600 dark:text-zinc-300">Current phase: {phaseLabel(loopState?.current_phase)}</p>
 
-      <div className="relative rounded-2xl border border-zinc-300 bg-zinc-50 p-4 dark:border-zinc-700 dark:bg-zinc-900">
+      <div className="relative rounded-2xl py-4">
         <div className="flex flex-row justify-between gap-4 xl:items-center">
           <LoopRing
             title="Local Model Loop"
@@ -122,7 +108,7 @@ export function LoopStatePanel({
               className={`h-[14px] rounded-full transition-colors duration-200 ${
                 surpriseFoundState ? "bg-zinc-900 dark:bg-zinc-100" : "bg-zinc-300 dark:bg-zinc-700"
               }`}
-              style={{ width: "calc(100% - 512px)" }}
+              style={{ width: "calc(100% - 462px)" }}
             />
           </div>
 
@@ -140,7 +126,7 @@ export function LoopStatePanel({
               className={`h-[14px] rounded-full transition-colors duration-200 ${
                 actionsCompletedState ? "bg-zinc-900 dark:bg-zinc-100" : "bg-zinc-300 dark:bg-zinc-700"
               }`}
-              style={{ width: "calc(100% - 512px)" }}
+              style={{ width: "calc(100% - 462px)" }}
             />
           </div>
         </div>
