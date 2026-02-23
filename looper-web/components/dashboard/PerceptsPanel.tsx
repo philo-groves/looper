@@ -9,6 +9,7 @@ export type PerceptListItem = {
 
 type PerceptsPanelProps = {
   items: PerceptListItem[];
+  onClear: () => void;
 };
 
 function statusClass(status: PerceptStatus) {
@@ -21,10 +22,19 @@ function statusClass(status: PerceptStatus) {
   return "border-amber-700 bg-amber-600 text-white";
 }
 
-export function PerceptsPanel({ items }: PerceptsPanelProps) {
+export function PerceptsPanel({ items, onClear }: PerceptsPanelProps) {
   return (
     <article className="rounded-2xl border border-zinc-300 bg-white p-4 shadow-sm dark:border-zinc-700 dark:bg-zinc-950 lg:col-span-3">
-      <h2 className="text-lg font-semibold">Percepts</h2>
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-lg font-semibold">Percepts</h2>
+        <button
+          type="button"
+          onClick={onClear}
+          className="rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 text-xs font-medium dark:border-zinc-700 dark:bg-zinc-900"
+        >
+          Clear
+        </button>
+      </div>
       <div className="mt-4 space-y-3">
         {items.length === 0 ? (
           <p className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">

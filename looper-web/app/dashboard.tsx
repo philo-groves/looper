@@ -64,6 +64,8 @@ export function Dashboard() {
   const [percepts, setPercepts] = useState<PerceptListItem[]>([]);
   const [actions, setActions] = useState<ActionListItem[]>([]);
   const [lastIterationId, setLastIterationId] = useState<number | null>(null);
+  const [perceptsCleared, setPerceptsCleared] = useState(false);
+  const [actionsCleared, setActionsCleared] = useState(false);
 
   const { data, socketConnected, socketError, wsCommand } = useDashboardSocket();
 
@@ -140,8 +142,12 @@ export function Dashboard() {
           }
         }
 
-        setPercepts((existing) => [...nextPercepts.reverse(), ...existing].slice(0, 60));
-        setActions((existing) => [...nextActions.reverse(), ...existing].slice(0, 60));
+        if (!perceptsCleared) {
+          setPercepts((existing) => [...nextPercepts.reverse(), ...existing].slice(0, 60));
+        }
+        if (!actionsCleared) {
+          setActions((existing) => [...nextActions.reverse(), ...existing].slice(0, 60));
+        }
         setLastIterationId(response.iterations[response.iterations.length - 1].id);
       } catch {
         setLastIterationId(latestId);
@@ -152,7 +158,7 @@ export function Dashboard() {
     return () => {
       cancelled = true;
     };
-  }, [snapshot, setupRequired, lastIterationId, wsCommand]);
+  }, [snapshot, setupRequired, lastIterationId, wsCommand, perceptsCleared, actionsCleared]);
 
   const {
     setupStep,
@@ -172,6 +178,9 @@ export function Dashboard() {
   });
 
   const pendingPercepts = useMemo(() => {
+    if (perceptsCleared) {
+      return [] as PerceptListItem[];
+    }
     if (!snapshot) {
       return [] as PerceptListItem[];
     }
@@ -188,9 +197,12 @@ export function Dashboard() {
       }
     }
     return items;
-  }, [snapshot]);
+  }, [snapshot, perceptsCleared]);
 
   const pendingActions = useMemo(() => {
+    if (actionsCleared) {
+      return [] as ActionListItem[];
+    }
     if (!snapshot || snapshot.pending_approval_count <= 0) {
       return [] as ActionListItem[];
     }
@@ -205,7 +217,7 @@ export function Dashboard() {
       });
     }
     return items;
-  }, [snapshot]);
+  }, [snapshot, actionsCleared]);
 
   if (!snapshot) {
     return (
@@ -243,7 +255,13 @@ export function Dashboard() {
 
   return (
     <section className="grid gap-5 lg:grid-cols-12">
-      <PerceptsPanel items={[...pendingPercepts, ...percepts].slice(0, 60)} />
+      <PerceptsPanel
+        items={[...pendingPercepts, ...percepts].slice(0, 60)}
+        onClear={() => {
+          setPercepts([]);
+          setPerceptsCleared(true);
+        }}
+      />
 
       <LoopStatePanel
         loopState={snapshot?.loop_visualization}
@@ -253,7 +271,13 @@ export function Dashboard() {
         socketError={socketError}
       />
 
-      <ActionsPanel items={[...pendingActions, ...actions].slice(0, 60)} />
+      <ActionsPanel
+        items={[...pendingActions, ...actions].slice(0, 60)}
+        onClear={() => {
+          setActions([]);
+          setActionsCleared(true);
+        }}
+      />
     </section>
   );
 }
