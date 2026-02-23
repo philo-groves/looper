@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 
 import { ActuatorsPanel } from "@/components/dashboard/ActuatorsPanel";
 import { LoopStatePanel } from "@/components/dashboard/LoopStatePanel";
@@ -13,8 +13,6 @@ import {
 } from "@/components/dashboard/types";
 import { useDashboardSocket } from "@/components/dashboard/useDashboardSocket";
 import { useSetupFlow } from "@/components/dashboard/useSetupFlow";
-import { HeaderBar } from "@/components/window/HeaderBar";
-import { SideNav } from "@/components/window/SideNav";
 
 function defaultPercepts(name: string): string[] {
   return [`${name}: incoming percept`, `${name}: incoming percept`, `${name}: incoming percept`];
@@ -62,17 +60,9 @@ function mergeActuators(
   return mapped.length > 0 ? mapped : existing;
 }
 
-function statusPill(connected: boolean) {
-  return connected
-    ? "border border-green-700 bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100"
-    : "border border-red-700 bg-red-600 text-white";
-}
-
 export function Dashboard() {
-  const [theme, setTheme] = useState<"light" | "dark">("light");
   const [sensors, setSensors] = useState<EditableSensor[]>([]);
   const [actuators, setActuators] = useState<EditableActuator[]>([]);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
 
   const handleSnapshot = useCallback((snapshot: DashboardPayload) => {
     setSensors((existing) => mergeSensors(existing, snapshot.sensors));
@@ -80,11 +70,6 @@ export function Dashboard() {
   }, []);
 
   const { data, socketConnected, socketError, wsCommand } = useDashboardSocket(handleSnapshot);
-
-  useEffect(() => {
-    document.documentElement.classList.toggle("dark", theme === "dark");
-    window.localStorage.setItem("looper-theme", theme);
-  }, [theme]);
 
   const snapshot = data;
   const setupRequired = snapshot ? snapshot.state.state === "setup" || !snapshot.state.configured : true;
@@ -109,8 +94,6 @@ export function Dashboard() {
   if (setupRequired) {
     return (
       <SetupWizard
-        theme={theme}
-        onToggleTheme={() => setTheme((current) => (current === "light" ? "dark" : "light"))}
         activeSetupSteps={activeSetupSteps}
         setupStep={setupStep}
         setupError={setupError}
@@ -130,61 +113,46 @@ export function Dashboard() {
   const frontierModelLabel = `${snapshot?.frontier_model.provider ?? "Frontier"} / ${snapshot?.frontier_model.model ?? "Unassigned"}`;
 
   return (
-    <main className="min-h-screen w-full bg-zinc-100 text-zinc-900 dark:bg-black dark:text-zinc-100">
-      <div className="flex min-h-screen w-full">
-        <SideNav isOpen={isSidebarOpen} onToggle={() => setIsSidebarOpen((current) => !current)} />
+    <section className="grid gap-5 lg:grid-cols-12">
+      <SensorsPanel
+        sensors={sensors}
+        onAddSensor={() => {
+          const next = sensors.length + 1;
+          setSensors((current) => [
+            ...current,
+            {
+              id: `sensor-${Date.now()}`,
+              name: `New Sensor ${next}`,
+              policy: "Sensitivity: 50%",
+              recentPercepts: ["New percept", "New percept", "New percept"],
+            },
+          ]);
+        }}
+      />
 
-        <div className="flex min-w-0 flex-1 flex-col gap-5">
-          <HeaderBar
-            socketConnected={socketConnected}
-            theme={theme}
-            onToggleTheme={() => setTheme((current) => (current === "light" ? "dark" : "light"))}
-            statusPillClassName={statusPill(socketConnected)}
-          />
+      <LoopStatePanel
+        loopState={snapshot?.loop_visualization}
+        localModelLabel={localModelLabel}
+        frontierModelLabel={frontierModelLabel}
+        socketConnected={socketConnected}
+        socketError={socketError}
+      />
 
-          <section className="grid gap-5 px-4 pb-4 sm:px-6 sm:pb-6 lg:grid-cols-12">
-            <SensorsPanel
-              sensors={sensors}
-              onAddSensor={() => {
-                const next = sensors.length + 1;
-                setSensors((current) => [
-                  ...current,
-                  {
-                    id: `sensor-${Date.now()}`,
-                    name: `New Sensor ${next}`,
-                    policy: "Sensitivity: 50%",
-                    recentPercepts: ["New percept", "New percept", "New percept"],
-                  },
-                ]);
-              }}
-            />
-
-            <LoopStatePanel
-              loopState={snapshot?.loop_visualization}
-              localModelLabel={localModelLabel}
-              frontierModelLabel={frontierModelLabel}
-              socketConnected={socketConnected}
-              socketError={socketError}
-            />
-
-            <ActuatorsPanel
-              actuators={actuators}
-              onAddActuator={() => {
-                const next = actuators.length + 1;
-                setActuators((current) => [
-                  ...current,
-                  {
-                    id: `actuator-${Date.now()}`,
-                    name: `New Actuator ${next}`,
-                    policy: "Rate limit: none",
-                    recentActions: ["New action", "New action", "New action"],
-                  },
-                ]);
-              }}
-            />
-          </section>
-        </div>
-      </div>
-    </main>
+      <ActuatorsPanel
+        actuators={actuators}
+        onAddActuator={() => {
+          const next = actuators.length + 1;
+          setActuators((current) => [
+            ...current,
+            {
+              id: `actuator-${Date.now()}`,
+              name: `New Actuator ${next}`,
+              policy: "Rate limit: none",
+              recentActions: ["New action", "New action", "New action"],
+            },
+          ]);
+        }}
+      />
+    </section>
   );
 }

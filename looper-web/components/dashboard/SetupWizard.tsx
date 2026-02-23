@@ -3,8 +3,6 @@ import { ReactNode } from "react";
 import { SETUP_STEPS, SetupStepId } from "@/components/dashboard/types";
 
 type SetupWizardProps = {
-  theme: "light" | "dark";
-  onToggleTheme: () => void;
   activeSetupSteps: SetupStepId[];
   setupStep: SetupStepId;
   setupError: string | null;
@@ -19,8 +17,6 @@ type SetupWizardProps = {
 };
 
 export function SetupWizard({
-  theme,
-  onToggleTheme,
   activeSetupSteps,
   setupStep,
   setupError,
@@ -34,18 +30,10 @@ export function SetupWizard({
   setupContent,
 }: SetupWizardProps) {
   return (
-    <main className="min-h-screen w-full bg-zinc-100 px-4 py-6 text-zinc-900 dark:bg-black dark:text-zinc-100 sm:px-6">
-      <section className="mx-auto w-full max-w-4xl rounded-2xl border border-zinc-300 bg-white p-5 shadow-sm dark:border-zinc-700 dark:bg-zinc-950">
-        <div className="flex items-center justify-between gap-3">
-          <h1 className="text-2xl font-semibold">Looper Setup</h1>
-          <button
-            type="button"
-            onClick={onToggleTheme}
-            className="rounded-lg border border-zinc-300 bg-zinc-100 px-3 py-2 text-sm font-medium dark:border-zinc-700 dark:bg-zinc-900"
-          >
-            {theme === "light" ? "Switch to Dark" : "Switch to Light"}
-          </button>
-        </div>
+    <section className="mx-auto w-full max-w-4xl rounded-2xl border border-zinc-300 bg-white p-5 shadow-sm dark:border-zinc-700 dark:bg-zinc-950">
+      <div className="flex items-center justify-between gap-3">
+        <h1 className="text-2xl font-semibold">Looper Setup</h1>
+      </div>
 
         <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
           Setup mode matches terminal setup steps. Workspace features unlock after setup completes.
@@ -121,7 +109,6 @@ export function SetupWizard({
             </div>
           </div>
         </div>
-      </section>
-    </main>
+    </section>
   );
 }

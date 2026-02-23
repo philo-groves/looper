@@ -1,5 +1,8 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+
+import { WorkspaceShell } from "@/components/window/WorkspaceShell";
+
 import "./globals.css";
 
 const geistSans = Geist({
@@ -27,7 +30,7 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} bg-white text-black antialiased dark:bg-black dark:text-white`}
       >
-        {children}
+        <WorkspaceShell>{children}</WorkspaceShell>
       </body>
     </html>
   );
