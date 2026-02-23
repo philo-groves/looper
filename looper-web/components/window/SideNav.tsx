@@ -142,6 +142,27 @@ export function SideNav({ isOpen, onToggle }: SideNavProps) {
               </ul>
             </li>
             <li className="w-full">
+              <p className="rounded-md px-2 py-1 font-medium">Plugins</p>
+              <ul className="mt-1 space-y-1 pl-4 text-zinc-600 dark:text-zinc-300">
+                <li className="w-full">
+                  <Link href="/actuators/plugins/add" className={linkClass("/actuators/plugins/add")}>
+                    {isActive("/actuators/plugins/add") ? (
+                      <span className="absolute inset-y-0 left-0 w-1 rounded-l-md bg-zinc-500 dark:bg-zinc-400" />
+                    ) : null}
+                    Add a Plugin
+                  </Link>
+                </li>
+                <li className="w-full">
+                  <Link href="/actuators/plugins/all" className={linkClass("/actuators/plugins/all")}>
+                    {isActive("/actuators/plugins/all") ? (
+                      <span className="absolute inset-y-0 left-0 w-1 rounded-l-md bg-zinc-500 dark:bg-zinc-400" />
+                    ) : null}
+                    All Plugins
+                  </Link>
+                </li>
+              </ul>
+            </li>
+            <li className="w-full">
               <p className="rounded-md px-2 py-1 font-medium">Agent Settings</p>
               <ul className="mt-1 space-y-1 pl-4 text-zinc-600 dark:text-zinc-300">
                 <li className="w-full">
@@ -190,6 +211,9 @@ export function SideNav({ isOpen, onToggle }: SideNavProps) {
             </li>
             <li className="w-full">
               <Link href="/actuators/all" className="block rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-900">A</Link>
+            </li>
+            <li className="w-full">
+              <Link href="/actuators/plugins/all" className="block rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-900">P</Link>
             </li>
             <li className="w-full">
               <Link href="/agent-settings/identity" className="block rounded-md border border-zinc-300 bg-zinc-100 px-2 py-1 dark:border-zinc-700 dark:bg-zinc-900">G</Link>

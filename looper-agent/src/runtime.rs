@@ -400,7 +400,7 @@ impl LooperRuntime {
 
         let mut chat_actuator = Actuator::internal(
             "chat",
-            "Responder of chat messages in action form",
+            "Used for responding to chat requests.",
             InternalActuatorKind::Chat,
             SafetyPolicy::default(),
         )?;

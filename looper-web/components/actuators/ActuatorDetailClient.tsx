@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ActuatorFormFields } from "@/components/actuators/ActuatorFormFields";
 import { useDashboardSocket } from "@/components/dashboard/useDashboardSocket";
@@ -26,9 +26,11 @@ export function ActuatorDetailClient({ actuatorName }: ActuatorDetailClientProps
   const [rateLimitEnabled, setRateLimitEnabled] = useState(false);
   const [rateLimitMax, setRateLimitMax] = useState(1);
   const [rateLimitPer, setRateLimitPer] = useState<RateLimitPeriod>("hour");
+  const [hasLocalEdits, setHasLocalEdits] = useState(false);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const hydratedActuatorName = useRef<string | null>(null);
 
   const actuator = useMemo(() => {
     if (!actuatorName || !data) {
@@ -47,6 +49,13 @@ export function ActuatorDetailClient({ actuatorName }: ActuatorDetailClientProps
     if (!actuator) {
       return;
     }
+
+    const normalizedActuatorName = actuator.name.toLowerCase();
+    const switchedActuator = hydratedActuatorName.current !== normalizedActuatorName;
+    if (!switchedActuator && hasLocalEdits) {
+      return;
+    }
+
     setDescription(actuator.description);
     setRequireHitl(actuator.require_hitl);
     setSandboxed(actuator.sandboxed);
@@ -55,7 +64,13 @@ export function ActuatorDetailClient({ actuatorName }: ActuatorDetailClientProps
     setRateLimitEnabled(actuator.rate_limit !== null);
     setRateLimitMax(Math.max(1, actuator.rate_limit?.max ?? 1));
     setRateLimitPer((actuator.rate_limit?.per as RateLimitPeriod) ?? "hour");
-  }, [actuator]);
+    hydratedActuatorName.current = normalizedActuatorName;
+    if (switchedActuator) {
+      setHasLocalEdits(false);
+      setStatus(null);
+      setError(null);
+    }
+  }, [actuator, hasLocalEdits]);
 
   async function save() {
     if (!actuator) {
@@ -98,6 +113,7 @@ export function ActuatorDetailClient({ actuatorName }: ActuatorDetailClientProps
         action_plural_name: pluralName,
       });
       setPlural(pluralName);
+      setHasLocalEdits(false);
       setStatus("Actuator settings updated.");
     } catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : "Failed to save actuator.";
@@ -148,21 +164,45 @@ export function ActuatorDetailClient({ actuatorName }: ActuatorDetailClientProps
 
             <ActuatorFormFields
               description={description}
-              onDescriptionChange={setDescription}
+              onDescriptionChange={(nextValue) => {
+                setHasLocalEdits(true);
+                setDescription(nextValue);
+              }}
               requireHitl={requireHitl}
-              onRequireHitlChange={setRequireHitl}
+              onRequireHitlChange={(nextValue) => {
+                setHasLocalEdits(true);
+                setRequireHitl(nextValue);
+              }}
               sandboxed={sandboxed}
-              onSandboxedChange={setSandboxed}
+              onSandboxedChange={(nextValue) => {
+                setHasLocalEdits(true);
+                setSandboxed(nextValue);
+              }}
               rateLimitEnabled={rateLimitEnabled}
-              onRateLimitEnabledChange={setRateLimitEnabled}
+              onRateLimitEnabledChange={(nextValue) => {
+                setHasLocalEdits(true);
+                setRateLimitEnabled(nextValue);
+              }}
               rateLimitMax={rateLimitMax}
-              onRateLimitMaxChange={setRateLimitMax}
+              onRateLimitMaxChange={(nextValue) => {
+                setHasLocalEdits(true);
+                setRateLimitMax(nextValue);
+              }}
               rateLimitPer={rateLimitPer}
-              onRateLimitPerChange={setRateLimitPer}
+              onRateLimitPerChange={(nextValue) => {
+                setHasLocalEdits(true);
+                setRateLimitPer(nextValue);
+              }}
               singular={singular}
-              onSingularChange={setSingular}
+              onSingularChange={(nextValue) => {
+                setHasLocalEdits(true);
+                setSingular(nextValue);
+              }}
               plural={plural}
-              onPluralChange={setPlural}
+              onPluralChange={(nextValue) => {
+                setHasLocalEdits(true);
+                setPlural(nextValue);
+              }}
             />
 
             <div className="flex items-center gap-2">

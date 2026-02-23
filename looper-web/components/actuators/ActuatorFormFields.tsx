@@ -40,7 +40,7 @@ export function ActuatorFormFields({
   return (
     <>
       <div className="space-y-2">
-        <label className="text-sm font-medium">About this Actuator</label>
+        <label className="text-sm font-medium">About the Actions</label>
         <textarea
           value={description}
           onChange={(event) => onDescriptionChange(event.target.value)}
