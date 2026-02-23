@@ -1,5 +1,5 @@
-import { BlankWorkspacePage } from "@/components/window/BlankWorkspacePage";
+import { ActionHistoryClient } from "@/components/actuators/ActionHistoryClient";
 
 export default function ActionHistoryPage() {
-  return <BlankWorkspacePage title="Action History" />;
+  return <ActionHistoryClient />;
 }

@@ -1,5 +1,5 @@
-import { BlankWorkspacePage } from "@/components/window/BlankWorkspacePage";
+import { PerceptHistoryClient } from "@/components/sensors/PerceptHistoryClient";
 
 export default function PerceptHistoryPage() {
-  return <BlankWorkspacePage title="Percept History" />;
+  return <PerceptHistoryClient />;
 }

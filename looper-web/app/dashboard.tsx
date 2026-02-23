@@ -8,6 +8,7 @@ import { PerceptsPanel, PerceptListItem } from "@/components/dashboard/PerceptsP
 import { SetupWizard } from "@/components/dashboard/SetupWizard";
 import { useDashboardSocket } from "@/components/dashboard/useDashboardSocket";
 import { useSetupFlow } from "@/components/dashboard/useSetupFlow";
+import { ReadOnlyDetailsModal } from "@/components/window/ReadOnlyDetailsModal";
 
 type PersistedPercept = {
   sensor_name: string;
@@ -60,12 +61,52 @@ function actionStatus(result: PersistedActionResult | undefined): ActionListItem
   return "Pending";
 }
 
+function actionResultDetails(result: PersistedActionResult | undefined) {
+  if (!result) {
+    return {
+      resultKind: "Pending" as const,
+      resultContent: null,
+    };
+  }
+  if ("Executed" in result) {
+    return {
+      resultKind: "Executed" as const,
+      resultContent: result.Executed.output,
+    };
+  }
+  if ("Denied" in result) {
+    return {
+      resultKind: "Denied" as const,
+      resultContent: result.Denied,
+    };
+  }
+  return {
+    resultKind: "RequiresHitl" as const,
+    resultContent: `Approval ID: ${result.RequiresHitl.approval_id}`,
+  };
+}
+
 export function Dashboard() {
-  const [percepts, setPercepts] = useState<PerceptListItem[]>([]);
-  const [actions, setActions] = useState<ActionListItem[]>([]);
+  type DashboardPerceptItem = PerceptListItem & {
+    sensorName: string | null;
+    content: string | null;
+    iterationId: number | null;
+  };
+
+  type DashboardActionItem = ActionListItem & {
+    actuatorName: string;
+    iterationId: number | null;
+    resultKind: "Executed" | "Denied" | "RequiresHitl" | "Pending";
+    resultContent: string | null;
+  };
+
+  const [percepts, setPercepts] = useState<DashboardPerceptItem[]>([]);
+  const [actions, setActions] = useState<DashboardActionItem[]>([]);
   const [lastIterationId, setLastIterationId] = useState<number | null>(null);
   const [perceptsCleared, setPerceptsCleared] = useState(false);
   const [actionsCleared, setActionsCleared] = useState(false);
+  const [selectedPercept, setSelectedPercept] = useState<DashboardPerceptItem | null>(null);
+  const [selectedAction, setSelectedAction] = useState<DashboardActionItem | null>(null);
 
   const { data, socketConnected, socketError, wsCommand } = useDashboardSocket();
 
@@ -107,8 +148,8 @@ export function Dashboard() {
           currentSnapshot.actuators.map((actuator) => [actuator.name, actuator.action_singular_name]),
         );
 
-        const nextPercepts: PerceptListItem[] = [];
-        const nextActions: ActionListItem[] = [];
+        const nextPercepts: DashboardPerceptItem[] = [];
+        const nextActions: DashboardActionItem[] = [];
 
         for (const iteration of response.iterations) {
           const surprisingPool = [...iteration.surprising_percepts];
@@ -127,17 +168,25 @@ export function Dashboard() {
               title: titleCase(sensorNames.get(percept.sensor_name) ?? "percept"),
               timestamp: timestampText(iteration.created_at_unix),
               status: isSurprise ? "Surprise" : "No Surprise",
+              sensorName: percept.sensor_name,
+              content: percept.content,
+              iterationId: iteration.id,
             });
           }
 
           for (let index = 0; index < iteration.planned_actions.length; index += 1) {
             const action = iteration.planned_actions[index];
             const result = iteration.action_results[index];
+            const details = actionResultDetails(result);
             nextActions.push({
               id: `action-${iteration.id}-${index}`,
               title: titleCase(actuatorNames.get(action.actuator_name) ?? "action"),
               timestamp: timestampText(iteration.created_at_unix),
               status: actionStatus(result),
+              actuatorName: action.actuator_name,
+              iterationId: iteration.id,
+              resultKind: details.resultKind,
+              resultContent: details.resultContent,
             });
           }
         }
@@ -179,12 +228,12 @@ export function Dashboard() {
 
   const pendingPercepts = useMemo(() => {
     if (perceptsCleared) {
-      return [] as PerceptListItem[];
+      return [] as DashboardPerceptItem[];
     }
     if (!snapshot) {
-      return [] as PerceptListItem[];
+      return [] as DashboardPerceptItem[];
     }
-    const items: PerceptListItem[] = [];
+    const items: DashboardPerceptItem[] = [];
     for (const sensor of snapshot.sensors) {
       const count = Math.min(sensor.unread_percepts, 6);
       for (let index = 0; index < count; index += 1) {
@@ -193,6 +242,9 @@ export function Dashboard() {
           title: titleCase(sensor.percept_singular_name),
           timestamp: "Waiting to be processed",
           status: "Pending",
+          sensorName: sensor.name,
+          content: null,
+          iterationId: null,
         });
       }
     }
@@ -201,19 +253,23 @@ export function Dashboard() {
 
   const pendingActions = useMemo(() => {
     if (actionsCleared) {
-      return [] as ActionListItem[];
+      return [] as DashboardActionItem[];
     }
     if (!snapshot || snapshot.pending_approval_count <= 0) {
-      return [] as ActionListItem[];
+      return [] as DashboardActionItem[];
     }
     const fallback = titleCase(snapshot.actuators[0]?.action_singular_name ?? "action");
-    const items: ActionListItem[] = [];
+    const items: DashboardActionItem[] = [];
     for (let index = 0; index < Math.min(snapshot.pending_approval_count, 6); index += 1) {
       items.push({
         id: `pending-action-${index}`,
         title: fallback,
         timestamp: "Awaiting approval",
         status: snapshot.loop_visualization.current_phase === "execute_actions" ? "Running" : "Pending",
+        actuatorName: "",
+        iterationId: null,
+        resultKind: "Pending",
+        resultContent: null,
       });
     }
     return items;
@@ -257,9 +313,11 @@ export function Dashboard() {
     <section className="grid gap-5 lg:grid-cols-12">
       <PerceptsPanel
         items={[...pendingPercepts, ...percepts].slice(0, 60)}
+        onItemClick={(item) => setSelectedPercept(item)}
         onClear={() => {
           setPercepts([]);
           setPerceptsCleared(true);
+          setSelectedPercept(null);
         }}
       />
 
@@ -273,10 +331,52 @@ export function Dashboard() {
 
       <ActionsPanel
         items={[...pendingActions, ...actions].slice(0, 60)}
+        onItemClick={(item) => setSelectedAction(item)}
         onClear={() => {
           setActions([]);
           setActionsCleared(true);
+          setSelectedAction(null);
         }}
+      />
+
+      <ReadOnlyDetailsModal
+        open={selectedPercept !== null}
+        title={selectedPercept?.title ?? "Percept"}
+        dialogTitleId="dashboard-percept-details-title"
+        onClose={() => setSelectedPercept(null)}
+        fields={
+          selectedPercept
+            ? [
+                { label: "Sensor", value: selectedPercept.sensorName ?? "-" },
+                { label: "Status", value: selectedPercept.status },
+                { label: "Observed", value: selectedPercept.timestamp },
+                { label: "Iteration", value: selectedPercept.iterationId ?? "Pending" },
+              ]
+            : []
+        }
+        contentLabel="Percept Content"
+        content={selectedPercept?.content ?? null}
+        emptyContentText="This percept is still pending processing, so detailed content is not available yet."
+      />
+
+      <ReadOnlyDetailsModal
+        open={selectedAction !== null}
+        title={selectedAction?.title ?? "Action"}
+        dialogTitleId="dashboard-action-details-title"
+        onClose={() => setSelectedAction(null)}
+        fields={
+          selectedAction
+            ? [
+                { label: "Actuator", value: selectedAction.actuatorName || "-" },
+                { label: "Status", value: selectedAction.status },
+                { label: "Observed", value: selectedAction.timestamp },
+                { label: "Iteration", value: selectedAction.iterationId ?? "Pending" },
+              ]
+            : []
+        }
+        contentLabel="Action Result"
+        content={selectedAction?.resultContent ?? null}
+        emptyContentText="This action is pending, so no result content is available yet."
       />
     </section>
   );
