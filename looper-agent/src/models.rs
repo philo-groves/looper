@@ -13,6 +13,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Action, ModelProviderKind, Percept, RecommendedAction};
 
+/// One skill markdown context block supplied to the frontier planner.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SkillContext {
+    /// Skill identifier (filename).
+    pub id: String,
+    /// Full skill markdown content.
+    pub markdown: String,
+}
+
 /// Input contract for local surprise-detection model.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalModelRequest {
@@ -20,6 +29,8 @@ pub struct LocalModelRequest {
     pub latest_percepts: Vec<Percept>,
     /// Up to 10 previous windows of percept text.
     pub previous_windows: Vec<Vec<String>>,
+    /// Full Soul markdown that defines agent identity.
+    pub soul_markdown: String,
 }
 
 /// Structured output from local model.
@@ -38,6 +49,10 @@ pub struct LocalModelResponse {
 pub struct FrontierModelRequest {
     /// Surprising percepts identified by local model.
     pub surprising_percepts: Vec<Percept>,
+    /// Full Soul markdown that defines agent identity.
+    pub soul_markdown: String,
+    /// Relevant enabled skills for this planning task.
+    pub relevant_skills: Vec<SkillContext>,
 }
 
 /// Structured output from frontier model.
@@ -225,9 +240,12 @@ impl LocalModel for FiddlesticksLocalModel {
     ) -> Pin<Box<dyn Future<Output = Result<LocalModelResponse>> + Send + '_>> {
         Box::pin(async move {
             let payload = serde_json::to_string(&request)?;
-            let instruction = "You are the local surprise detector in a sensory loop. Return only strict JSON with this shape: {\"surprising_indices\": number[], \"rationale\": string, \"token_usage\": number}. surprising_indices must reference indices from latest_percepts.";
+            let instruction = format!(
+                "You are the local surprise detector in a sensory loop. You must apply the full Soul markdown below when deciding what is surprising. Return only strict JSON with this shape: {{\"surprising_indices\": number[], \"rationale\": string, \"token_usage\": number}}. surprising_indices must reference indices from latest_percepts.\n\nSoul markdown:\n{}",
+                request.soul_markdown
+            );
             let response =
-                complete_json(&*self.provider, &self.model, instruction, &payload, 512).await?;
+                complete_json(&*self.provider, &self.model, &instruction, &payload, 512).await?;
             parse_local_contract(&response)
         })
     }
@@ -262,9 +280,18 @@ impl FrontierModel for FiddlesticksFrontierModel {
     ) -> Pin<Box<dyn Future<Output = Result<FrontierModelResponse>> + Send + '_>> {
         Box::pin(async move {
             let payload = serde_json::to_string(&request)?;
-            let instruction = "You are the frontier planner in a sensory loop. Return only strict JSON with this shape: {\"actions\": [{\"actuator_name\": string, \"action\": object}], \"token_usage\": number, \"rationale\"?: string}. action must match one of: ChatResponse, Grep, Glob, Shell, WebSearch enum representations. For ChatResponse actions, include only the user-visible reply text in action.message (or action.text). Keep responses concise.";
+            let instruction = format!(
+                "You are the frontier planner in a sensory loop. You must apply the full Soul markdown and provided relevant skills. Return only strict JSON with this shape: {{\"actions\": [{{\"actuator_name\": string, \"action\": object}}], \"token_usage\": number, \"rationale\"?: string}}. action must match one of: ChatResponse, Grep, Glob, Shell, WebSearch enum representations. For ChatResponse actions, include only the user-visible reply text in action.message (or action.text). Keep responses concise.\n\nSoul markdown:\n{}\n\nRelevant enabled skills:\n{}",
+                request.soul_markdown,
+                request
+                    .relevant_skills
+                    .iter()
+                    .map(|skill| format!("\n---\n# Skill: {}\n{}", skill.id, skill.markdown))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
             let response =
-                complete_json(&*self.provider, &self.model, instruction, &payload, 1024).await?;
+                complete_json(&*self.provider, &self.model, &instruction, &payload, 1024).await?;
             match parse_frontier_contract(&response) {
                 Ok(parsed) => Ok(parsed),
                 Err(_) => Ok(frontier_fallback_from_plain_text(&response)),

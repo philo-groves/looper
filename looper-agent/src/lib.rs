@@ -13,11 +13,12 @@ pub use executors::{
     ActuatorExecutor, ChatActuatorExecutor, GlobActuatorExecutor, GrepActuatorExecutor,
     ShellActuatorExecutor, WebSearchActuatorExecutor,
 };
-pub use http::{AppState, auto_start_loop_if_configured, build_router};
+pub use http::{AppState, auto_start_loop_if_configured, build_router, initialize_sensor_ingress};
 pub use model::{
     Action, Actuator, ActuatorType, AgentState, ExecutionResult, InternalActuatorKind,
     McpConnectionType, McpDetails, ModelProviderKind, ModelSelection, PendingApproval, Percept,
-    RateLimit, RateLimitPeriod, RecommendedAction, SafetyPolicy, Sensor, WorkflowDetails,
+    RateLimit, RateLimitPeriod, RecommendedAction, SafetyPolicy, Sensor, SensorIngressConfig,
+    SensorRestFormat, WorkflowDetails,
 };
 pub use models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,

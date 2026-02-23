@@ -1,5 +1,5 @@
-import { BlankWorkspacePage } from "@/components/window/BlankWorkspacePage";
+import { AgentIdentityPanel } from "@/components/agent-settings/AgentIdentityPanel";
 
 export default function AgentIdentityPage() {
-  return <BlankWorkspacePage title="Agent Identity" />;
+  return <AgentIdentityPanel />;
 }

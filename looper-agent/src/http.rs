@@ -1,26 +1,77 @@
+use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use fiddlesticks::{ProviderId, list_models_with_api_key};
+use notify::{
+    Config as NotifyConfig, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::select;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 use crate::dto::{ActuatorCreateRequest, SensorCreateRequest};
 use crate::model::{
     Actuator, ActuatorType, AgentState, ExecutionResult, ModelProviderKind, ModelSelection,
-    RateLimit,
+    RateLimit, SensorIngressConfig, SensorRestFormat,
 };
-use crate::runtime::{LoopVisualizationSnapshot, LooperRuntime, ObservabilitySnapshot};
+use crate::runtime::{
+    LoopVisualizationSnapshot, LooperRuntime, ObservabilitySnapshot, SensorUpdate,
+};
 use crate::storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration};
 
 const DEFAULT_AUTO_START_INTERVAL_MS: u64 = 500;
+
+const DEFAULT_SOUL_MARKDOWN: &str = r#"# Looper Soul
+
+## Identity
+Looper is a curious, practical, and upbeat general-purpose agent.
+Looper likes solving real problems end-to-end and keeping momentum high.
+
+## Personality
+- Friendly and direct
+- Creative when ideating, precise when executing
+- Calm under uncertainty
+- Enjoys pairing with humans and explaining tradeoffs
+
+## Working Style
+1. Understand intent, constraints, and definition of done.
+2. Propose a clear approach before deep changes.
+3. Execute in small, verifiable steps.
+4. Validate with tests, checks, and concrete evidence.
+5. Report outcomes, risks, and sensible next moves.
+
+## Communication
+- Keep responses concise by default.
+- Use plain language.
+- Surface assumptions and edge cases early.
+- Be honest about uncertainty.
+
+## Engineering Principles
+- Prefer readable, maintainable solutions over clever shortcuts.
+- Preserve existing conventions unless there is a strong reason to change.
+- Treat reliability and safety as first-class requirements.
+- Minimize blast radius for each change.
+
+## Collaboration Promises
+Looper will:
+- Ask only truly blocking questions.
+- Share progress frequently on larger work.
+- Make it easy to review by referencing specific files/commands.
+- Leave the codebase cleaner than it found it.
+
+## Mission
+Help people perform general tasks with confidence, speed, and a little delight."#;
 
 /// Shared HTTP state for Looper API handlers.
 #[derive(Clone)]
@@ -28,6 +79,7 @@ pub struct AppState {
     /// Shared runtime instance.
     pub runtime: Arc<Mutex<LooperRuntime>>,
     loop_control: Arc<Mutex<LoopControl>>,
+    directory_watchers: Arc<Mutex<HashMap<String, DirectoryWatcherHandle>>>,
 }
 
 impl AppState {
@@ -36,6 +88,7 @@ impl AppState {
         Self {
             runtime: Arc::new(Mutex::new(runtime)),
             loop_control: Arc::new(Mutex::new(LoopControl::default())),
+            directory_watchers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -44,6 +97,10 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/api/sensors", post(add_sensor_handler))
+        .route(
+            "/api/sensors/{sensor_name}/percepts",
+            post(add_sensor_percept_handler),
+        )
         .route("/api/actuators", post(add_actuator_handler))
         .route("/api/percepts/chat", post(add_chat_percept_handler))
         .route("/api/chats", get(list_chat_sessions_handler))
@@ -60,6 +117,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/loop/status", get(loop_status_handler))
         .route("/api/state", get(state_handler))
         .route("/api/dashboard", get(dashboard_handler))
+        .route("/api/agent/identity", get(agent_identity_handler))
+        .route("/api/agent/soul", post(save_soul_handler))
+        .route("/api/agent/skills", post(save_skill_handler))
+        .route(
+            "/api/agent/skills/from-url",
+            post(save_skill_from_url_handler),
+        )
+        .route("/api/agent/skills/delete", post(delete_skill_handler))
+        .route("/api/agent/skills/get", post(get_skill_handler))
         .route("/api/ws", get(websocket_handler))
         .route("/api/iterations", get(list_iterations_handler))
         .route("/api/iterations/{id}", get(get_iteration_handler))
@@ -90,7 +156,14 @@ pub async fn add_sensor_handler(
     let name = sensor.name.clone();
 
     let mut runtime = state.runtime.lock().await;
-    runtime.add_sensor(sensor);
+    runtime
+        .register_sensor(sensor)
+        .map_err(|error| bad_request(error.to_string()))?;
+    drop(runtime);
+
+    sync_directory_watchers(&state)
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
 
     Ok((
         StatusCode::CREATED,
@@ -137,6 +210,81 @@ pub async fn add_chat_percept_handler(
         StatusCode::ACCEPTED,
         Json(SimpleStatusResponse {
             status: format!("accepted:{chat_id}"),
+        }),
+    ))
+}
+
+/// Ingests one percept for a configured sensor endpoint.
+pub async fn add_sensor_percept_handler(
+    Path(sensor_name): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<(StatusCode, Json<SimpleStatusResponse>), (StatusCode, Json<ApiError>)> {
+    let content_type = headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let mut runtime = state.runtime.lock().await;
+    let sensor = runtime
+        .sensors()
+        .into_iter()
+        .find(|item| item.name == sensor_name)
+        .ok_or_else(|| bad_request(format!("sensor '{}' not found", sensor_name)))?;
+
+    let payload = match sensor.ingress {
+        SensorIngressConfig::Internal => {
+            return Err(bad_request(format!(
+                "sensor '{}' is managed internally",
+                sensor.name
+            )));
+        }
+        SensorIngressConfig::Directory { .. } => {
+            return Err(bad_request(format!(
+                "sensor '{}' receives percepts from directory watcher",
+                sensor.name
+            )));
+        }
+        SensorIngressConfig::RestApi {
+            format: SensorRestFormat::Text,
+        } => {
+            if !content_type.is_empty()
+                && !content_type.starts_with("text/plain")
+                && !content_type.starts_with("text/markdown")
+            {
+                return Err(bad_request(
+                    "expected text/plain or text/markdown content-type".to_string(),
+                ));
+            }
+            let text = String::from_utf8(body.to_vec())
+                .map_err(|_| bad_request("text payload must be valid UTF-8".to_string()))?;
+            text.trim().to_string()
+        }
+        SensorIngressConfig::RestApi {
+            format: SensorRestFormat::Json,
+        } => {
+            if !content_type.starts_with("application/json") {
+                return Err(bad_request(
+                    "expected application/json content-type".to_string(),
+                ));
+            }
+            let value: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|error| bad_request(format!("invalid json payload: {error}")))?;
+            serde_json::to_string(&value)
+                .map_err(|error| bad_request(format!("invalid json payload: {error}")))?
+        }
+    };
+
+    runtime
+        .enqueue_sensor_percept(&sensor_name, payload)
+        .map_err(|error| bad_request(error.to_string()))?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SimpleStatusResponse {
+            status: "accepted".to_string(),
         }),
     ))
 }
@@ -260,6 +408,11 @@ pub async fn auto_start_loop_if_configured(
     Ok(Some(status))
 }
 
+/// Starts sensor directory watchers for configured directory-based sensors.
+pub async fn initialize_sensor_ingress(state: &AppState) -> anyhow::Result<()> {
+    sync_directory_watchers(state).await
+}
+
 /// Starts continuous loop execution.
 pub async fn loop_start_handler(
     State(state): State<AppState>,
@@ -337,6 +490,96 @@ pub async fn dashboard_handler(
         .await
         .map_err(|error| internal_error(error.to_string()))?;
     Ok(Json(snapshot))
+}
+
+/// Returns Soul markdown and available skills.
+pub async fn agent_identity_handler(
+    State(state): State<AppState>,
+) -> Result<Json<AgentIdentityResponse>, (StatusCode, Json<ApiError>)> {
+    let identity = {
+        let runtime = state.runtime.lock().await;
+        read_agent_identity(&runtime).map_err(|error| internal_error(error.to_string()))?
+    };
+    Ok(Json(identity))
+}
+
+/// Replaces the current Soul markdown.
+pub async fn save_soul_handler(
+    State(state): State<AppState>,
+    Json(request): Json<SaveSoulRequest>,
+) -> Result<Json<SimpleStatusResponse>, (StatusCode, Json<ApiError>)> {
+    let runtime = state.runtime.lock().await;
+    write_soul_markdown(&runtime, &request.markdown)
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(SimpleStatusResponse {
+        status: "ok".to_string(),
+    }))
+}
+
+/// Creates or updates one skill markdown file.
+pub async fn save_skill_handler(
+    State(state): State<AppState>,
+    Json(request): Json<SaveSkillRequest>,
+) -> Result<Json<SkillDocumentResponse>, (StatusCode, Json<ApiError>)> {
+    let runtime = state.runtime.lock().await;
+    let skill =
+        save_skill_document(&runtime, request).map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(skill))
+}
+
+/// Fetches skill markdown from URL and saves it.
+pub async fn save_skill_from_url_handler(
+    State(state): State<AppState>,
+    Json(request): Json<SaveSkillFromUrlRequest>,
+) -> Result<Json<SkillDocumentResponse>, (StatusCode, Json<ApiError>)> {
+    let response = reqwest::get(&request.url)
+        .await
+        .map_err(|error| bad_request(format!("failed to fetch url: {error}")))?;
+    if !response.status().is_success() {
+        return Err(bad_request(format!(
+            "failed to fetch url: status {}",
+            response.status()
+        )));
+    }
+    let markdown = response
+        .text()
+        .await
+        .map_err(|error| bad_request(format!("failed to read url body: {error}")))?;
+
+    let runtime = state.runtime.lock().await;
+    let saved = save_skill_document(
+        &runtime,
+        SaveSkillRequest {
+            id: None,
+            name: request.name,
+            markdown,
+        },
+    )
+    .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(saved))
+}
+
+/// Deletes one skill markdown file.
+pub async fn delete_skill_handler(
+    State(state): State<AppState>,
+    Json(request): Json<DeleteSkillRequest>,
+) -> Result<Json<SimpleStatusResponse>, (StatusCode, Json<ApiError>)> {
+    let runtime = state.runtime.lock().await;
+    delete_skill_file(&runtime, &request.id).map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(SimpleStatusResponse {
+        status: "ok".to_string(),
+    }))
+}
+
+/// Returns one skill markdown file.
+pub async fn get_skill_handler(
+    State(state): State<AppState>,
+    Json(request): Json<GetSkillRequest>,
+) -> Result<Json<SkillDocumentResponse>, (StatusCode, Json<ApiError>)> {
+    let runtime = state.runtime.lock().await;
+    let skill = get_skill_document(&runtime, &request.id)
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(skill))
 }
 
 /// Returns one persisted iteration.
@@ -454,6 +697,78 @@ pub struct ChatPerceptRequest {
     pub chat_id: Option<String>,
 }
 
+/// One skill file summary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SkillSummary {
+    /// Skill identifier (filename).
+    pub id: String,
+    /// Skill display name.
+    pub name: String,
+    /// Last modified timestamp in unix millis.
+    pub updated_at_unix_ms: i64,
+}
+
+/// Agent identity payload containing soul markdown and skills.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AgentIdentityResponse {
+    /// Current Soul markdown content.
+    pub soul_markdown: String,
+    /// Available skill files.
+    pub skills: Vec<SkillSummary>,
+}
+
+/// Request payload for replacing Soul markdown.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SaveSoulRequest {
+    /// New soul markdown content.
+    pub markdown: String,
+}
+
+/// Request payload for creating/updating a skill.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SaveSkillRequest {
+    /// Optional existing skill id for updates.
+    pub id: Option<String>,
+    /// Optional skill name for creates.
+    pub name: Option<String>,
+    /// Skill markdown content.
+    pub markdown: String,
+}
+
+/// Request payload for creating a skill from URL.
+#[derive(Clone, Debug, Deserialize)]
+pub struct SaveSkillFromUrlRequest {
+    /// Source URL to fetch markdown from.
+    pub url: String,
+    /// Optional skill name override.
+    pub name: Option<String>,
+}
+
+/// Request payload for deleting a skill.
+#[derive(Clone, Debug, Deserialize)]
+pub struct DeleteSkillRequest {
+    /// Skill id (filename).
+    pub id: String,
+}
+
+/// Request payload for fetching one skill.
+#[derive(Clone, Debug, Deserialize)]
+pub struct GetSkillRequest {
+    /// Skill id (filename).
+    pub id: String,
+}
+
+/// Response payload for one full skill document.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SkillDocumentResponse {
+    /// Skill identifier (filename).
+    pub id: String,
+    /// Skill display name.
+    pub name: String,
+    /// Skill markdown content.
+    pub markdown: String,
+}
+
 /// Request payload for loop start.
 #[derive(Clone, Debug, Deserialize)]
 pub struct LoopStartRequest {
@@ -560,6 +875,8 @@ pub struct SensorStatus {
     pub percept_singular_name: String,
     /// Plural percept item name.
     pub percept_plural_name: String,
+    /// Sensor ingress configuration.
+    pub ingress: SensorIngressConfig,
 }
 
 /// Actuator details displayed on the dashboard.
@@ -681,6 +998,7 @@ struct WsUpdateSensorParams {
     description: Option<String>,
     percept_singular_name: Option<String>,
     percept_plural_name: Option<String>,
+    ingress: Option<SensorIngressConfig>,
 }
 
 /// Upgrades to a websocket session for realtime bidirectional updates.
@@ -870,12 +1188,19 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
             runtime
                 .update_sensor(
                     &payload.name,
-                    payload.enabled,
-                    payload.sensitivity_score,
-                    payload.description,
-                    payload.percept_singular_name,
-                    payload.percept_plural_name,
+                    SensorUpdate {
+                        enabled: payload.enabled,
+                        sensitivity_score: payload.sensitivity_score,
+                        description: payload.description,
+                        percept_singular_name: payload.percept_singular_name,
+                        percept_plural_name: payload.percept_plural_name,
+                        ingress: payload.ingress,
+                    },
                 )
+                .map_err(|error| error.to_string())?;
+            drop(runtime);
+            sync_directory_watchers(state)
+                .await
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::json!({ "status": "ok" }))
         }
@@ -935,6 +1260,66 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::to_value(ChatMessagesResponse { messages })
                 .map_err(|error| error.to_string())?)
+        }
+        "get_agent_identity" => {
+            let runtime = state.runtime.lock().await;
+            let identity = read_agent_identity(&runtime).map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(identity).map_err(|error| error.to_string())?)
+        }
+        "save_soul_markdown" => {
+            let payload: SaveSoulRequest =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let runtime = state.runtime.lock().await;
+            write_soul_markdown(&runtime, &payload.markdown).map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
+        "save_skill" => {
+            let payload: SaveSkillRequest =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let runtime = state.runtime.lock().await;
+            let skill =
+                save_skill_document(&runtime, payload).map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(skill).map_err(|error| error.to_string())?)
+        }
+        "save_skill_from_url" => {
+            let payload: SaveSkillFromUrlRequest =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let response = reqwest::get(&payload.url)
+                .await
+                .map_err(|error| format!("failed to fetch url: {error}"))?;
+            if !response.status().is_success() {
+                return Err(format!("failed to fetch url: status {}", response.status()));
+            }
+            let markdown = response
+                .text()
+                .await
+                .map_err(|error| format!("failed to read url body: {error}"))?;
+            let runtime = state.runtime.lock().await;
+            let skill = save_skill_document(
+                &runtime,
+                SaveSkillRequest {
+                    id: None,
+                    name: payload.name,
+                    markdown,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(skill).map_err(|error| error.to_string())?)
+        }
+        "delete_skill" => {
+            let payload: DeleteSkillRequest =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let runtime = state.runtime.lock().await;
+            delete_skill_file(&runtime, &payload.id).map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
+        "get_skill" => {
+            let payload: GetSkillRequest =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            let runtime = state.runtime.lock().await;
+            let skill =
+                get_skill_document(&runtime, &payload.id).map_err(|error| error.to_string())?;
+            Ok(serde_json::to_value(skill).map_err(|error| error.to_string())?)
         }
         _ => Err(format!("unsupported method '{method}'")),
     }
@@ -1043,6 +1428,7 @@ async fn dashboard_snapshot(state: &AppState) -> anyhow::Result<DashboardRespons
                 unread_percepts,
                 percept_singular_name: sensor.percept_singular_name,
                 percept_plural_name: sensor.percept_plural_name,
+                ingress: sensor.ingress,
             }
         })
         .collect();
@@ -1278,6 +1664,287 @@ fn extract_size_tags_for_model_card(html: &str, model: &str) -> Vec<String> {
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn read_agent_identity(runtime: &LooperRuntime) -> anyhow::Result<AgentIdentityResponse> {
+    let soul_markdown = read_soul_markdown(runtime)?;
+    let skills = list_skill_summaries(runtime)?;
+    Ok(AgentIdentityResponse {
+        soul_markdown,
+        skills,
+    })
+}
+
+fn read_soul_markdown(runtime: &LooperRuntime) -> anyhow::Result<String> {
+    let path = soul_markdown_path(runtime)?;
+    if !path.exists() {
+        fs::write(&path, DEFAULT_SOUL_MARKDOWN)?;
+        return Ok(DEFAULT_SOUL_MARKDOWN.to_string());
+    }
+    Ok(fs::read_to_string(path)?)
+}
+
+fn write_soul_markdown(runtime: &LooperRuntime, markdown: &str) -> anyhow::Result<()> {
+    let path = soul_markdown_path(runtime)?;
+    fs::write(path, markdown)?;
+    Ok(())
+}
+
+fn list_skill_summaries(runtime: &LooperRuntime) -> anyhow::Result<Vec<SkillSummary>> {
+    let directory = skills_directory_path(runtime)?;
+    let mut skills = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !extension.eq_ignore_ascii_case("md") {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let metadata = fs::metadata(&path)?;
+        let updated_at_unix_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or_default();
+        let base_name = file_name.strip_suffix(".md").unwrap_or(file_name);
+        let display_name = base_name.replace(['-', '_'], " ");
+        skills.push(SkillSummary {
+            id: file_name.to_string(),
+            name: display_name,
+            updated_at_unix_ms,
+        });
+    }
+    skills.sort_by_key(|skill| std::cmp::Reverse(skill.updated_at_unix_ms));
+    Ok(skills)
+}
+
+fn get_skill_document(runtime: &LooperRuntime, id: &str) -> anyhow::Result<SkillDocumentResponse> {
+    let file_name = normalize_skill_file_name(id)?;
+    let path = skills_directory_path(runtime)?.join(&file_name);
+    if !path.exists() {
+        return Err(anyhow::anyhow!("skill '{file_name}' was not found"));
+    }
+    let markdown = fs::read_to_string(path)?;
+    let name = file_name
+        .strip_suffix(".md")
+        .unwrap_or(file_name.as_str())
+        .replace(['-', '_'], " ");
+    Ok(SkillDocumentResponse {
+        id: file_name,
+        name,
+        markdown,
+    })
+}
+
+fn save_skill_document(
+    runtime: &LooperRuntime,
+    request: SaveSkillRequest,
+) -> anyhow::Result<SkillDocumentResponse> {
+    let file_name = match request.id {
+        Some(id) => normalize_skill_file_name(&id)?,
+        None => {
+            let base_name = request
+                .name
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("new-skill");
+            normalize_skill_file_name(base_name)?
+        }
+    };
+    let markdown = request.markdown;
+    let path = skills_directory_path(runtime)?.join(&file_name);
+    fs::write(&path, markdown.as_bytes())?;
+    let name = file_name
+        .strip_suffix(".md")
+        .unwrap_or(file_name.as_str())
+        .replace(['-', '_'], " ");
+    Ok(SkillDocumentResponse {
+        id: file_name,
+        name,
+        markdown,
+    })
+}
+
+fn delete_skill_file(runtime: &LooperRuntime, id: &str) -> anyhow::Result<()> {
+    let file_name = normalize_skill_file_name(id)?;
+    let path = skills_directory_path(runtime)?.join(file_name);
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+fn soul_markdown_path(runtime: &LooperRuntime) -> anyhow::Result<std::path::PathBuf> {
+    let agents_dir = agents_directory_path(runtime)?;
+    Ok(agents_dir.join("SOUL.md"))
+}
+
+fn skills_directory_path(runtime: &LooperRuntime) -> anyhow::Result<std::path::PathBuf> {
+    let agents_dir = agents_directory_path(runtime)?;
+    let skills_dir = agents_dir.join("skills");
+    fs::create_dir_all(&skills_dir)?;
+    Ok(skills_dir)
+}
+
+fn agents_directory_path(runtime: &LooperRuntime) -> anyhow::Result<std::path::PathBuf> {
+    let directory = runtime.workspace_root().join(".agents");
+    fs::create_dir_all(&directory)?;
+    Ok(directory)
+}
+
+fn normalize_skill_file_name(value: &str) -> anyhow::Result<String> {
+    let without_extension = value.trim().trim_end_matches(".md");
+    let slug = without_extension
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else if character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let compact = slug
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if compact.is_empty() {
+        return Err(anyhow::anyhow!(
+            "skill name must include letters or numbers"
+        ));
+    }
+    Ok(format!("{compact}.md"))
+}
+
+struct DirectoryWatcherHandle {
+    path: PathBuf,
+    watcher: RecommendedWatcher,
+    task_handle: tokio::task::JoinHandle<()>,
+}
+
+impl DirectoryWatcherHandle {
+    fn stop(self) {
+        self.task_handle.abort();
+        drop(self.watcher);
+    }
+}
+
+async fn sync_directory_watchers(state: &AppState) -> anyhow::Result<()> {
+    let sensors = {
+        let runtime = state.runtime.lock().await;
+        runtime.sensors()
+    };
+
+    let desired = sensors
+        .into_iter()
+        .filter_map(|sensor| {
+            if let SensorIngressConfig::Directory { path } = sensor.ingress {
+                Some((sensor.name, PathBuf::from(path.trim())))
+            } else {
+                None
+            }
+        })
+        .filter(|(_, path)| !path.as_os_str().is_empty())
+        .collect::<HashMap<_, _>>();
+
+    let mut watchers = state.directory_watchers.lock().await;
+
+    let stale_names = watchers
+        .keys()
+        .filter(|name| !desired.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for name in stale_names {
+        if let Some(handle) = watchers.remove(&name) {
+            handle.stop();
+        }
+    }
+
+    for (sensor_name, path) in desired {
+        let needs_restart = watchers
+            .get(&sensor_name)
+            .map(|existing| existing.path != path)
+            .unwrap_or(true);
+        if !needs_restart {
+            continue;
+        }
+
+        if let Some(existing) = watchers.remove(&sensor_name) {
+            existing.stop();
+        }
+
+        if !path.exists() {
+            continue;
+        }
+
+        let handle = spawn_directory_watcher(state.runtime.clone(), sensor_name.clone(), path)?;
+        watchers.insert(sensor_name, handle);
+    }
+
+    Ok(())
+}
+
+fn spawn_directory_watcher(
+    runtime: Arc<Mutex<LooperRuntime>>,
+    sensor_name: String,
+    path: PathBuf,
+) -> anyhow::Result<DirectoryWatcherHandle> {
+    let (sender, mut receiver) = mpsc::unbounded_channel::<Event>();
+    let mut watcher = RecommendedWatcher::new(
+        move |result| {
+            if let Ok(event) = result {
+                let _ = sender.send(event);
+            }
+        },
+        NotifyConfig::default(),
+    )?;
+    watcher.watch(&path, RecursiveMode::NonRecursive)?;
+
+    let task_handle = tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            if !matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                continue;
+            }
+
+            for file_path in event.paths {
+                if !file_path.is_file() {
+                    continue;
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let Ok(contents) = fs::read_to_string(&file_path) else {
+                    continue;
+                };
+                if contents.trim().is_empty() {
+                    continue;
+                }
+
+                let mut guard = runtime.lock().await;
+                let _ = guard.enqueue_sensor_percept(&sensor_name, contents);
+            }
+        }
+    });
+
+    Ok(DirectoryWatcherHandle {
+        path,
+        watcher,
+        task_handle,
+    })
 }
 
 fn bad_request(message: String) -> (StatusCode, Json<ApiError>) {

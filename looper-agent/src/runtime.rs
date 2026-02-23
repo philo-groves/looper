@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,21 +16,59 @@ use crate::executors::{
 use crate::model::{
     Actuator, ActuatorType, AgentState, ExecutionResult, InternalActuatorKind, ModelProviderKind,
     ModelSelection, PendingApproval, Percept, RecommendedAction, SafetyPolicy, Sensor,
+    SensorIngressConfig, SensorRestFormat,
 };
 use crate::models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,
-    LocalModel, LocalModelRequest, RuleBasedFrontierModel, RuleBasedLocalModel,
+    LocalModel, LocalModelRequest, RuleBasedFrontierModel, RuleBasedLocalModel, SkillContext,
 };
 use crate::storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration, SqliteStore};
 
 const FORCE_SURPRISE_SENSITIVITY_THRESHOLD: u8 = 90;
+const DEFAULT_SOUL_MARKDOWN: &str =
+    "# Looper Soul\n\nLooper is a curious, practical, and upbeat general-purpose agent.";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedAgentSettings {
-    local_provider: ModelProviderKind,
-    local_model: String,
-    frontier_provider: ModelProviderKind,
-    frontier_model: String,
+    #[serde(default)]
+    local_provider: Option<ModelProviderKind>,
+    #[serde(default)]
+    local_model: Option<String>,
+    #[serde(default)]
+    frontier_provider: Option<ModelProviderKind>,
+    #[serde(default)]
+    frontier_model: Option<String>,
+    #[serde(default)]
+    sensors: Vec<PersistedSensorSettings>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedSensorSettings {
+    name: String,
+    description: String,
+    enabled: bool,
+    sensitivity_score: u8,
+    percept_singular_name: String,
+    percept_plural_name: String,
+    #[serde(default = "default_sensor_ingress")]
+    ingress: SensorIngressConfig,
+}
+
+/// Partial update payload for mutable sensor settings.
+#[derive(Clone, Debug, Default)]
+pub struct SensorUpdate {
+    /// Optional new enabled state.
+    pub enabled: Option<bool>,
+    /// Optional new sensitivity score.
+    pub sensitivity_score: Option<u8>,
+    /// Optional new percept description.
+    pub description: Option<String>,
+    /// Optional new percept singular display name.
+    pub percept_singular_name: Option<String>,
+    /// Optional new percept plural display name.
+    pub percept_plural_name: Option<String>,
+    /// Optional ingress configuration update.
+    pub ingress: Option<SensorIngressConfig>,
 }
 
 /// Phases of a loop iteration.
@@ -323,11 +362,12 @@ impl LooperRuntime {
         let mut runtime = Self::new();
         let mut chat_sensor = Sensor::with_sensitivity_score(
             "chat",
-            "Receiver of chat messages in percept form",
+            "Conversational messages that should always be considered surprising.",
             100,
         );
         chat_sensor.percept_singular_name = "Incoming Message".to_string();
         chat_sensor.percept_plural_name = "Incoming Messages".to_string();
+        chat_sensor.ingress = SensorIngressConfig::Internal;
         runtime.add_sensor(chat_sensor);
 
         let mut chat_actuator = Actuator::internal(
@@ -523,21 +563,33 @@ impl LooperRuntime {
         }
     }
 
+    /// Returns the configured workspace root directory.
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
     pub fn add_sensor(&mut self, sensor: Sensor) {
         self.sensors.insert(sensor.name.clone(), sensor);
     }
 
+    /// Registers a new sensor and persists settings.
+    pub fn register_sensor(&mut self, mut sensor: Sensor) -> Result<()> {
+        if sensor.name == "chat" {
+            sensor.ingress = SensorIngressConfig::Internal;
+        }
+        if let SensorIngressConfig::Directory { path } = &sensor.ingress
+            && path.trim().is_empty()
+        {
+            return Err(anyhow!("directory path cannot be empty"));
+        }
+
+        self.add_sensor(sensor);
+        self.persist_settings()
+    }
+
     /// Updates mutable sensor configuration fields for an existing sensor.
-    pub fn update_sensor(
-        &mut self,
-        name: &str,
-        enabled: Option<bool>,
-        sensitivity_score: Option<u8>,
-        description: Option<String>,
-        percept_singular_name: Option<String>,
-        percept_plural_name: Option<String>,
-    ) -> Result<()> {
-        if name == "chat" && matches!(enabled, Some(false)) {
+    pub fn update_sensor(&mut self, name: &str, update: SensorUpdate) -> Result<()> {
+        if name == "chat" && matches!(update.enabled, Some(false)) {
             return Err(anyhow!("chat sensor cannot be disabled"));
         }
 
@@ -547,29 +599,48 @@ impl LooperRuntime {
                 .get_mut(name)
                 .ok_or_else(|| anyhow!("sensor '{name}' not found"))?;
 
-            if let Some(value) = enabled {
+            if let Some(value) = update.enabled {
                 sensor.enabled = value;
             }
-            if let Some(value) = sensitivity_score {
+            if let Some(value) = update.sensitivity_score {
                 sensor.sensitivity_score = value.min(100);
             }
-            if let Some(value) = description {
+            if let Some(value) = update.description {
                 let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    sensor.description = trimmed.to_string();
+                if trimmed.is_empty() {
+                    return Err(anyhow!("description cannot be empty"));
                 }
+                sensor.description = trimmed.to_string();
             }
-            if let Some(value) = percept_singular_name {
+            if let Some(value) = update.percept_singular_name {
                 let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    sensor.percept_singular_name = trimmed.to_lowercase();
+                if trimmed.is_empty() {
+                    return Err(anyhow!("percept singular name cannot be empty"));
                 }
+                sensor.percept_singular_name = trimmed.to_lowercase();
             }
-            if let Some(value) = percept_plural_name {
+            if let Some(value) = update.percept_plural_name {
                 let trimmed = value.trim();
-                if !trimmed.is_empty() {
-                    sensor.percept_plural_name = trimmed.to_lowercase();
+                if trimmed.is_empty() {
+                    return Err(anyhow!("percept plural name cannot be empty"));
                 }
+                sensor.percept_plural_name = trimmed.to_lowercase();
+            }
+            if let Some(value) = update.ingress {
+                if name == "chat" && value != SensorIngressConfig::Internal {
+                    return Err(anyhow!("chat sensor ingress is managed internally"));
+                }
+
+                match &value {
+                    SensorIngressConfig::Directory { path } => {
+                        if path.trim().is_empty() {
+                            return Err(anyhow!("directory path cannot be empty"));
+                        }
+                    }
+                    SensorIngressConfig::Internal | SensorIngressConfig::RestApi { .. } => {}
+                }
+
+                sensor.ingress = value;
             }
 
             (
@@ -588,6 +659,32 @@ impl LooperRuntime {
             ),
         );
 
+        self.persist_settings()?;
+
+        Ok(())
+    }
+
+    /// Enqueues one percept for a configured non-chat sensor.
+    pub fn enqueue_sensor_percept(
+        &mut self,
+        sensor_name: &str,
+        content: impl Into<String>,
+    ) -> Result<()> {
+        if sensor_name == "chat" {
+            return Err(anyhow!("chat sensor is managed internally"));
+        }
+
+        let sensor = self
+            .sensors
+            .get_mut(sensor_name)
+            .ok_or_else(|| anyhow!("sensor '{sensor_name}' not found"))?;
+
+        let trimmed = content.into().trim().to_string();
+        if trimmed.is_empty() {
+            return Err(anyhow!("percept content cannot be empty"));
+        }
+
+        sensor.enqueue(trimmed);
         Ok(())
     }
 
@@ -754,6 +851,7 @@ impl LooperRuntime {
         let sensed = self.collect_new_percepts();
         self.log_state("run_iteration.sensed", format!("count={}", sensed.len()));
         let prior_windows = self.latest_history_windows()?;
+        let soul_markdown = self.read_soul_markdown_for_models();
         let local_model = self
             .local_model
             .as_ref()
@@ -762,6 +860,7 @@ impl LooperRuntime {
             .detect_surprises(LocalModelRequest {
                 latest_percepts: sensed.clone(),
                 previous_windows: prior_windows,
+                soul_markdown: soul_markdown.clone(),
             })
             .await?;
         self.observability.local_model_tokens += surprise_response.token_usage;
@@ -828,9 +927,12 @@ impl LooperRuntime {
             .frontier_model
             .as_ref()
             .ok_or_else(|| anyhow!("frontier model is not configured"))?;
+        let relevant_skills = self.relevant_enabled_skills_for_surprises(&surprising);
         let plan_response = match frontier_model
             .plan_actions(FrontierModelRequest {
                 surprising_percepts: surprising.clone(),
+                soul_markdown,
+                relevant_skills,
             })
             .await
         {
@@ -1056,6 +1158,88 @@ impl LooperRuntime {
         }
     }
 
+    fn read_soul_markdown_for_models(&self) -> String {
+        let path = self.workspace_root.join(".agents").join("SOUL.md");
+        if let Ok(contents) = fs::read_to_string(path)
+            && !contents.trim().is_empty()
+        {
+            return contents;
+        }
+        DEFAULT_SOUL_MARKDOWN.to_string()
+    }
+
+    fn relevant_enabled_skills_for_surprises(&self, surprising: &[Percept]) -> Vec<SkillContext> {
+        let skills_dir = self.workspace_root.join(".agents").join("skills");
+        let entries = match fs::read_dir(skills_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+
+        let terms = surprising
+            .iter()
+            .flat_map(|percept| percept.content.split_whitespace())
+            .map(|token| {
+                token
+                    .trim_matches(|ch: char| !ch.is_ascii_alphanumeric())
+                    .to_ascii_lowercase()
+            })
+            .filter(|token| token.len() >= 3)
+            .collect::<Vec<_>>();
+
+        let mut scored = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if !path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            {
+                continue;
+            }
+
+            let Some(id) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+
+            let markdown = match fs::read_to_string(&path) {
+                Ok(markdown) => markdown,
+                Err(_) => continue,
+            };
+            if markdown.trim().is_empty() {
+                continue;
+            }
+            if !skill_is_enabled(&markdown) {
+                continue;
+            }
+
+            let lower_markdown = markdown.to_ascii_lowercase();
+            let score = terms
+                .iter()
+                .filter(|term| lower_markdown.contains(term.as_str()))
+                .count();
+
+            if score > 0 {
+                scored.push((
+                    score,
+                    SkillContext {
+                        id: id.to_string(),
+                        markdown,
+                    },
+                ));
+            }
+        }
+
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored
+            .into_iter()
+            .take(5)
+            .map(|(_, context)| context)
+            .collect()
+    }
+
     fn persist_iteration(&self, report: &mut IterationReport) -> Result<()> {
         let Some(store) = &self.store else {
             return Ok(());
@@ -1132,21 +1316,35 @@ impl LooperRuntime {
     }
 
     fn persist_settings(&self) -> Result<()> {
-        let (Some(local), Some(frontier)) = (&self.local_selection, &self.frontier_selection)
-        else {
-            return Ok(());
-        };
-
         let path = self.settings_store_path();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
+        let mut sensors = self
+            .sensors
+            .values()
+            .map(|sensor| PersistedSensorSettings {
+                name: sensor.name.clone(),
+                description: sensor.description.clone(),
+                enabled: sensor.enabled,
+                sensitivity_score: sensor.sensitivity_score,
+                percept_singular_name: sensor.percept_singular_name.clone(),
+                percept_plural_name: sensor.percept_plural_name.clone(),
+                ingress: sensor.ingress.clone(),
+            })
+            .collect::<Vec<_>>();
+        sensors.sort_by(|left, right| left.name.cmp(&right.name));
+
         let encoded = serde_json::to_string_pretty(&PersistedAgentSettings {
-            local_provider: local.provider,
-            local_model: local.model.clone(),
-            frontier_provider: frontier.provider,
-            frontier_model: frontier.model.clone(),
+            local_provider: self.local_selection.as_ref().map(|item| item.provider),
+            local_model: self.local_selection.as_ref().map(|item| item.model.clone()),
+            frontier_provider: self.frontier_selection.as_ref().map(|item| item.provider),
+            frontier_model: self
+                .frontier_selection
+                .as_ref()
+                .map(|item| item.model.clone()),
+            sensors,
         })?;
         fs::write(path, encoded)?;
         Ok(())
@@ -1188,27 +1386,92 @@ impl LooperRuntime {
 
         let raw = fs::read_to_string(path)?;
         let parsed = serde_json::from_str::<PersistedAgentSettings>(&raw)?;
-        let local = ModelSelection {
-            provider: parsed.local_provider,
-            model: parsed.local_model,
-        };
-        let frontier = ModelSelection {
-            provider: parsed.frontier_provider,
-            model: parsed.frontier_model,
-        };
+        if let (
+            Some(local_provider),
+            Some(local_model),
+            Some(frontier_provider),
+            Some(frontier_model),
+        ) = (
+            parsed.local_provider,
+            parsed.local_model,
+            parsed.frontier_provider,
+            parsed.frontier_model,
+        ) {
+            let local = ModelSelection {
+                provider: local_provider,
+                model: local_model,
+            };
+            let frontier = ModelSelection {
+                provider: frontier_provider,
+                model: frontier_model,
+            };
 
-        if self.configure_models(local, frontier).is_err() {
-            self.local_selection = None;
-            self.frontier_selection = None;
-            self.local_model = None;
-            self.frontier_model = None;
-            self.log_state(
-                "load_persisted_settings",
-                "failed to apply persisted settings",
-            );
-        } else {
-            self.log_state("load_persisted_settings", "persisted settings applied");
+            if self.configure_models(local, frontier).is_err() {
+                self.local_selection = None;
+                self.frontier_selection = None;
+                self.local_model = None;
+                self.frontier_model = None;
+                self.log_state(
+                    "load_persisted_settings",
+                    "failed to apply persisted model settings",
+                );
+            }
         }
+
+        for persisted in parsed.sensors {
+            let name = persisted.name.trim();
+            if name.is_empty() {
+                continue;
+            }
+
+            let enabled = if name == "chat" {
+                true
+            } else {
+                persisted.enabled
+            };
+            let sensitivity_score = persisted.sensitivity_score.min(100);
+            let description = persisted.description.trim().to_string();
+            let percept_singular_name = persisted.percept_singular_name.trim().to_lowercase();
+            let percept_plural_name = persisted.percept_plural_name.trim().to_lowercase();
+            let ingress = if name == "chat" {
+                SensorIngressConfig::Internal
+            } else {
+                persisted.ingress
+            };
+
+            if let Some(existing) = self.sensors.get_mut(name) {
+                existing.enabled = enabled;
+                existing.sensitivity_score = sensitivity_score;
+                if !description.is_empty() {
+                    existing.description = description.clone();
+                }
+                if !percept_singular_name.is_empty() {
+                    existing.percept_singular_name = percept_singular_name.clone();
+                }
+                if !percept_plural_name.is_empty() {
+                    existing.percept_plural_name = percept_plural_name.clone();
+                }
+                existing.ingress = ingress.clone();
+                continue;
+            }
+
+            if description.is_empty() {
+                continue;
+            }
+
+            let mut sensor = Sensor::with_sensitivity_score(name, description, sensitivity_score);
+            sensor.enabled = enabled;
+            if !percept_singular_name.is_empty() {
+                sensor.percept_singular_name = percept_singular_name;
+            }
+            if !percept_plural_name.is_empty() {
+                sensor.percept_plural_name = percept_plural_name;
+            }
+            sensor.ingress = ingress;
+            self.sensors.insert(sensor.name.clone(), sensor);
+        }
+
+        self.log_state("load_persisted_settings", "persisted settings applied");
 
         Ok(())
     }
@@ -1272,6 +1535,22 @@ fn normalize_chat_id(chat_id: Option<String>) -> String {
     format!("chat-{}", now_unix_ms())
 }
 
+fn default_sensor_ingress() -> SensorIngressConfig {
+    SensorIngressConfig::RestApi {
+        format: SensorRestFormat::Text,
+    }
+}
+
+fn skill_is_enabled(markdown: &str) -> bool {
+    let first_lines = markdown.lines().take(16).map(str::trim).collect::<Vec<_>>();
+    for line in first_lines {
+        if line.eq_ignore_ascii_case("enabled: false") {
+            return false;
+        }
+    }
+    true
+}
+
 fn looper_user_dir() -> PathBuf {
     if let Some(home) = user_home_dir() {
         return home.join(".looper");
@@ -1325,6 +1604,8 @@ fn is_frontier_communication_issue(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use crate::model::Action;
 
     use super::*;
@@ -1469,5 +1750,74 @@ mod tests {
             .expect("chat alias should execute");
 
         assert!(matches!(result, ExecutionResult::Executed { .. }));
+    }
+
+    #[test]
+    fn update_sensor_rejects_empty_description() {
+        let workspace = std::env::temp_dir().join(format!("looper-test-{}", now_unix_ms()));
+        fs::create_dir_all(&workspace).expect("temp workspace should be created");
+
+        let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should build");
+        runtime.disable_store();
+
+        let error = runtime
+            .update_sensor(
+                "chat",
+                SensorUpdate {
+                    description: Some("   ".to_string()),
+                    ..SensorUpdate::default()
+                },
+            )
+            .expect_err("empty description should be rejected");
+        assert!(error.to_string().contains("description cannot be empty"));
+    }
+
+    #[test]
+    fn sensor_settings_persist_between_runtime_instances() {
+        let workspace = std::env::temp_dir().join(format!("looper-test-{}", now_unix_ms()));
+        fs::create_dir_all(&workspace).expect("temp workspace should be created");
+
+        let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should build");
+        runtime.disable_store();
+        runtime
+            .register_sensor(Sensor::with_sensitivity_score("inbox", "incoming mail", 30))
+            .expect("sensor should register");
+        runtime
+            .update_sensor(
+                "inbox",
+                SensorUpdate {
+                    enabled: Some(false),
+                    sensitivity_score: Some(88),
+                    description: Some("Email alerts from monitored inboxes".to_string()),
+                    percept_singular_name: Some("Email Alert".to_string()),
+                    percept_plural_name: Some("Email Alerts".to_string()),
+                    ingress: Some(SensorIngressConfig::Directory {
+                        path: "C:/tmp/inbox".to_string(),
+                    }),
+                },
+            )
+            .expect("sensor should update");
+
+        let reloaded = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should reload");
+        let sensor = reloaded
+            .sensors()
+            .into_iter()
+            .find(|item| item.name == "inbox")
+            .expect("persisted sensor should exist");
+
+        assert!(!sensor.enabled);
+        assert_eq!(sensor.sensitivity_score, 88);
+        assert_eq!(sensor.description, "Email alerts from monitored inboxes");
+        assert_eq!(sensor.percept_singular_name, "email alert");
+        assert_eq!(sensor.percept_plural_name, "email alerts");
+        assert_eq!(
+            sensor.ingress,
+            SensorIngressConfig::Directory {
+                path: "C:/tmp/inbox".to_string()
+            }
+        );
     }
 }

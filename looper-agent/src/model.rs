@@ -3,6 +3,28 @@ use std::collections::VecDeque;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+/// Accepted payload format for REST-ingested percepts.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SensorRestFormat {
+    /// Plain text or markdown payload.
+    Text,
+    /// JSON payload serialized to text.
+    Json,
+}
+
+/// How a sensor receives percepts.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SensorIngressConfig {
+    /// Sensor receives percepts from internal runtime hooks.
+    Internal,
+    /// Sensor receives percepts by watching files in a directory.
+    Directory { path: String },
+    /// Sensor receives percepts via the HTTP API.
+    RestApi { format: SensorRestFormat },
+}
+
 /// Supported model providers for Looper configuration.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -83,6 +105,8 @@ pub struct Sensor {
     pub percept_singular_name: String,
     /// Plural display name for percept items.
     pub percept_plural_name: String,
+    /// Ingestion configuration for this sensor.
+    pub ingress: SensorIngressConfig,
     queue: VecDeque<Percept>,
     unread_start: usize,
 }
@@ -114,6 +138,9 @@ impl Sensor {
             sensitivity_score: sensitivity_score.min(100),
             percept_singular_name: singular,
             percept_plural_name: plural,
+            ingress: SensorIngressConfig::RestApi {
+                format: SensorRestFormat::Text,
+            },
             queue: VecDeque::new(),
             unread_start: 0,
         }

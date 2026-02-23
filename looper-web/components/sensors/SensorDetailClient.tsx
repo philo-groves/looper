@@ -3,6 +3,9 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { useDashboardSocket } from "@/components/dashboard/useDashboardSocket";
+import { SensorIngressConfig } from "@/components/dashboard/types";
+import { SensorFormFields } from "@/components/sensors/SensorFormFields";
+import { SensorIngressFields } from "@/components/sensors/SensorIngressFields";
 
 type SensorDetailClientProps = {
   sensorName: string;
@@ -16,6 +19,7 @@ export function SensorDetailClient({ sensorName }: SensorDetailClientProps) {
   const [description, setDescription] = useState("");
   const [singular, setSingular] = useState("");
   const [plural, setPlural] = useState("");
+  const [ingress, setIngress] = useState<SensorIngressConfig>({ type: "rest_api", format: "text" });
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -43,13 +47,14 @@ export function SensorDetailClient({ sensorName }: SensorDetailClientProps) {
     if (sensorName.toLowerCase() === "chat") {
       return {
         name: "chat",
-        description: "Receiver of chat messages in percept form",
+        description: "Conversational messages that should always be considered surprising.",
         enabled: true,
         sensitivity_score: 100,
         queued_percepts: 0,
         unread_percepts: 0,
         percept_singular_name: "Incoming Message",
         percept_plural_name: "Incoming Messages",
+        ingress: { type: "internal" as const },
       };
     }
 
@@ -65,10 +70,16 @@ export function SensorDetailClient({ sensorName }: SensorDetailClientProps) {
     setDescription(sensor.description);
     setSingular(sensor.percept_singular_name);
     setPlural(sensor.percept_plural_name);
+    setIngress(sensor.ingress);
   }, [sensor]);
 
   async function save() {
     if (!sensorName) {
+      return;
+    }
+    if (ingress.type === "directory" && !ingress.path.trim()) {
+      setError("Directory path is required when Percept Source is Directory.");
+      setStatus(null);
       return;
     }
 
@@ -83,6 +94,7 @@ export function SensorDetailClient({ sensorName }: SensorDetailClientProps) {
         description,
         percept_singular_name: singular,
         percept_plural_name: plural,
+        ingress,
       });
       setStatus("Sensor settings updated.");
     } catch (saveError) {
@@ -113,58 +125,24 @@ export function SensorDetailClient({ sensorName }: SensorDetailClientProps) {
           <p className="text-sm text-zinc-600 dark:text-zinc-300">Sensor not found.</p>
         ) : (
           <div className="space-y-4">
-            <label className="flex items-center gap-2 text-sm font-medium">
-              <input
-                type="checkbox"
-                checked={enabled}
-                onChange={(event) => setEnabled(event.target.checked)}
-                className="h-4 w-4"
-              />
-              Enabled
-            </label>
+            <SensorFormFields
+              enabled={enabled}
+              onEnabledChange={setEnabled}
+              sensitivity={sensitivity}
+              onSensitivityChange={setSensitivity}
+              description={description}
+              onDescriptionChange={setDescription}
+              singular={singular}
+              onSingularChange={setSingular}
+              plural={plural}
+              onPluralChange={setPlural}
+            />
 
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Sensitivity Score (0-100)</label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                value={sensitivity}
-                onChange={(event) =>
-                  setSensitivity(Math.max(0, Math.min(100, Number(event.target.value) || 0)))
-                }
-                className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
-              />
-            </div>
-
-            <div className="space-y-2">
-              <label className="text-sm font-medium">Description</label>
-              <textarea
-                value={description}
-                onChange={(event) => setDescription(event.target.value)}
-                rows={2}
-                className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
-              />
-            </div>
-
-            <div className="grid gap-3 sm:grid-cols-2">
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Percept Singular Name</label>
-                <input
-                  value={singular}
-                  onChange={(event) => setSingular(event.target.value)}
-                  className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Percept Plural Name</label>
-                <input
-                  value={plural}
-                  onChange={(event) => setPlural(event.target.value)}
-                  className="w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900"
-                />
-              </div>
-            </div>
+            <SensorIngressFields
+              sensorName={sensorName}
+              ingress={ingress}
+              onIngressChange={setIngress}
+            />
 
             <div className="flex items-center gap-2">
               <button

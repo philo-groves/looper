@@ -1,5 +1,5 @@
-import { BlankWorkspacePage } from "@/components/window/BlankWorkspacePage";
+import { AddSensorClient } from "@/components/sensors/AddSensorClient";
 
 export default function AddSensorPage() {
-  return <BlankWorkspacePage title="Add a Sensor" />;
+  return <AddSensorClient />;
 }

@@ -1,7 +1,20 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Actuator, McpDetails, SafetyPolicy, Sensor, WorkflowDetails};
+use crate::model::{
+    Actuator, McpDetails, SafetyPolicy, Sensor, SensorIngressConfig, SensorRestFormat,
+    WorkflowDetails,
+};
+
+/// Sensor ingress options accepted by REST API.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SensorIngressCreateRequest {
+    /// Sensor receives percepts via watched directory files.
+    Directory { path: String },
+    /// Sensor receives percepts via REST API.
+    RestApi { format: SensorRestFormat },
+}
 
 /// API request body for creating a sensor.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -13,16 +26,31 @@ pub struct SensorCreateRequest {
     /// Optional sensitivity score from 0 to 100.
     #[serde(default)]
     pub sensitivity_score: Option<u8>,
+    /// Optional ingress configuration for non-internal sensors.
+    #[serde(default)]
+    pub ingress: Option<SensorIngressCreateRequest>,
 }
 
 impl SensorCreateRequest {
     /// Converts the request into a runtime sensor.
     pub fn into_sensor(self) -> Sensor {
-        Sensor::with_sensitivity_score(
+        let mut sensor = Sensor::with_sensitivity_score(
             self.name,
             self.description,
             self.sensitivity_score.unwrap_or(50),
-        )
+        );
+        sensor.ingress = match self.ingress {
+            Some(SensorIngressCreateRequest::Directory { path }) => {
+                SensorIngressConfig::Directory { path }
+            }
+            Some(SensorIngressCreateRequest::RestApi { format }) => {
+                SensorIngressConfig::RestApi { format }
+            }
+            None => SensorIngressConfig::RestApi {
+                format: SensorRestFormat::Text,
+            },
+        };
+        sensor
     }
 }
 

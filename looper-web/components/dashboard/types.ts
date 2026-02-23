@@ -5,6 +5,11 @@ export type ProcessStatus = {
   process_state: string;
 };
 
+export type SensorIngressConfig =
+  | { type: "internal" }
+  | { type: "directory"; path: string }
+  | { type: "rest_api"; format: "text" | "json" };
+
 export type DashboardPayload = {
   state: {
     state: string;
@@ -58,6 +63,7 @@ export type DashboardPayload = {
     unread_percepts: number;
     percept_singular_name: string;
     percept_plural_name: string;
+    ingress: SensorIngressConfig;
   }>;
   actuators: Array<{
     name: string;
