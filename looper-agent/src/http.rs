@@ -20,7 +20,7 @@ use serde_json::Value;
 use tokio::select;
 use tokio::sync::{Mutex, mpsc, oneshot};
 
-use crate::dto::{ActuatorCreateRequest, SensorCreateRequest};
+use crate::dto::{ActuatorCreateRequest, PluginImportRequest, SensorCreateRequest};
 use crate::model::{
     Actuator, ActuatorType, AgentState, ExecutionResult, ModelProviderKind, ModelSelection,
     RateLimit, SensorIngressConfig, SensorRestFormat,
@@ -111,6 +111,7 @@ pub fn build_router(state: AppState) -> Router {
             post(add_sensor_percept_handler),
         )
         .route("/api/actuators", post(add_actuator_handler))
+        .route("/api/plugins/import", post(import_plugin_handler))
         .route("/api/percepts/chat", post(add_chat_percept_handler))
         .route("/api/chats", get(list_chat_sessions_handler))
         .route(
@@ -194,7 +195,33 @@ pub async fn add_actuator_handler(
     let name = actuator.name.clone();
 
     let mut runtime = state.runtime.lock().await;
-    runtime.add_actuator(actuator);
+    runtime
+        .register_actuator(actuator)
+        .map_err(|error| bad_request(error.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MutationResponse {
+            status: "ok".to_string(),
+            name,
+        }),
+    ))
+}
+
+/// Imports a plugin package from disk and registers declared sensors/actuators.
+pub async fn import_plugin_handler(
+    State(state): State<AppState>,
+    Json(request): Json<PluginImportRequest>,
+) -> Result<(StatusCode, Json<MutationResponse>), (StatusCode, Json<ApiError>)> {
+    let mut runtime = state.runtime.lock().await;
+    let name = runtime
+        .import_plugin_package(request.path)
+        .map_err(|error| bad_request(error.to_string()))?;
+    drop(runtime);
+
+    sync_directory_watchers(&state)
+        .await
+        .map_err(|error| internal_error(error.to_string()))?;
 
     Ok((
         StatusCode::CREATED,
@@ -253,6 +280,12 @@ pub async fn add_sensor_percept_handler(
         SensorIngressConfig::Directory { .. } => {
             return Err(bad_request(format!(
                 "sensor '{}' receives percepts from directory watcher",
+                sensor.name
+            )));
+        }
+        SensorIngressConfig::Plugin(_) => {
+            return Err(bad_request(format!(
+                "sensor '{}' receives percepts from plugin polling",
                 sensor.name
             )));
         }
@@ -1035,6 +1068,11 @@ struct WsUpdateActuatorParams {
     action_plural_name: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct WsImportPluginParams {
+    path: String,
+}
+
 /// Upgrades to a websocket session for realtime bidirectional updates.
 pub async fn websocket_handler(
     ws: WebSocketUpgrade,
@@ -1284,6 +1322,20 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
                         action_plural_name: payload.action_plural_name,
                     },
                 )
+                .map_err(|error| error.to_string())?;
+            Ok(serde_json::json!({ "status": "ok" }))
+        }
+        "import_plugin" => {
+            let payload: WsImportPluginParams =
+                serde_json::from_value(params).map_err(|error| error.to_string())?;
+            {
+                let mut runtime = state.runtime.lock().await;
+                runtime
+                    .import_plugin_package(payload.path)
+                    .map_err(|error| error.to_string())?;
+            }
+            sync_directory_watchers(state)
+                .await
                 .map_err(|error| error.to_string())?;
             Ok(serde_json::json!({ "status": "ok" }))
         }
@@ -2121,6 +2173,7 @@ fn actuator_status(actuator: Actuator) -> ActuatorStatus {
         ActuatorType::Internal(_) => "internal",
         ActuatorType::Mcp(_) => "mcp",
         ActuatorType::Workflow(_) => "workflow",
+        ActuatorType::Plugin(_) => "plugin",
     }
     .to_string();
 

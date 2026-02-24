@@ -23,6 +23,168 @@ pub enum SensorIngressConfig {
     Directory { path: String },
     /// Sensor receives percepts via the HTTP API.
     RestApi { format: SensorRestFormat },
+    /// Sensor receives percepts from an external plugin package.
+    Plugin(PluginSensorIngress),
+}
+
+/// Deno permission profile used for plugin execution.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DenoPermissions {
+    /// Allowed read paths.
+    #[serde(default)]
+    pub read: Vec<String>,
+    /// Allowed write paths.
+    #[serde(default)]
+    pub write: Vec<String>,
+    /// Allowed network hosts.
+    #[serde(default)]
+    pub net: Vec<String>,
+    /// Allowed environment variable names.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Allowed executable names for subprocess launches.
+    #[serde(default)]
+    pub run: Vec<String>,
+}
+
+/// Plugin-backed sensor ingress metadata.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginSensorIngress {
+    /// Plugin package name.
+    pub plugin: String,
+    /// Absolute plugin root directory.
+    pub root: String,
+    /// Relative entry file path from plugin root.
+    pub entry: String,
+    /// Plugin sensor identifier.
+    pub sensor: String,
+    /// Deno permission profile for sensor polling.
+    #[serde(default)]
+    pub permissions: DenoPermissions,
+}
+
+impl PluginSensorIngress {
+    /// Validates plugin ingress metadata.
+    pub fn validate(&self) -> Result<()> {
+        if self.plugin.trim().is_empty() {
+            return Err(anyhow!("plugin sensor ingress.plugin cannot be empty"));
+        }
+        if self.root.trim().is_empty() {
+            return Err(anyhow!("plugin sensor ingress.root cannot be empty"));
+        }
+        if self.entry.trim().is_empty() {
+            return Err(anyhow!("plugin sensor ingress.entry cannot be empty"));
+        }
+        if self.sensor.trim().is_empty() {
+            return Err(anyhow!("plugin sensor ingress.sensor cannot be empty"));
+        }
+        Ok(())
+    }
+}
+
+/// Plugin sensor declaration in a package manifest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginSensorDefinition {
+    /// Sensor identifier used within the plugin package.
+    pub name: String,
+    /// Human-readable sensor description.
+    pub description: String,
+}
+
+/// Plugin actuator declaration in a package manifest.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginActuatorDefinition {
+    /// Actuator identifier used within the plugin package.
+    pub name: String,
+    /// Human-readable actuator description.
+    pub description: String,
+}
+
+/// Plugin package manifest format.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginManifest {
+    /// Package name.
+    pub name: String,
+    /// Package version.
+    pub version: String,
+    /// Relative entry file path from package root.
+    pub entry: String,
+    /// Sensors exported by the package.
+    #[serde(default)]
+    pub sensors: Vec<PluginSensorDefinition>,
+    /// Actuators exported by the package.
+    #[serde(default)]
+    pub actuators: Vec<PluginActuatorDefinition>,
+    /// Deno permission profile for all package calls.
+    #[serde(default)]
+    pub permissions: DenoPermissions,
+}
+
+impl PluginManifest {
+    /// Validates manifest invariants.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(anyhow!("plugin manifest name cannot be empty"));
+        }
+        if self.version.trim().is_empty() {
+            return Err(anyhow!("plugin manifest version cannot be empty"));
+        }
+        if self.entry.trim().is_empty() {
+            return Err(anyhow!("plugin manifest entry cannot be empty"));
+        }
+        for sensor in &self.sensors {
+            if sensor.name.trim().is_empty() {
+                return Err(anyhow!("plugin sensor name cannot be empty"));
+            }
+            if sensor.description.trim().is_empty() {
+                return Err(anyhow!("plugin sensor description cannot be empty"));
+            }
+        }
+        for actuator in &self.actuators {
+            if actuator.name.trim().is_empty() {
+                return Err(anyhow!("plugin actuator name cannot be empty"));
+            }
+            if actuator.description.trim().is_empty() {
+                return Err(anyhow!("plugin actuator description cannot be empty"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Plugin actuator execution details.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginActuatorDetails {
+    /// Plugin package name.
+    pub plugin: String,
+    /// Absolute plugin root directory.
+    pub root: String,
+    /// Relative entry file path from plugin root.
+    pub entry: String,
+    /// Plugin actuator identifier.
+    pub actuator: String,
+    /// Deno permission profile for actuator execution.
+    #[serde(default)]
+    pub permissions: DenoPermissions,
+}
+
+impl PluginActuatorDetails {
+    /// Validates plugin actuator details.
+    pub fn validate(&self) -> Result<()> {
+        if self.plugin.trim().is_empty() {
+            return Err(anyhow!("plugin details.plugin cannot be empty"));
+        }
+        if self.root.trim().is_empty() {
+            return Err(anyhow!("plugin details.root cannot be empty"));
+        }
+        if self.entry.trim().is_empty() {
+            return Err(anyhow!("plugin details.entry cannot be empty"));
+        }
+        if self.actuator.trim().is_empty() {
+            return Err(anyhow!("plugin details.actuator cannot be empty"));
+        }
+        Ok(())
+    }
 }
 
 /// Supported model providers for Looper configuration.
@@ -364,6 +526,8 @@ pub enum ActuatorType {
     Mcp(McpDetails),
     /// Agentic workflow actuator.
     Workflow(WorkflowDetails),
+    /// External plugin actuator executed through Deno.
+    Plugin(PluginActuatorDetails),
 }
 
 /// Executor for performing actions.
@@ -458,6 +622,33 @@ impl Actuator {
             name,
             description: description.into(),
             kind: ActuatorType::Workflow(details),
+            policy,
+            action_singular_name: singular,
+            action_plural_name: plural,
+        })
+    }
+
+    /// Creates a plugin actuator.
+    pub fn plugin(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        details: PluginActuatorDetails,
+        policy: SafetyPolicy,
+    ) -> Result<Self> {
+        policy.validate()?;
+        details.validate()?;
+        let name = name.into();
+        let singular = name.trim().to_lowercase();
+        let plural = if singular.ends_with('s') {
+            singular.clone()
+        } else {
+            format!("{singular}s")
+        };
+
+        Ok(Self {
+            name,
+            description: description.into(),
+            kind: ActuatorType::Plugin(details),
             policy,
             action_singular_name: singular,
             action_plural_name: plural,

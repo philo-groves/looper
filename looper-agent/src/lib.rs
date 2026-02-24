@@ -8,17 +8,20 @@ pub mod models;
 pub mod runtime;
 pub mod storage;
 
-pub use dto::{ActuatorCreateRequest, ActuatorRegistrationType, SensorCreateRequest};
+pub use dto::{
+    ActuatorCreateRequest, ActuatorRegistrationType, PluginImportRequest, SensorCreateRequest,
+};
 pub use executors::{
     ActuatorExecutor, ChatActuatorExecutor, GlobActuatorExecutor, GrepActuatorExecutor,
     ShellActuatorExecutor, WebSearchActuatorExecutor,
 };
 pub use http::{AppState, auto_start_loop_if_configured, build_router, initialize_sensor_ingress};
 pub use model::{
-    Action, Actuator, ActuatorType, AgentState, ExecutionResult, InternalActuatorKind,
-    McpConnectionType, McpDetails, ModelProviderKind, ModelSelection, PendingApproval, Percept,
-    RateLimit, RateLimitPeriod, RecommendedAction, SafetyPolicy, Sensor, SensorIngressConfig,
-    SensorRestFormat, WorkflowDetails,
+    Action, Actuator, ActuatorType, AgentState, DenoPermissions, ExecutionResult,
+    InternalActuatorKind, McpConnectionType, McpDetails, ModelProviderKind, ModelSelection,
+    PendingApproval, Percept, PluginActuatorDefinition, PluginActuatorDetails, PluginManifest,
+    PluginSensorDefinition, PluginSensorIngress, RateLimit, RateLimitPeriod, RecommendedAction,
+    SafetyPolicy, Sensor, SensorIngressConfig, SensorRestFormat, WorkflowDetails,
 };
 pub use models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,

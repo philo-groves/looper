@@ -1,0 +1,29 @@
+{
+  "name": "git_commit_guard",
+  "version": "0.1.0",
+  "entry": "mod.ts",
+  "permissions": {
+    "read": [
+      "."
+    ],
+    "run": [
+      "git",
+      "powershell",
+      "msg",
+      "osascript",
+      "notify-send"
+    ]
+  },
+  "sensors": [
+    {
+      "name": "git_commits",
+      "description": "Watches recent local git commits and reports risky file additions"
+    }
+  ],
+  "actuators": [
+    {
+      "name": "desktop_notify_secrets",
+      "description": "Sends desktop notifications when commits include .env or likely secrets"
+    }
+  ]
+}

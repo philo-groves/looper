@@ -2,8 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{
-    Actuator, McpDetails, SafetyPolicy, Sensor, SensorIngressConfig, SensorRestFormat,
-    WorkflowDetails,
+    Actuator, McpDetails, PluginActuatorDetails, SafetyPolicy, Sensor, SensorIngressConfig,
+    SensorRestFormat, WorkflowDetails,
 };
 
 /// Sensor ingress options accepted by REST API.
@@ -62,6 +62,8 @@ pub enum ActuatorRegistrationType {
     Mcp,
     /// Agentic workflow registration.
     Workflow,
+    /// Plugin actuator registration.
+    Plugin,
 }
 
 /// Top-level API request body for creating an actuator.
@@ -95,8 +97,19 @@ impl ActuatorCreateRequest {
                 let details: WorkflowDetails = serde_json::from_value(self.details)?;
                 Actuator::workflow(self.name, self.description, details, self.policy)
             }
+            ActuatorRegistrationType::Plugin => {
+                let details: PluginActuatorDetails = serde_json::from_value(self.details)?;
+                Actuator::plugin(self.name, self.description, details, self.policy)
+            }
         }
     }
+}
+
+/// API request body for importing a plugin package.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginImportRequest {
+    /// Directory containing `looper-plugin.json`.
+    pub path: String,
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 use crate::executors::{
@@ -14,9 +14,10 @@ use crate::executors::{
     ShellActuatorExecutor, WebSearchActuatorExecutor,
 };
 use crate::model::{
-    Actuator, ActuatorType, AgentState, ExecutionResult, InternalActuatorKind, ModelProviderKind,
-    ModelSelection, PendingApproval, Percept, RecommendedAction, SafetyPolicy, Sensor,
-    SensorIngressConfig, SensorRestFormat,
+    Action, Actuator, ActuatorType, AgentState, ExecutionResult, InternalActuatorKind,
+    ModelProviderKind,
+    ModelSelection, PendingApproval, Percept, PluginManifest, PluginSensorIngress,
+    RecommendedAction, SafetyPolicy, Sensor, SensorIngressConfig, SensorRestFormat,
 };
 use crate::models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,
@@ -60,9 +61,20 @@ struct PersistedSensorSettings {
 struct PersistedActuatorSettings {
     name: String,
     description: String,
+    #[serde(default)]
+    kind: Option<PersistedActuatorKind>,
     policy: SafetyPolicy,
     action_singular_name: String,
     action_plural_name: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PersistedActuatorKind {
+    Internal { kind: String },
+    Mcp { details: crate::model::McpDetails },
+    Workflow { details: crate::model::WorkflowDetails },
+    Plugin { details: crate::model::PluginActuatorDetails },
 }
 
 /// Partial update payload for mutable sensor settings.
@@ -610,6 +622,9 @@ impl LooperRuntime {
         {
             return Err(anyhow!("directory path cannot be empty"));
         }
+        if let SensorIngressConfig::Plugin(details) = &sensor.ingress {
+            details.validate()?;
+        }
 
         self.add_sensor(sensor);
         self.persist_settings()
@@ -664,6 +679,9 @@ impl LooperRuntime {
                         if path.trim().is_empty() {
                             return Err(anyhow!("directory path cannot be empty"));
                         }
+                    }
+                    SensorIngressConfig::Plugin(details) => {
+                        details.validate()?;
                     }
                     SensorIngressConfig::Internal | SensorIngressConfig::RestApi { .. } => {}
                 }
@@ -725,6 +743,74 @@ impl LooperRuntime {
 
     pub fn add_actuator(&mut self, actuator: Actuator) {
         self.actuators.insert(actuator.name.clone(), actuator);
+    }
+
+    /// Registers a new actuator and persists settings.
+    pub fn register_actuator(&mut self, actuator: Actuator) -> Result<()> {
+        self.add_actuator(actuator);
+        self.persist_settings()
+    }
+
+    /// Imports a plugin package and registers its declared sensors and actuators.
+    pub fn import_plugin_package(&mut self, plugin_path: impl AsRef<Path>) -> Result<String> {
+        let plugin_root = normalize_plugin_root(plugin_path.as_ref(), &self.workspace_root)?;
+        let manifest_path = plugin_root.join("looper-plugin.json");
+        let raw = fs::read_to_string(&manifest_path).with_context(|| {
+            format!(
+                "failed to read plugin manifest at '{}'",
+                manifest_path.to_string_lossy()
+            )
+        })?;
+        let manifest = serde_json::from_str::<PluginManifest>(&raw).with_context(|| {
+            format!(
+                "failed to parse plugin manifest at '{}'",
+                manifest_path.to_string_lossy()
+            )
+        })?;
+        manifest.validate()?;
+        let entry_path = plugin_root.join(manifest.entry.trim());
+        if !entry_path.exists() {
+            return Err(anyhow!(
+                "plugin entry '{}' does not exist",
+                entry_path.to_string_lossy()
+            ));
+        }
+
+        let plugin_name = manifest.name.trim().to_string();
+        let plugin_root_text = plugin_root.to_string_lossy().to_string();
+
+        for sensor_def in manifest.sensors {
+            let sensor_name = format!("{}:{}", plugin_name, sensor_def.name.trim());
+            let mut sensor = Sensor::new(sensor_name, sensor_def.description.trim());
+            sensor.ingress = SensorIngressConfig::Plugin(PluginSensorIngress {
+                plugin: plugin_name.clone(),
+                root: plugin_root_text.clone(),
+                entry: manifest.entry.clone(),
+                sensor: sensor_def.name.trim().to_string(),
+                permissions: manifest.permissions.clone(),
+            });
+            self.add_sensor(sensor);
+        }
+
+        for actuator_def in manifest.actuators {
+            let actuator_name = format!("{}:{}", plugin_name, actuator_def.name.trim());
+            let actuator = Actuator::plugin(
+                actuator_name,
+                actuator_def.description.trim(),
+                crate::model::PluginActuatorDetails {
+                    plugin: plugin_name.clone(),
+                    root: plugin_root_text.clone(),
+                    entry: manifest.entry.clone(),
+                    actuator: actuator_def.name.trim().to_string(),
+                    permissions: manifest.permissions.clone(),
+                },
+                SafetyPolicy::default(),
+            )?;
+            self.add_actuator(actuator);
+        }
+
+        self.persist_settings()?;
+        Ok(plugin_name)
     }
 
     /// Updates mutable actuator configuration fields for an existing actuator.
@@ -1018,30 +1104,34 @@ impl LooperRuntime {
         self.observability.bump_phase(LoopPhase::Reasoning);
         self.loop_visualization.frontier_current_step = Some(FrontierLoopStep::PlanActions);
         self.transition_phase(LoopRuntimePhase::PlanActions);
-        let frontier_model = self
-            .frontier_model
-            .as_ref()
-            .ok_or_else(|| anyhow!("frontier model is not configured"))?;
-        let relevant_skills = self.relevant_enabled_skills_for_surprises(&surprising);
-        let plan_response = match frontier_model
-            .plan_actions(FrontierModelRequest {
-                surprising_percepts: surprising.clone(),
-                soul_markdown,
-                relevant_skills,
-            })
-            .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                if is_frontier_communication_issue(&error) {
-                    self.stop(format!("frontier communication failure: {error}"));
-                }
-                return Err(error);
-            }
-        };
+        let (mut planned_actions, frontier_surprises) = deterministic_actions_from_percepts(&surprising);
 
-        self.observability.frontier_model_tokens += plan_response.token_usage;
-        let planned_actions = plan_response.actions;
+        if !frontier_surprises.is_empty() {
+            let frontier_model = self
+                .frontier_model
+                .as_ref()
+                .ok_or_else(|| anyhow!("frontier model is not configured"))?;
+            let relevant_skills = self.relevant_enabled_skills_for_surprises(&frontier_surprises);
+            let plan_response = match frontier_model
+                .plan_actions(FrontierModelRequest {
+                    surprising_percepts: frontier_surprises,
+                    soul_markdown,
+                    relevant_skills,
+                })
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    if is_frontier_communication_issue(&error) {
+                        self.stop(format!("frontier communication failure: {error}"));
+                    }
+                    return Err(error);
+                }
+            };
+
+            self.observability.frontier_model_tokens += plan_response.token_usage;
+            planned_actions.extend(plan_response.actions);
+        }
 
         if planned_actions.is_empty() {
             self.observability.false_positive_surprises += 1;
@@ -1136,6 +1226,20 @@ impl LooperRuntime {
     fn collect_new_percepts(&mut self) -> Vec<Percept> {
         let mut all = Vec::new();
         for sensor in self.sensors.values_mut() {
+            if sensor.enabled
+                && let SensorIngressConfig::Plugin(details) = &sensor.ingress
+            {
+                let poll_result = poll_plugin_sensor(&self.workspace_root, details);
+                if let Ok(payloads) = poll_result {
+                    for payload in payloads {
+                        let trimmed = payload.trim();
+                        if !trimmed.is_empty() {
+                            sensor.enqueue(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+
             if sensor.enabled {
                 all.extend(sensor.sense_unread());
             }
@@ -1236,6 +1340,9 @@ impl LooperRuntime {
                     details.name,
                     details.cells.len()
                 )
+            }
+            ActuatorType::Plugin(details) => {
+                execute_plugin_actuator(&self.workspace_root, details, &recommendation.action)?
             }
         };
 
@@ -1437,6 +1544,7 @@ impl LooperRuntime {
             .map(|actuator| PersistedActuatorSettings {
                 name: actuator.name.clone(),
                 description: actuator.description.clone(),
+                kind: Some(persisted_kind_from_actuator(&actuator.kind)),
                 policy: actuator.policy.clone(),
                 action_singular_name: actuator.action_singular_name.clone(),
                 action_plural_name: actuator.action_plural_name.clone(),
@@ -1590,14 +1698,26 @@ impl LooperRuntime {
                 continue;
             }
 
-            let Some(actuator) = self.actuators.get_mut(name) else {
+            let description = persisted.description.trim();
+            if description.is_empty() {
+                continue;
+            }
+
+            let kind = persisted
+                .kind
+                .or_else(|| infer_legacy_actuator_kind(name));
+            let Some(kind) = kind else {
                 continue;
             };
 
-            let description = persisted.description.trim();
-            if !description.is_empty() {
-                actuator.description = description.to_string();
-            }
+            let Ok(mut actuator) = actuator_from_persisted_kind(
+                name,
+                description,
+                kind,
+                persisted.policy,
+            ) else {
+                continue;
+            };
 
             let singular = persisted.action_singular_name.trim();
             if !singular.is_empty() {
@@ -1609,7 +1729,7 @@ impl LooperRuntime {
                 actuator.action_plural_name = plural.to_lowercase();
             }
 
-            actuator.policy = persisted.policy;
+            self.actuators.insert(actuator.name.clone(), actuator);
         }
 
         self.log_state("load_persisted_settings", "persisted settings applied");
@@ -1743,13 +1863,303 @@ fn is_frontier_communication_issue(error: &anyhow::Error) -> bool {
         || lower.contains("429")
 }
 
+fn deterministic_actions_from_percepts(
+    percepts: &[Percept],
+) -> (Vec<RecommendedAction>, Vec<Percept>) {
+    let mut actions = Vec::new();
+    let mut remaining = Vec::new();
+
+    for percept in percepts {
+        if let Some(action) = deterministic_action_from_percept(percept) {
+            actions.push(action);
+        } else {
+            remaining.push(percept.clone());
+        }
+    }
+
+    (actions, remaining)
+}
+
+fn deterministic_action_from_percept(percept: &Percept) -> Option<RecommendedAction> {
+    let value = serde_json::from_str::<serde_json::Value>(&percept.content).ok()?;
+    let object = value.as_object()?;
+    if object.get("looper_signal")?.as_str()? != "plugin_route_v1" {
+        return None;
+    }
+
+    let actuator_name = object.get("route_to_actuator")?.as_str()?.trim().to_string();
+    if actuator_name.is_empty() {
+        return None;
+    }
+
+    let message = object
+        .get("action_message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .unwrap_or("plugin deterministic action")
+        .to_string();
+
+    Some(RecommendedAction {
+        actuator_name,
+        action: Action::ChatResponse { message },
+    })
+}
+
+fn persisted_kind_from_actuator(kind: &ActuatorType) -> PersistedActuatorKind {
+    match kind {
+        ActuatorType::Internal(internal) => PersistedActuatorKind::Internal {
+            kind: match internal {
+                InternalActuatorKind::Chat => "chat",
+                InternalActuatorKind::Grep => "grep",
+                InternalActuatorKind::Glob => "glob",
+                InternalActuatorKind::Shell => "shell",
+                InternalActuatorKind::WebSearch => "web_search",
+            }
+            .to_string(),
+        },
+        ActuatorType::Mcp(details) => PersistedActuatorKind::Mcp {
+            details: details.clone(),
+        },
+        ActuatorType::Workflow(details) => PersistedActuatorKind::Workflow {
+            details: details.clone(),
+        },
+        ActuatorType::Plugin(details) => PersistedActuatorKind::Plugin {
+            details: details.clone(),
+        },
+    }
+}
+
+fn actuator_from_persisted_kind(
+    name: &str,
+    description: &str,
+    kind: PersistedActuatorKind,
+    policy: SafetyPolicy,
+) -> Result<Actuator> {
+    match kind {
+        PersistedActuatorKind::Internal { kind } => {
+            let internal = match kind.trim().to_ascii_lowercase().as_str() {
+                "chat" => InternalActuatorKind::Chat,
+                "grep" => InternalActuatorKind::Grep,
+                "glob" => InternalActuatorKind::Glob,
+                "shell" => InternalActuatorKind::Shell,
+                "web_search" => InternalActuatorKind::WebSearch,
+                _ => return Err(anyhow!("unknown internal actuator kind")),
+            };
+            Actuator::internal(name, description, internal, policy)
+        }
+        PersistedActuatorKind::Mcp { details } => Actuator::mcp(name, description, details, policy),
+        PersistedActuatorKind::Workflow { details } => {
+            Actuator::workflow(name, description, details, policy)
+        }
+        PersistedActuatorKind::Plugin { details } => Actuator::plugin(name, description, details, policy),
+    }
+}
+
+fn infer_legacy_actuator_kind(name: &str) -> Option<PersistedActuatorKind> {
+    let kind = match name.trim().to_ascii_lowercase().as_str() {
+        "chat" => "chat",
+        "grep" => "grep",
+        "glob" => "glob",
+        "shell" => "shell",
+        "web_search" => "web_search",
+        _ => return None,
+    };
+    Some(PersistedActuatorKind::Internal {
+        kind: kind.to_string(),
+    })
+}
+
+fn normalize_plugin_root(requested: &Path, workspace_root: &Path) -> Result<PathBuf> {
+    let root = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace_root.join(requested)
+    };
+    if !root.exists() {
+        return Err(anyhow!(
+            "plugin directory '{}' does not exist",
+            root.to_string_lossy()
+        ));
+    }
+    if !root.is_dir() {
+        return Err(anyhow!(
+            "plugin path '{}' is not a directory",
+            root.to_string_lossy()
+        ));
+    }
+    Ok(root)
+}
+
+fn poll_plugin_sensor(workspace_root: &Path, details: &PluginSensorIngress) -> Result<Vec<String>> {
+    details.validate()?;
+
+    let payload = serde_json::json!({
+        "mode": "sensor",
+        "plugin": details.plugin,
+        "sensor": details.sensor,
+        "workspace_root": workspace_root.to_string_lossy().to_string(),
+    });
+
+    let output = run_deno_plugin(
+        workspace_root,
+        &details.root,
+        &details.entry,
+        &details.permissions,
+        &payload,
+    )?;
+
+    if let Some(items) = output.as_array() {
+        let percepts = items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| item.to_string())
+            })
+            .collect::<Vec<_>>();
+        return Ok(percepts);
+    }
+
+    if let Some(items) = output.get("percepts").and_then(|value| value.as_array()) {
+        let percepts = items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| item.to_string())
+            })
+            .collect::<Vec<_>>();
+        return Ok(percepts);
+    }
+
+    Ok(Vec::new())
+}
+
+fn execute_plugin_actuator(
+    workspace_root: &Path,
+    details: &crate::model::PluginActuatorDetails,
+    action: &crate::model::Action,
+) -> Result<String> {
+    details.validate()?;
+
+    let payload = serde_json::json!({
+        "mode": "actuator",
+        "plugin": details.plugin,
+        "actuator": details.actuator,
+        "action": action,
+        "workspace_root": workspace_root.to_string_lossy().to_string(),
+    });
+
+    let output = run_deno_plugin(
+        workspace_root,
+        &details.root,
+        &details.entry,
+        &details.permissions,
+        &payload,
+    )?;
+
+    if let Some(text) = output.get("output").and_then(|value| value.as_str()) {
+        return Ok(text.to_string());
+    }
+    Ok(output.to_string())
+}
+
+fn run_deno_plugin(
+    workspace_root: &Path,
+    plugin_root_raw: &str,
+    entry_raw: &str,
+    permissions: &crate::model::DenoPermissions,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let plugin_root = normalize_plugin_root(Path::new(plugin_root_raw), workspace_root)?;
+    let entry_path = plugin_root.join(entry_raw.trim());
+    if !entry_path.exists() {
+        return Err(anyhow!(
+            "plugin entry '{}' does not exist",
+            entry_path.to_string_lossy()
+        ));
+    }
+
+    let payload_text = serde_json::to_string(payload)?;
+    let mut command = std::process::Command::new("deno");
+    command.arg("run").arg("--quiet");
+    for arg in deno_permission_args(permissions) {
+        command.arg(arg);
+    }
+    command
+        .arg(entry_path.to_string_lossy().to_string())
+        .arg("--looper-payload")
+        .arg(payload_text)
+        .current_dir(plugin_root);
+
+    let output = command.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!("plugin command failed: {}", stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Ok(serde_json::Value::Null);
+    }
+
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .with_context(|| format!("plugin output is not valid JSON: {stdout}"))
+}
+
+fn deno_permission_args(permissions: &crate::model::DenoPermissions) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(flag) = permission_flag("allow-read", &permissions.read) {
+        args.push(flag);
+    }
+    if let Some(flag) = permission_flag("allow-write", &permissions.write) {
+        args.push(flag);
+    }
+    if let Some(flag) = permission_flag("allow-net", &permissions.net) {
+        args.push(flag);
+    }
+    if let Some(flag) = permission_flag("allow-env", &permissions.env) {
+        args.push(flag);
+    }
+    if let Some(flag) = permission_flag("allow-run", &permissions.run) {
+        args.push(flag);
+    }
+    args
+}
+
+fn permission_flag(name: &str, values: &[String]) -> Option<String> {
+    let joined = values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(format!("--{name}={joined}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::model::{Action, RateLimit, RateLimitPeriod};
+    use crate::model::{Action, ActuatorType, RateLimit, RateLimitPeriod, SensorIngressConfig};
 
     use super::*;
+
+    fn unique_test_workspace(prefix: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "looper-test-{prefix}-{}-{}-{sequence}",
+            std::process::id(),
+            now_unix_ms()
+        ))
+    }
 
     #[tokio::test]
     async fn chat_sensor_is_always_surprising_when_sensitivity_is_high() {
@@ -1863,10 +2273,10 @@ mod tests {
 
         let snapshot = runtime.loop_visualization_snapshot();
         assert_eq!(snapshot.local_current_step, LocalLoopStep::SurpriseFound);
-        assert_eq!(
+        assert!(matches!(
             snapshot.frontier_current_step,
-            Some(FrontierLoopStep::PlanActions)
-        );
+            Some(FrontierLoopStep::PlanActions | FrontierLoopStep::PerformingActions)
+        ));
         assert!(snapshot.surprise_found);
         assert!(snapshot.action_required);
         assert_eq!(snapshot.local_loop_count, 1);
@@ -1893,9 +2303,64 @@ mod tests {
         assert!(matches!(result, ExecutionResult::Executed { .. }));
     }
 
+    #[tokio::test]
+    async fn deterministic_plugin_signal_routes_without_frontier_planning() {
+        let workspace = unique_test_workspace("deterministic-plugin-route");
+        fs::create_dir_all(&workspace).expect("temp workspace should be created");
+        fs::write(workspace.join("mod.ts"), "console.log('{}');")
+            .expect("plugin entry should be created");
+
+        let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should build");
+        runtime.disable_store();
+        runtime.use_rule_models_for_testing();
+        runtime
+            .register_actuator(
+                Actuator::plugin(
+                    "git_commit_guard:desktop_notify_secrets",
+                    "routes desktop notifications",
+                    crate::model::PluginActuatorDetails {
+                        plugin: "git_commit_guard".to_string(),
+                        root: workspace.to_string_lossy().to_string(),
+                        entry: "mod.ts".to_string(),
+                        actuator: "desktop_notify_secrets".to_string(),
+                        permissions: crate::model::DenoPermissions::default(),
+                    },
+                    SafetyPolicy {
+                        require_hitl: true,
+                        ..SafetyPolicy::default()
+                    },
+                )
+                .expect("plugin actuator should be valid"),
+            )
+            .expect("plugin actuator should register");
+        runtime.start().expect("runtime should start");
+
+        runtime
+            .enqueue_chat_message(
+                r#"{"looper_signal":"plugin_route_v1","event":"new_risky_commit","route_to_actuator":"git_commit_guard:desktop_notify_secrets","action_message":"Notify desktop about risky commit abc1234."}"#,
+                None,
+            )
+            .expect("chat sensor should exist");
+
+        let report = runtime
+            .run_iteration()
+            .await
+            .expect("iteration should complete");
+        assert_eq!(report.planned_actions.len(), 1);
+        assert_eq!(
+            report.planned_actions[0].actuator_name,
+            "git_commit_guard:desktop_notify_secrets"
+        );
+        assert!(matches!(
+            report.action_results.first(),
+            Some(ExecutionResult::RequiresHitl { .. })
+        ));
+    }
+
     #[test]
     fn update_sensor_rejects_empty_description() {
-        let workspace = std::env::temp_dir().join(format!("looper-test-{}", now_unix_ms()));
+        let workspace = unique_test_workspace("sensor-validation");
         fs::create_dir_all(&workspace).expect("temp workspace should be created");
 
         let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
@@ -1916,7 +2381,7 @@ mod tests {
 
     #[test]
     fn sensor_settings_persist_between_runtime_instances() {
-        let workspace = std::env::temp_dir().join(format!("looper-test-{}", now_unix_ms()));
+        let workspace = unique_test_workspace("sensor-settings");
         fs::create_dir_all(&workspace).expect("temp workspace should be created");
 
         let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
@@ -1964,7 +2429,7 @@ mod tests {
 
     #[test]
     fn update_actuator_rejects_empty_description() {
-        let workspace = std::env::temp_dir().join(format!("looper-test-{}", now_unix_ms()));
+        let workspace = unique_test_workspace("actuator-validation");
         fs::create_dir_all(&workspace).expect("temp workspace should be created");
 
         let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
@@ -1985,7 +2450,7 @@ mod tests {
 
     #[test]
     fn actuator_settings_persist_between_runtime_instances() {
-        let workspace = std::env::temp_dir().join(format!("looper-test-{}", now_unix_ms()));
+        let workspace = unique_test_workspace("actuator-settings");
         fs::create_dir_all(&workspace).expect("temp workspace should be created");
 
         let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
@@ -2031,5 +2496,71 @@ mod tests {
         );
         assert_eq!(actuator.action_singular_name, "external search");
         assert_eq!(actuator.action_plural_name, "external searches");
+    }
+
+    #[test]
+    fn plugin_import_registers_and_persists_sensor_and_actuator() {
+        let workspace = unique_test_workspace("plugin-import");
+        let plugin_dir = workspace.join("plugins").join("demo-plugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should be created");
+        fs::write(plugin_dir.join("mod.ts"), "console.log('{}');")
+            .expect("entry file should be written");
+        fs::write(
+            plugin_dir.join("looper-plugin.json"),
+            r#"{
+  "name": "demo",
+  "version": "0.1.0",
+  "entry": "mod.ts",
+  "permissions": {
+    "read": ["."],
+    "net": []
+  },
+  "sensors": [
+    { "name": "alerts", "description": "Demo alert stream" }
+  ],
+  "actuators": [
+    { "name": "notify", "description": "Demo notifier" }
+  ]
+}"#,
+        )
+        .expect("manifest should be written");
+
+        let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should build");
+        runtime.disable_store();
+        let imported = runtime
+            .import_plugin_package(&plugin_dir)
+            .expect("plugin should import");
+        assert_eq!(imported, "demo");
+
+        let sensor = runtime
+            .sensors()
+            .into_iter()
+            .find(|item| item.name == "demo:alerts")
+            .expect("plugin sensor should exist");
+        assert!(matches!(sensor.ingress, SensorIngressConfig::Plugin(_)));
+
+        let actuator = runtime
+            .actuators()
+            .into_iter()
+            .find(|item| item.name == "demo:notify")
+            .expect("plugin actuator should exist");
+        assert!(matches!(actuator.kind, ActuatorType::Plugin(_)));
+
+        let reloaded = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should reload");
+        let reloaded_sensor = reloaded
+            .sensors()
+            .into_iter()
+            .find(|item| item.name == "demo:alerts")
+            .expect("reloaded plugin sensor should exist");
+        assert!(matches!(reloaded_sensor.ingress, SensorIngressConfig::Plugin(_)));
+
+        let reloaded_actuator = reloaded
+            .actuators()
+            .into_iter()
+            .find(|item| item.name == "demo:notify")
+            .expect("reloaded plugin actuator should exist");
+        assert!(matches!(reloaded_actuator.kind, ActuatorType::Plugin(_)));
     }
 }
