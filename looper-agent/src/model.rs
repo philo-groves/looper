@@ -24,7 +24,7 @@ pub enum SensorIngressConfig {
     /// Sensor receives percepts via the HTTP API.
     RestApi { format: SensorRestFormat },
     /// Sensor receives percepts from an external plugin package.
-    Plugin(PluginSensorIngress),
+    Plugin(Box<PluginSensorIngress>),
 }
 
 /// Deno permission profile used for plugin execution.
@@ -61,6 +61,9 @@ pub struct PluginSensorIngress {
     /// Deno permission profile for sensor polling.
     #[serde(default)]
     pub permissions: DenoPermissions,
+    /// Runtime requirements used to determine whether plugin is enabled.
+    #[serde(default)]
+    pub requirements: PluginRequirements,
 }
 
 impl PluginSensorIngress {
@@ -78,6 +81,7 @@ impl PluginSensorIngress {
         if self.sensor.trim().is_empty() {
             return Err(anyhow!("plugin sensor ingress.sensor cannot be empty"));
         }
+        self.requirements.validate()?;
         Ok(())
     }
 }
@@ -100,6 +104,56 @@ pub struct PluginActuatorDefinition {
     pub description: String,
 }
 
+/// Runtime requirements for enabling a plugin package.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginRequirements {
+    /// Commands that must all be available on PATH.
+    #[serde(default)]
+    pub command_all: Vec<String>,
+    /// At least one of these commands must be available on PATH.
+    #[serde(default)]
+    pub command_any: Vec<String>,
+    /// Environment variables that must be set and non-empty.
+    #[serde(default)]
+    pub env_all: Vec<String>,
+    /// Human-readable guidance shown when requirements are missing.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+impl PluginRequirements {
+    /// Validates requirement metadata.
+    pub fn validate(&self) -> Result<()> {
+        for command in &self.command_all {
+            if command.trim().is_empty() {
+                return Err(anyhow!(
+                    "plugin requirements.command_all cannot contain empty values"
+                ));
+            }
+        }
+        for command in &self.command_any {
+            if command.trim().is_empty() {
+                return Err(anyhow!(
+                    "plugin requirements.command_any cannot contain empty values"
+                ));
+            }
+        }
+        for env_key in &self.env_all {
+            if env_key.trim().is_empty() {
+                return Err(anyhow!(
+                    "plugin requirements.env_all cannot contain empty values"
+                ));
+            }
+        }
+        if let Some(message) = &self.message
+            && message.trim().is_empty()
+        {
+            return Err(anyhow!("plugin requirements.message cannot be empty"));
+        }
+        Ok(())
+    }
+}
+
 /// Plugin package manifest format.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PluginManifest {
@@ -118,6 +172,9 @@ pub struct PluginManifest {
     /// Deno permission profile for all package calls.
     #[serde(default)]
     pub permissions: DenoPermissions,
+    /// Runtime requirements used to auto-enable this plugin.
+    #[serde(default)]
+    pub requirements: PluginRequirements,
 }
 
 impl PluginManifest {
@@ -132,6 +189,7 @@ impl PluginManifest {
         if self.entry.trim().is_empty() {
             return Err(anyhow!("plugin manifest entry cannot be empty"));
         }
+        self.requirements.validate()?;
         for sensor in &self.sensors {
             if sensor.name.trim().is_empty() {
                 return Err(anyhow!("plugin sensor name cannot be empty"));
@@ -166,6 +224,9 @@ pub struct PluginActuatorDetails {
     /// Deno permission profile for actuator execution.
     #[serde(default)]
     pub permissions: DenoPermissions,
+    /// Runtime requirements used to determine whether plugin is enabled.
+    #[serde(default)]
+    pub requirements: PluginRequirements,
 }
 
 impl PluginActuatorDetails {
@@ -183,6 +244,7 @@ impl PluginActuatorDetails {
         if self.actuator.trim().is_empty() {
             return Err(anyhow!("plugin details.actuator cannot be empty"));
         }
+        self.requirements.validate()?;
         Ok(())
     }
 }
@@ -527,7 +589,7 @@ pub enum ActuatorType {
     /// Agentic workflow actuator.
     Workflow(WorkflowDetails),
     /// External plugin actuator executed through Deno.
-    Plugin(PluginActuatorDetails),
+    Plugin(Box<PluginActuatorDetails>),
 }
 
 /// Executor for performing actions.
@@ -648,7 +710,7 @@ impl Actuator {
         Ok(Self {
             name,
             description: description.into(),
-            kind: ActuatorType::Plugin(details),
+            kind: ActuatorType::Plugin(Box::new(details)),
             policy,
             action_singular_name: singular,
             action_plural_name: plural,

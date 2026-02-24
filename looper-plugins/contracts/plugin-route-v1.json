@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://looper.dev/contracts/plugin-route-v1.json",
+  "title": "Looper Plugin Route Signal v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "looper_signal",
+    "event",
+    "route_to_actuator"
+  ],
+  "properties": {
+    "looper_signal": {
+      "const": "plugin_route_v1"
+    },
+    "event": {
+      "type": "string",
+      "minLength": 1
+    },
+    "route_to_actuator": {
+      "type": "string",
+      "minLength": 1
+    },
+    "action_message": {
+      "type": "string"
+    }
+  }
+}

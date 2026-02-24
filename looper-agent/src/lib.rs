@@ -5,6 +5,7 @@ pub mod executors;
 pub mod http;
 pub mod model;
 pub mod models;
+mod plugin_contract;
 pub mod runtime;
 pub mod storage;
 
@@ -20,8 +21,9 @@ pub use model::{
     Action, Actuator, ActuatorType, AgentState, DenoPermissions, ExecutionResult,
     InternalActuatorKind, McpConnectionType, McpDetails, ModelProviderKind, ModelSelection,
     PendingApproval, Percept, PluginActuatorDefinition, PluginActuatorDetails, PluginManifest,
-    PluginSensorDefinition, PluginSensorIngress, RateLimit, RateLimitPeriod, RecommendedAction,
-    SafetyPolicy, Sensor, SensorIngressConfig, SensorRestFormat, WorkflowDetails,
+    PluginRequirements, PluginSensorDefinition, PluginSensorIngress, RateLimit, RateLimitPeriod,
+    RecommendedAction, SafetyPolicy, Sensor, SensorIngressConfig, SensorRestFormat,
+    WorkflowDetails,
 };
 pub use models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,
@@ -29,8 +31,8 @@ pub use models::{
     RuleBasedFrontierModel, RuleBasedLocalModel,
 };
 pub use runtime::{
-    FrontierLoopStep, IterationReport, LocalLoopStep, LoopPhase, LoopPhaseTransitionEvent,
-    LoopRuntimePhase, LoopVisualizationSnapshot, LooperRuntime, Observability,
-    ObservabilitySnapshot, default_agent_workspace_dir,
+    FrontierLoopStep, InternalPluginStatus, IterationReport, LocalLoopStep, LoopPhase,
+    LoopPhaseTransitionEvent, LoopRuntimePhase, LoopVisualizationSnapshot, LooperRuntime,
+    Observability, ObservabilitySnapshot, default_agent_workspace_dir,
 };
 pub use storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration, SqliteStore};

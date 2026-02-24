@@ -26,7 +26,8 @@ use crate::model::{
     RateLimit, SensorIngressConfig, SensorRestFormat,
 };
 use crate::runtime::{
-    ActuatorUpdate, LoopVisualizationSnapshot, LooperRuntime, ObservabilitySnapshot, SensorUpdate,
+    ActuatorUpdate, InternalPluginStatus, LoopVisualizationSnapshot, LooperRuntime,
+    ObservabilitySnapshot, SensorUpdate,
 };
 use crate::storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration};
 
@@ -112,6 +113,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/actuators", post(add_actuator_handler))
         .route("/api/plugins/import", post(import_plugin_handler))
+        .route(
+            "/api/plugins/{plugin_id}/enabled",
+            post(set_plugin_enabled_handler),
+        )
         .route("/api/percepts/chat", post(add_chat_percept_handler))
         .route("/api/chats", get(list_chat_sessions_handler))
         .route(
@@ -121,6 +126,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/config/keys", post(register_api_key_handler))
         .route("/api/config/models", post(configure_models_handler))
         .route("/api/metrics", get(metrics_handler))
+        .route("/api/plugins/status", get(plugin_status_handler))
         .route("/api/health", get(health_handler))
         .route("/api/loop/start", post(loop_start_handler))
         .route("/api/loop/stop", post(loop_stop_handler))
@@ -230,6 +236,21 @@ pub async fn import_plugin_handler(
             name,
         }),
     ))
+}
+
+/// Updates plugin enabled state.
+pub async fn set_plugin_enabled_handler(
+    State(state): State<AppState>,
+    Path(plugin_id): Path<String>,
+    Json(request): Json<PluginEnabledRequest>,
+) -> Result<Json<SimpleStatusResponse>, (StatusCode, Json<ApiError>)> {
+    let mut runtime = state.runtime.lock().await;
+    runtime
+        .set_plugin_enabled(&plugin_id, request.enabled)
+        .map_err(|error| bad_request(error.to_string()))?;
+    Ok(Json(SimpleStatusResponse {
+        status: "ok".to_string(),
+    }))
 }
 
 /// Ingests a chat percept.
@@ -396,6 +417,16 @@ pub async fn metrics_handler(
 ) -> Result<Json<ObservabilitySnapshot>, (StatusCode, Json<ApiError>)> {
     let runtime = state.runtime.lock().await;
     Ok(Json(runtime.observability_snapshot()))
+}
+
+/// Lists status for bundled internal plugins.
+pub async fn plugin_status_handler(
+    State(state): State<AppState>,
+) -> Result<Json<PluginStatusResponse>, (StatusCode, Json<ApiError>)> {
+    let runtime = state.runtime.lock().await;
+    Ok(Json(PluginStatusResponse {
+        plugins: runtime.internal_plugin_statuses(),
+    }))
 }
 
 /// Registers a provider API key.
@@ -741,6 +772,13 @@ pub struct ChatPerceptRequest {
     pub chat_id: Option<String>,
 }
 
+/// Request payload for enabling/disabling a plugin.
+#[derive(Clone, Debug, Deserialize)]
+pub struct PluginEnabledRequest {
+    /// Desired enabled state.
+    pub enabled: bool,
+}
+
 /// One skill file summary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SkillSummary {
@@ -987,6 +1025,13 @@ pub struct ApprovalDecisionResponse {
     pub execution_result: Option<ExecutionResult>,
 }
 
+/// Plugin status response payload.
+#[derive(Clone, Debug, Serialize)]
+pub struct PluginStatusResponse {
+    /// Bundled internal plugin statuses.
+    pub plugins: Vec<InternalPluginStatus>,
+}
+
 /// Error response payload.
 #[derive(Clone, Debug, Serialize)]
 pub struct ApiError {
@@ -1222,8 +1267,8 @@ async fn ws_handle_request(state: &AppState, method: &str, params: Value) -> Res
                     .interval_ms
                     .unwrap_or(configured_loop_interval_ms(state).await),
             )
-                .await
-                .map_err(|error| error.to_string())?;
+            .await
+            .map_err(|error| error.to_string())?;
             Ok(serde_json::to_value(status).map_err(|error| error.to_string())?)
         }
         "enqueue_chat_message" => {

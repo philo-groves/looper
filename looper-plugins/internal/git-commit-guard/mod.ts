@@ -18,9 +18,19 @@ type CommitInfo = {
   subject: string;
 };
 
+type RouteContract = {
+  required?: string[];
+  properties?: {
+    looper_signal?: {
+      const?: string;
+    };
+  };
+};
+
 const SENSOR_ID = "git_commits";
 const ACTUATOR_ID = "desktop_notify_secrets";
 const decoder = new TextDecoder();
+let contractCache: RouteContract | null = null;
 
 function parsePayload(): Payload {
   const index = Deno.args.indexOf("--looper-payload");
@@ -35,9 +45,14 @@ function parsePayload(): Payload {
   }
 }
 
-function buildRiskSignal(commit: CommitInfo, reasons: string[]): string {
-  return JSON.stringify({
-    looper_signal: "plugin_route_v1",
+function hasOwn(input: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(input, key);
+}
+
+async function buildRiskSignal(commit: CommitInfo, reasons: string[]): Promise<string | null> {
+  const looperSignal = await routeSignalLiteral();
+  const signal: Record<string, unknown> = {
+    looper_signal: looperSignal,
     event: "new_risky_commit",
     plugin: "git_commit_guard",
     route_to_actuator: "git_commit_guard:desktop_notify_secrets",
@@ -45,7 +60,25 @@ function buildRiskSignal(commit: CommitInfo, reasons: string[]): string {
     commit_hash: commit.hash,
     commit_subject: commit.subject,
     reasons,
-  });
+  };
+
+  if (!(await matchesRouteContract(signal))) {
+    return null;
+  }
+
+  return JSON.stringify(signal);
+}
+
+export async function buildRiskSignalForTest(
+  hash: string,
+  subject: string,
+  reasons: string[],
+): Promise<Record<string, unknown> | null> {
+  const encoded = await buildRiskSignal({ hash, subject }, reasons);
+  if (!encoded) {
+    return null;
+  }
+  return JSON.parse(encoded) as Record<string, unknown>;
 }
 
 function pathFromImportMeta(relative: string): string {
@@ -58,6 +91,48 @@ function pathFromImportMeta(relative: string): string {
     return path.replaceAll("/", "\\");
   }
   return path;
+}
+
+function contractPath(): string {
+  return pathFromImportMeta("../../contracts/plugin-route-v1.json");
+}
+
+async function readRouteContract(): Promise<RouteContract> {
+  if (contractCache) {
+    return contractCache;
+  }
+
+  try {
+    const raw = await Deno.readTextFile(contractPath());
+    const parsed = JSON.parse(raw) as RouteContract;
+    contractCache = parsed;
+    return parsed;
+  } catch {
+    contractCache = {};
+    return contractCache;
+  }
+}
+
+async function routeSignalLiteral(): Promise<string> {
+  const contract = await readRouteContract();
+  const value = contract.properties?.looper_signal?.const;
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.trim();
+  }
+  return "plugin_route_v1";
+}
+
+async function matchesRouteContract(signal: Record<string, unknown>): Promise<boolean> {
+  const contract = await readRouteContract();
+  const required = Array.isArray(contract.required) ? contract.required : [];
+  for (const field of required) {
+    if (!hasOwn(signal, field)) {
+      return false;
+    }
+  }
+
+  const literal = await routeSignalLiteral();
+  return signal.looper_signal === literal;
 }
 
 function statePath(): string {
@@ -241,7 +316,10 @@ async function handleSensor(payload: Payload): Promise<unknown> {
   for (const commit of fresh.reverse()) {
     const reasons = await commitRisk(workspaceRoot, commit.hash);
     if (reasons.length > 0) {
-      percepts.push(buildRiskSignal(commit, reasons));
+      const signal = await buildRiskSignal(commit, reasons);
+      if (signal) {
+        percepts.push(signal);
+      }
     }
   }
 

@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
@@ -15,14 +16,15 @@ use crate::executors::{
 };
 use crate::model::{
     Action, Actuator, ActuatorType, AgentState, ExecutionResult, InternalActuatorKind,
-    ModelProviderKind,
-    ModelSelection, PendingApproval, Percept, PluginManifest, PluginSensorIngress,
-    RecommendedAction, SafetyPolicy, Sensor, SensorIngressConfig, SensorRestFormat,
+    ModelProviderKind, ModelSelection, PendingApproval, Percept, PluginManifest,
+    PluginRequirements, PluginSensorIngress, RecommendedAction, SafetyPolicy, Sensor,
+    SensorIngressConfig, SensorRestFormat,
 };
 use crate::models::{
     FiddlesticksFrontierModel, FiddlesticksLocalModel, FrontierModel, FrontierModelRequest,
     LocalModel, LocalModelRequest, RuleBasedFrontierModel, RuleBasedLocalModel, SkillContext,
 };
+use crate::plugin_contract::parse_plugin_route_signal;
 use crate::storage::{PersistedChatMessage, PersistedChatSession, PersistedIteration, SqliteStore};
 
 const FORCE_SURPRISE_SENSITIVITY_THRESHOLD: u8 = 90;
@@ -43,6 +45,8 @@ struct PersistedAgentSettings {
     sensors: Vec<PersistedSensorSettings>,
     #[serde(default)]
     actuators: Vec<PersistedActuatorSettings>,
+    #[serde(default)]
+    plugin_enabled_overrides: HashMap<String, bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -71,10 +75,18 @@ struct PersistedActuatorSettings {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum PersistedActuatorKind {
-    Internal { kind: String },
-    Mcp { details: crate::model::McpDetails },
-    Workflow { details: crate::model::WorkflowDetails },
-    Plugin { details: crate::model::PluginActuatorDetails },
+    Internal {
+        kind: String,
+    },
+    Mcp {
+        details: crate::model::McpDetails,
+    },
+    Workflow {
+        details: crate::model::WorkflowDetails,
+    },
+    Plugin {
+        details: Box<crate::model::PluginActuatorDetails>,
+    },
 }
 
 /// Partial update payload for mutable sensor settings.
@@ -342,6 +354,31 @@ pub struct IterationReport {
     pub ended_after_reasoning: bool,
 }
 
+/// Runtime status for one bundled internal plugin package.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InternalPluginStatus {
+    /// Stable plugin id from manifest name when available.
+    pub id: String,
+    /// Plugin display name.
+    pub name: String,
+    /// Plugin version string.
+    pub version: String,
+    /// Absolute plugin directory path.
+    pub path: String,
+    /// Whether this plugin package has been imported into runtime registries.
+    pub imported: bool,
+    /// Whether runtime requirements are currently satisfied.
+    pub enabled: bool,
+    /// Whether the plugin is user-enabled.
+    pub user_enabled: bool,
+    /// Optional reason for disabled or errored status.
+    pub status_message: Option<String>,
+    /// Declared sensor names for this plugin.
+    pub sensors: Vec<String>,
+    /// Declared actuator names for this plugin.
+    pub actuators: Vec<String>,
+}
+
 /// Runtime for Looper sensory loop.
 pub struct LooperRuntime {
     sensors: HashMap<String, Sensor>,
@@ -363,6 +400,7 @@ pub struct LooperRuntime {
     loop_visualization: LoopVisualizationState,
     phase_events: VecDeque<LoopPhaseTransitionEvent>,
     next_phase_event_sequence: u64,
+    plugin_enabled_overrides: HashMap<String, bool>,
 }
 
 impl LooperRuntime {
@@ -387,6 +425,7 @@ impl LooperRuntime {
             loop_visualization: LoopVisualizationState::default(),
             phase_events: VecDeque::new(),
             next_phase_event_sequence: 1,
+            plugin_enabled_overrides: HashMap::new(),
         }
     }
 
@@ -469,6 +508,7 @@ impl LooperRuntime {
 
         runtime.attach_store(SqliteStore::new(default_store_path())?);
         runtime.load_persisted_api_keys()?;
+        runtime.import_bundled_internal_plugins();
         runtime.load_persisted_settings()?;
         Ok(runtime)
     }
@@ -606,6 +646,190 @@ impl LooperRuntime {
     /// Returns the configured workspace root directory.
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Enables or disables an imported plugin package by id.
+    pub fn set_plugin_enabled(&mut self, plugin_id: &str, enabled: bool) -> Result<()> {
+        let plugin_id = plugin_id.trim();
+        if plugin_id.is_empty() {
+            return Err(anyhow!("plugin id cannot be empty"));
+        }
+
+        let exists = self.sensors.values().any(|sensor| {
+            matches!(&sensor.ingress, SensorIngressConfig::Plugin(details) if details.plugin == plugin_id)
+        }) || self.actuators.values().any(|actuator| {
+            matches!(&actuator.kind, ActuatorType::Plugin(details) if details.plugin == plugin_id)
+        });
+
+        if !exists {
+            return Err(anyhow!("plugin '{}' is not configured", plugin_id));
+        }
+
+        self.plugin_enabled_overrides
+            .insert(plugin_id.to_string(), enabled);
+        self.persist_settings()?;
+        self.log_state(
+            "set_plugin_enabled",
+            format!("plugin={}, enabled={enabled}", plugin_id),
+        );
+        Ok(())
+    }
+
+    /// Returns whether a plugin is user-enabled when configured.
+    pub fn plugin_user_enabled(&self, plugin_id: &str) -> Option<bool> {
+        let plugin_id = plugin_id.trim();
+        if plugin_id.is_empty() {
+            return None;
+        }
+
+        let exists = self.sensors.values().any(|sensor| {
+            matches!(&sensor.ingress, SensorIngressConfig::Plugin(details) if details.plugin == plugin_id)
+        }) || self.actuators.values().any(|actuator| {
+            matches!(&actuator.kind, ActuatorType::Plugin(details) if details.plugin == plugin_id)
+        });
+
+        if !exists {
+            return None;
+        }
+
+        Some(
+            self.plugin_enabled_overrides
+                .get(plugin_id)
+                .copied()
+                .unwrap_or(true),
+        )
+    }
+
+    /// Returns status for bundled internal plugin packages.
+    pub fn internal_plugin_statuses(&self) -> Vec<InternalPluginStatus> {
+        let base_dir = bundled_internal_plugins_dir();
+        let entries = match fs::read_dir(&base_dir) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut plugin_dirs = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        plugin_dirs.sort();
+
+        let mut statuses = Vec::new();
+        for plugin_dir in plugin_dirs {
+            statuses.push(self.internal_plugin_status_for_dir(&plugin_dir));
+        }
+        statuses
+    }
+
+    fn internal_plugin_status_for_dir(&self, plugin_dir: &Path) -> InternalPluginStatus {
+        let fallback_id = plugin_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let manifest_path = plugin_dir.join("looper-plugin.json");
+        let path_text = plugin_dir.to_string_lossy().to_string();
+
+        let raw = match fs::read_to_string(&manifest_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return InternalPluginStatus {
+                    id: fallback_id.clone(),
+                    name: fallback_id,
+                    version: "unknown".to_string(),
+                    path: path_text,
+                    imported: false,
+                    enabled: false,
+                    user_enabled: false,
+                    status_message: Some(format!("missing or unreadable manifest: {}", error)),
+                    sensors: Vec::new(),
+                    actuators: Vec::new(),
+                };
+            }
+        };
+
+        let manifest = match serde_json::from_str::<PluginManifest>(&raw) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                return InternalPluginStatus {
+                    id: fallback_id.clone(),
+                    name: fallback_id,
+                    version: "unknown".to_string(),
+                    path: path_text,
+                    imported: false,
+                    enabled: false,
+                    user_enabled: false,
+                    status_message: Some(format!("invalid manifest JSON: {}", error)),
+                    sensors: Vec::new(),
+                    actuators: Vec::new(),
+                };
+            }
+        };
+
+        if let Err(error) = manifest.validate() {
+            return InternalPluginStatus {
+                id: manifest.name.clone(),
+                name: manifest.name,
+                version: manifest.version,
+                path: path_text,
+                imported: false,
+                enabled: false,
+                user_enabled: false,
+                status_message: Some(format!("invalid manifest: {}", error)),
+                sensors: Vec::new(),
+                actuators: Vec::new(),
+            };
+        }
+
+        let plugin_name = manifest.name.trim().to_string();
+        let sensors = manifest
+            .sensors
+            .iter()
+            .map(|item| format!("{}:{}", plugin_name, item.name.trim()))
+            .collect::<Vec<_>>();
+        let actuators = manifest
+            .actuators
+            .iter()
+            .map(|item| format!("{}:{}", plugin_name, item.name.trim()))
+            .collect::<Vec<_>>();
+        let imported = sensors.iter().all(|name| self.sensors.contains_key(name))
+            && actuators
+                .iter()
+                .all(|name| self.actuators.contains_key(name));
+        let user_enabled = self
+            .plugin_enabled_overrides
+            .get(&plugin_name)
+            .copied()
+            .unwrap_or(true);
+        let status_message = self.plugin_disabled_reason(&plugin_name, &manifest.requirements);
+        let enabled = status_message.is_none();
+
+        InternalPluginStatus {
+            id: plugin_name.clone(),
+            name: plugin_name,
+            version: manifest.version,
+            path: path_text,
+            imported,
+            enabled,
+            user_enabled,
+            status_message,
+            sensors,
+            actuators,
+        }
+    }
+
+    fn plugin_disabled_reason(
+        &self,
+        plugin_name: &str,
+        requirements: &PluginRequirements,
+    ) -> Option<String> {
+        let user_enabled = self
+            .plugin_enabled_overrides
+            .get(plugin_name)
+            .copied()
+            .unwrap_or(true);
+        plugin_disabled_reason_with_user(user_enabled, requirements)
     }
 
     pub fn add_sensor(&mut self, sensor: Sensor) {
@@ -753,6 +977,14 @@ impl LooperRuntime {
 
     /// Imports a plugin package and registers its declared sensors and actuators.
     pub fn import_plugin_package(&mut self, plugin_path: impl AsRef<Path>) -> Result<String> {
+        self.import_plugin_package_with_options(plugin_path, true)
+    }
+
+    fn import_plugin_package_with_options(
+        &mut self,
+        plugin_path: impl AsRef<Path>,
+        persist_settings: bool,
+    ) -> Result<String> {
         let plugin_root = normalize_plugin_root(plugin_path.as_ref(), &self.workspace_root)?;
         let manifest_path = plugin_root.join("looper-plugin.json");
         let raw = fs::read_to_string(&manifest_path).with_context(|| {
@@ -782,13 +1014,14 @@ impl LooperRuntime {
         for sensor_def in manifest.sensors {
             let sensor_name = format!("{}:{}", plugin_name, sensor_def.name.trim());
             let mut sensor = Sensor::new(sensor_name, sensor_def.description.trim());
-            sensor.ingress = SensorIngressConfig::Plugin(PluginSensorIngress {
+            sensor.ingress = SensorIngressConfig::Plugin(Box::new(PluginSensorIngress {
                 plugin: plugin_name.clone(),
                 root: plugin_root_text.clone(),
                 entry: manifest.entry.clone(),
                 sensor: sensor_def.name.trim().to_string(),
                 permissions: manifest.permissions.clone(),
-            });
+                requirements: manifest.requirements.clone(),
+            }));
             self.add_sensor(sensor);
         }
 
@@ -803,14 +1036,41 @@ impl LooperRuntime {
                     entry: manifest.entry.clone(),
                     actuator: actuator_def.name.trim().to_string(),
                     permissions: manifest.permissions.clone(),
+                    requirements: manifest.requirements.clone(),
                 },
                 SafetyPolicy::default(),
             )?;
             self.add_actuator(actuator);
         }
 
-        self.persist_settings()?;
+        if persist_settings {
+            self.persist_settings()?;
+        }
         Ok(plugin_name)
+    }
+
+    fn import_bundled_internal_plugins(&mut self) {
+        let base_dir = bundled_internal_plugins_dir();
+        let entries = match fs::read_dir(&base_dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+
+        let mut plugin_dirs = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+        plugin_dirs.sort();
+
+        for plugin_dir in plugin_dirs {
+            if let Err(error) = self.import_plugin_package_with_options(&plugin_dir, false) {
+                self.log_state(
+                    "import_bundled_internal_plugins.error",
+                    format!("path='{}', error={error}", plugin_dir.to_string_lossy()),
+                );
+            }
+        }
     }
 
     /// Updates mutable actuator configuration fields for an existing actuator.
@@ -1104,7 +1364,8 @@ impl LooperRuntime {
         self.observability.bump_phase(LoopPhase::Reasoning);
         self.loop_visualization.frontier_current_step = Some(FrontierLoopStep::PlanActions);
         self.transition_phase(LoopRuntimePhase::PlanActions);
-        let (mut planned_actions, frontier_surprises) = deterministic_actions_from_percepts(&surprising);
+        let (mut planned_actions, frontier_surprises) =
+            deterministic_actions_from_percepts(&surprising);
 
         if !frontier_surprises.is_empty() {
             let frontier_model = self
@@ -1225,22 +1486,40 @@ impl LooperRuntime {
 
     fn collect_new_percepts(&mut self) -> Vec<Percept> {
         let mut all = Vec::new();
+        let plugin_overrides = self.plugin_enabled_overrides.clone();
         for sensor in self.sensors.values_mut() {
             if sensor.enabled
                 && let SensorIngressConfig::Plugin(details) = &sensor.ingress
             {
-                let poll_result = poll_plugin_sensor(&self.workspace_root, details);
-                if let Ok(payloads) = poll_result {
-                    for payload in payloads {
-                        let trimmed = payload.trim();
-                        if !trimmed.is_empty() {
-                            sensor.enqueue(trimmed.to_string());
+                let user_enabled = plugin_overrides
+                    .get(&details.plugin)
+                    .copied()
+                    .unwrap_or(true);
+                if plugin_disabled_reason_with_user(user_enabled, &details.requirements).is_none() {
+                    let poll_result = poll_plugin_sensor(&self.workspace_root, details);
+                    if let Ok(payloads) = poll_result {
+                        for payload in payloads {
+                            let trimmed = payload.trim();
+                            if !trimmed.is_empty() {
+                                sensor.enqueue(trimmed.to_string());
+                            }
                         }
                     }
                 }
             }
 
             if sensor.enabled {
+                if let SensorIngressConfig::Plugin(details) = &sensor.ingress {
+                    let user_enabled = plugin_overrides
+                        .get(&details.plugin)
+                        .copied()
+                        .unwrap_or(true);
+                    if plugin_disabled_reason_with_user(user_enabled, &details.requirements)
+                        .is_some()
+                    {
+                        continue;
+                    }
+                }
                 all.extend(sensor.sense_unread());
             }
         }
@@ -1342,6 +1621,14 @@ impl LooperRuntime {
                 )
             }
             ActuatorType::Plugin(details) => {
+                if let Some(reason) =
+                    self.plugin_disabled_reason(&details.plugin, &details.requirements)
+                {
+                    return Ok(ExecutionResult::Denied(format!(
+                        "plugin '{}' is disabled: {}",
+                        details.plugin, reason
+                    )));
+                }
                 execute_plugin_actuator(&self.workspace_root, details, &recommendation.action)?
             }
         };
@@ -1562,6 +1849,7 @@ impl LooperRuntime {
                 .map(|item| item.model.clone()),
             sensors,
             actuators,
+            plugin_enabled_overrides: self.plugin_enabled_overrides.clone(),
         })?;
         fs::write(path, encoded)?;
         Ok(())
@@ -1603,6 +1891,7 @@ impl LooperRuntime {
 
         let raw = fs::read_to_string(path)?;
         let parsed = serde_json::from_str::<PersistedAgentSettings>(&raw)?;
+        self.plugin_enabled_overrides = parsed.plugin_enabled_overrides.clone();
         if let (
             Some(local_provider),
             Some(local_model),
@@ -1703,19 +1992,14 @@ impl LooperRuntime {
                 continue;
             }
 
-            let kind = persisted
-                .kind
-                .or_else(|| infer_legacy_actuator_kind(name));
+            let kind = persisted.kind.or_else(|| infer_legacy_actuator_kind(name));
             let Some(kind) = kind else {
                 continue;
             };
 
-            let Ok(mut actuator) = actuator_from_persisted_kind(
-                name,
-                description,
-                kind,
-                persisted.policy,
-            ) else {
+            let Ok(mut actuator) =
+                actuator_from_persisted_kind(name, description, kind, persisted.policy)
+            else {
                 continue;
             };
 
@@ -1881,28 +2165,13 @@ fn deterministic_actions_from_percepts(
 }
 
 fn deterministic_action_from_percept(percept: &Percept) -> Option<RecommendedAction> {
-    let value = serde_json::from_str::<serde_json::Value>(&percept.content).ok()?;
-    let object = value.as_object()?;
-    if object.get("looper_signal")?.as_str()? != "plugin_route_v1" {
-        return None;
-    }
-
-    let actuator_name = object.get("route_to_actuator")?.as_str()?.trim().to_string();
-    if actuator_name.is_empty() {
-        return None;
-    }
-
-    let message = object
-        .get("action_message")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-        .unwrap_or("plugin deterministic action")
-        .to_string();
+    let signal = parse_plugin_route_signal(&percept.content)?;
 
     Some(RecommendedAction {
-        actuator_name,
-        action: Action::ChatResponse { message },
+        actuator_name: signal.actuator_name,
+        action: Action::ChatResponse {
+            message: signal.action_message,
+        },
     })
 }
 
@@ -1952,7 +2221,9 @@ fn actuator_from_persisted_kind(
         PersistedActuatorKind::Workflow { details } => {
             Actuator::workflow(name, description, details, policy)
         }
-        PersistedActuatorKind::Plugin { details } => Actuator::plugin(name, description, details, policy),
+        PersistedActuatorKind::Plugin { details } => {
+            Actuator::plugin(name, description, *details, policy)
+        }
     }
 }
 
@@ -1989,6 +2260,92 @@ fn normalize_plugin_root(requested: &Path, workspace_root: &Path) -> Result<Path
         ));
     }
     Ok(root)
+}
+
+fn bundled_internal_plugins_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("looper-plugins")
+        .join("internal")
+}
+
+fn plugin_disabled_reason_with_user(
+    user_enabled: bool,
+    requirements: &PluginRequirements,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if !user_enabled {
+        reasons.push("disabled in settings".to_string());
+    }
+    if let Some(reason) = plugin_requirements_disabled_reason(requirements) {
+        reasons.push(reason);
+    }
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    }
+}
+
+fn plugin_requirements_disabled_reason(requirements: &PluginRequirements) -> Option<String> {
+    let mut reasons = Vec::new();
+
+    for command in &requirements.command_all {
+        if !command_available(command) {
+            reasons.push(format!("missing command '{}'", command));
+        }
+    }
+
+    if !requirements.command_any.is_empty()
+        && !requirements
+            .command_any
+            .iter()
+            .any(|command| command_available(command))
+    {
+        reasons.push(format!(
+            "requires one of: {}",
+            requirements.command_any.join(", ")
+        ));
+    }
+
+    for env_key in &requirements.env_all {
+        let configured = std::env::var_os(env_key)
+            .map(|value| !value.to_string_lossy().trim().is_empty())
+            .unwrap_or(false);
+        if !configured {
+            reasons.push(format!("set environment variable '{}'", env_key));
+        }
+    }
+
+    if reasons.is_empty() {
+        return None;
+    }
+
+    let guidance = requirements
+        .message
+        .as_ref()
+        .map(|message| message.trim())
+        .filter(|message| !message.is_empty())
+        .map(ToString::to_string);
+
+    Some(match guidance {
+        Some(message) => format!("{} ({})", message, reasons.join("; ")),
+        None => reasons.join("; "),
+    })
+}
+
+fn command_available(name: &str) -> bool {
+    if name.trim().is_empty() {
+        return false;
+    }
+
+    Command::new(name)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn poll_plugin_sensor(workspace_root: &Path, details: &PluginSensorIngress) -> Result<Vec<String>> {
@@ -2325,6 +2682,7 @@ mod tests {
                         entry: "mod.ts".to_string(),
                         actuator: "desktop_notify_secrets".to_string(),
                         permissions: crate::model::DenoPermissions::default(),
+                        requirements: crate::model::PluginRequirements::default(),
                     },
                     SafetyPolicy {
                         require_hitl: true,
@@ -2460,7 +2818,9 @@ mod tests {
             .update_actuator(
                 "web_search",
                 ActuatorUpdate {
-                    description: Some("Searches external documentation with restrictions".to_string()),
+                    description: Some(
+                        "Searches external documentation with restrictions".to_string(),
+                    ),
                     require_hitl: Some(true),
                     sandboxed: Some(true),
                     rate_limit: Some(Some(RateLimit {
@@ -2554,7 +2914,10 @@ mod tests {
             .into_iter()
             .find(|item| item.name == "demo:alerts")
             .expect("reloaded plugin sensor should exist");
-        assert!(matches!(reloaded_sensor.ingress, SensorIngressConfig::Plugin(_)));
+        assert!(matches!(
+            reloaded_sensor.ingress,
+            SensorIngressConfig::Plugin(_)
+        ));
 
         let reloaded_actuator = reloaded
             .actuators()
@@ -2562,5 +2925,111 @@ mod tests {
             .find(|item| item.name == "demo:notify")
             .expect("reloaded plugin actuator should exist");
         assert!(matches!(reloaded_actuator.kind, ActuatorType::Plugin(_)));
+    }
+
+    #[test]
+    fn plugin_with_missing_requirements_imports_as_disabled() {
+        let workspace = unique_test_workspace("plugin-requirements");
+        let plugin_dir = workspace.join("plugins").join("restricted-plugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should be created");
+        fs::write(plugin_dir.join("mod.ts"), "console.log('{}');")
+            .expect("entry file should be written");
+        fs::write(
+            plugin_dir.join("looper-plugin.json"),
+            r#"{
+  "name": "restricted",
+  "version": "0.1.0",
+  "entry": "mod.ts",
+  "requirements": {
+    "env_all": ["LOOPER_TEST_PLUGIN_REQUIREMENT_DO_NOT_SET"],
+    "message": "Set required env var"
+  },
+  "sensors": [
+    { "name": "alerts", "description": "Restricted alert stream" }
+  ],
+  "actuators": [
+    { "name": "notify", "description": "Restricted notifier" }
+  ]
+}"#,
+        )
+        .expect("manifest should be written");
+
+        let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should build");
+        runtime.disable_store();
+        runtime
+            .import_plugin_package(&plugin_dir)
+            .expect("plugin should import");
+
+        let sensor = runtime
+            .sensors()
+            .into_iter()
+            .find(|item| item.name == "restricted:alerts")
+            .expect("plugin sensor should exist");
+        assert!(sensor.enabled);
+
+        let actuator = runtime
+            .actuators()
+            .into_iter()
+            .find(|item| item.name == "restricted:notify")
+            .expect("plugin actuator should exist");
+        assert!(matches!(actuator.kind, ActuatorType::Plugin(_)));
+
+        let result = runtime
+            .execute_recommendation(
+                &RecommendedAction {
+                    actuator_name: "restricted:notify".to_string(),
+                    action: Action::ChatResponse {
+                        message: "notify".to_string(),
+                    },
+                },
+                false,
+            )
+            .expect("execution should complete");
+        assert!(matches!(
+            result,
+            ExecutionResult::Denied(message) if message.contains("Set required env var")
+        ));
+    }
+
+    #[test]
+    fn plugin_can_be_disabled_and_enabled_via_runtime_setting() {
+        let workspace = unique_test_workspace("plugin-toggle");
+        let plugin_dir = workspace.join("plugins").join("toggle-plugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should be created");
+        fs::write(plugin_dir.join("mod.ts"), "console.log('{}');")
+            .expect("entry file should be written");
+        fs::write(
+            plugin_dir.join("looper-plugin.json"),
+            r#"{
+  "name": "toggle",
+  "version": "0.1.0",
+  "entry": "mod.ts",
+  "sensors": [
+    { "name": "alerts", "description": "Toggle alerts" }
+  ],
+  "actuators": [
+    { "name": "notify", "description": "Toggle notifier" }
+  ]
+}"#,
+        )
+        .expect("manifest should be written");
+
+        let mut runtime = LooperRuntime::with_internal_defaults_for_workspace(&workspace)
+            .expect("defaults should build");
+        runtime.disable_store();
+        runtime
+            .import_plugin_package(&plugin_dir)
+            .expect("plugin should import");
+
+        runtime
+            .set_plugin_enabled("toggle", false)
+            .expect("plugin should disable");
+        assert_eq!(runtime.plugin_user_enabled("toggle"), Some(false));
+
+        runtime
+            .set_plugin_enabled("toggle", true)
+            .expect("plugin should enable");
+        assert_eq!(runtime.plugin_user_enabled("toggle"), Some(true));
     }
 }
