@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = [
+    "looper-agent", 
+    "looper-peas", 
+    "looper-settings",
+    "looper-terminal"
+]
