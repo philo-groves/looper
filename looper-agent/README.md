@@ -16,3 +16,7 @@ This binary crate is the core background process for each Looper agent instance.
 Additional feature lists are available the libraries:
 - [looper-peas](../looper-peas/README.md)
 - [looper-settings](../looper-settings/README.md)
+
+### About the Process
+
+

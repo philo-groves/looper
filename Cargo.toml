@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "looper-agent", 
+    "looper-discovery", 
     "looper-peas", 
     "looper-settings",
     "looper-terminal"

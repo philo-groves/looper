@@ -3,7 +3,15 @@
 version = 4
 
 [[package]]
+name = "looper"
+version = "0.1.0"
+
+[[package]]
 name = "looper-agent"
+version = "0.1.0"
+
+[[package]]
+name = "looper-discovery"
 version = "0.1.0"
 
 [[package]]
@@ -12,8 +20,4 @@ version = "0.1.0"
 
 [[package]]
 name = "looper-settings"
-version = "0.1.0"
-
-[[package]]
-name = "looper-terminal"
 version = "0.1.0"
