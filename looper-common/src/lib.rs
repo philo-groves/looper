@@ -52,6 +52,7 @@ pub enum DiscoveryRequest {
     StartAgent {
         workspace_dir: String,
     },
+    CreateAgent,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,6 +69,9 @@ pub enum DiscoveryResponse {
     AgentLaunchUpserted,
     AgentStarted {
         workspace_dir: String,
+        assigned_port: u16,
+    },
+    AgentCreated {
         assigned_port: u16,
     },
     Error {

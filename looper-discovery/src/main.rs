@@ -40,6 +40,7 @@ fn default_schema_version() -> u32 {
 struct DiscoveryState {
     agents: HashMap<String, AgentInfo>,
     used_ports: HashSet<u16>,
+    pending_ports: HashSet<u16>,
     configured_ports: HashSet<u16>,
     launch_configs: Vec<AgentLaunchConfig>,
 }
@@ -50,6 +51,7 @@ impl DiscoveryState {
         Self {
             agents: HashMap::new(),
             used_ports: HashSet::new(),
+            pending_ports: HashSet::new(),
             configured_ports,
             launch_configs,
         }
@@ -57,7 +59,10 @@ impl DiscoveryState {
 
     fn assign_port(&mut self) -> Option<u16> {
         for port in AGENT_PORT_START..=AGENT_PORT_END {
-            if !self.used_ports.contains(&port) && !self.configured_ports.contains(&port) {
+            if !self.used_ports.contains(&port)
+                && !self.pending_ports.contains(&port)
+                && !self.configured_ports.contains(&port)
+            {
                 self.used_ports.insert(port);
                 return Some(port);
             }
@@ -66,7 +71,26 @@ impl DiscoveryState {
         None
     }
 
+    fn reserve_port_for_new_agent(&mut self) -> Option<u16> {
+        for port in AGENT_PORT_START..=AGENT_PORT_END {
+            if !self.used_ports.contains(&port)
+                && !self.pending_ports.contains(&port)
+                && !self.configured_ports.contains(&port)
+            {
+                self.pending_ports.insert(port);
+                return Some(port);
+            }
+        }
+
+        None
+    }
+
     fn claim_port(&mut self, port: u16) -> Option<u16> {
+        if self.pending_ports.remove(&port) {
+            self.used_ports.insert(port);
+            return Some(port);
+        }
+
         if self.used_ports.contains(&port) {
             return None;
         }
@@ -76,6 +100,7 @@ impl DiscoveryState {
 
     fn release_port(&mut self, port: u16) {
         self.used_ports.remove(&port);
+        self.pending_ports.remove(&port);
     }
 
     fn active_agents(&self) -> Vec<AgentInfo> {
@@ -86,10 +111,10 @@ impl DiscoveryState {
         let mut entries = Vec::new();
 
         for cfg in &self.launch_configs {
-            let running = self
-                .agents
-                .values()
-                .find(|agent| agent.workspace_dir.as_deref() == Some(cfg.workspace_dir.as_str()));
+            let running = self.agents.values().find(|agent| {
+                agent.workspace_dir.as_deref() == Some(cfg.workspace_dir.as_str())
+                    || agent.assigned_port == cfg.port
+            });
 
             entries.push(AgentEntry {
                 workspace_dir: cfg.workspace_dir.clone(),
@@ -320,6 +345,7 @@ async fn handle_connection(
             agent_name,
         } => {
             let mut state_guard = state.lock().await;
+            let workspace_dir_for_running = workspace_dir.clone();
             let upsert = state_guard.upsert_launch_config(AgentLaunchConfig {
                 workspace_dir,
                 port,
@@ -328,6 +354,14 @@ async fn handle_connection(
 
             match upsert {
                 Ok(()) => {
+                    if let Some(running_agent) = state_guard
+                        .agents
+                        .values_mut()
+                        .find(|agent| agent.assigned_port == port)
+                    {
+                        running_agent.workspace_dir = Some(workspace_dir_for_running);
+                    }
+
                     persist_launch_configs(&config_path, &state_guard.launch_configs)?;
                     writer
                         .send(Message::Text(
@@ -371,7 +405,10 @@ async fn handle_connection(
             let already_running = state_guard
                 .agents
                 .values()
-                .any(|agent| agent.workspace_dir.as_deref() == Some(cfg.workspace_dir.as_str()));
+                .any(|agent| {
+                    agent.workspace_dir.as_deref() == Some(cfg.workspace_dir.as_str())
+                        || agent.assigned_port == cfg.port
+                });
 
             if already_running {
                 writer
@@ -399,6 +436,45 @@ async fn handle_connection(
                 ))
                 .await
                 .context("failed to send start response")?;
+
+            return Ok(());
+        }
+        DiscoveryRequest::CreateAgent => {
+            let mut state_guard = state.lock().await;
+            let Some(assigned_port) = state_guard.reserve_port_for_new_agent() else {
+                writer
+                    .send(Message::Text(
+                        serde_json::to_string(&DiscoveryResponse::Error {
+                            message: "no free ports available to start a new agent".to_string(),
+                        })?
+                        .into(),
+                    ))
+                    .await
+                    .context("failed to send create-agent capacity response")?;
+                return Ok(());
+            };
+
+            if let Err(error) = start_new_agent(assigned_port) {
+                state_guard.pending_ports.remove(&assigned_port);
+                writer
+                    .send(Message::Text(
+                        serde_json::to_string(&DiscoveryResponse::Error {
+                            message: format!("failed to create agent: {error}"),
+                        })?
+                        .into(),
+                    ))
+                    .await
+                    .context("failed to send create-agent error")?;
+                return Ok(());
+            }
+
+            writer
+                .send(Message::Text(
+                    serde_json::to_string(&DiscoveryResponse::AgentCreated { assigned_port })?
+                        .into(),
+                ))
+                .await
+                .context("failed to send create-agent response")?;
 
             return Ok(());
         }
@@ -511,6 +587,18 @@ fn start_configured_agent(config: &AgentLaunchConfig) -> anyhow::Result<()> {
         "started configured agent for {} on port {}",
         config.workspace_dir, config.port
     );
+    Ok(())
+}
+
+fn start_new_agent(assigned_port: u16) -> anyhow::Result<()> {
+    let agent_binary = resolve_agent_binary()?;
+    let mut cmd = Command::new(&agent_binary);
+    cmd.arg("--port").arg(assigned_port.to_string());
+
+    cmd.spawn()
+        .with_context(|| format!("failed to start new agent on port {assigned_port}"))?;
+
+    println!("started new setup agent on port {assigned_port}");
     Ok(())
 }
 

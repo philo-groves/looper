@@ -137,7 +137,8 @@ async fn wait_for_registration(
                     }
                     DiscoveryResponse::Agents { .. }
                     | DiscoveryResponse::AgentLaunchUpserted
-                    | DiscoveryResponse::AgentStarted { .. } => {}
+                    | DiscoveryResponse::AgentStarted { .. }
+                    | DiscoveryResponse::AgentCreated { .. } => {}
                 }
             }
             Ok(_) => {}
@@ -415,7 +416,8 @@ async fn upsert_launch_config(
                     }
                     DiscoveryResponse::Registered { .. }
                     | DiscoveryResponse::Agents { .. }
-                    | DiscoveryResponse::AgentStarted { .. } => {}
+                    | DiscoveryResponse::AgentStarted { .. }
+                    | DiscoveryResponse::AgentCreated { .. } => {}
                 }
             }
             Ok(Message::Close(_)) => break,

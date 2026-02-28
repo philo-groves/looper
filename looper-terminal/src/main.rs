@@ -28,17 +28,20 @@ const PROVIDERS: [&str; 4] = ["openai", "anthropic", "google", "xai"];
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let agents = discover_agents().await?;
-    let Some(mut agent) = run_agent_selector(agents)? else {
-        println!("No configured agents found in discovery.");
-        return Ok(());
+    let selected = run_agent_selector(agents)?;
+
+    let runtime_agent = match selected {
+        SelectorOutcome::Quit => return Ok(()),
+        SelectorOutcome::CreateNew => create_new_agent().await?,
+        SelectorOutcome::Selected(mut agent) => {
+            if !agent.is_running {
+                start_agent(&agent.workspace_dir).await?;
+                agent.is_running = true;
+            }
+
+            wait_for_agent_online(&agent.workspace_dir, agent.assigned_port).await?
+        }
     };
-
-    if !agent.is_running {
-        start_agent(&agent.workspace_dir).await?;
-        agent.is_running = true;
-    }
-
-    let runtime_agent = wait_for_agent_online(&agent.workspace_dir, agent.assigned_port).await?;
 
     let mode = fetch_agent_mode(&runtime_agent).await?;
     if mode == AgentMode::Setup {
@@ -78,7 +81,8 @@ async fn discover_agents() -> anyhow::Result<Vec<AgentEntry>> {
                     }
                     DiscoveryResponse::Registered { .. }
                     | DiscoveryResponse::AgentLaunchUpserted
-                    | DiscoveryResponse::AgentStarted { .. } => {
+                    | DiscoveryResponse::AgentStarted { .. }
+                    | DiscoveryResponse::AgentCreated { .. } => {
                     }
                 }
             }
@@ -91,23 +95,124 @@ async fn discover_agents() -> anyhow::Result<Vec<AgentEntry>> {
     bail!("discovery server closed before listing agents")
 }
 
-fn run_agent_selector(agents: Vec<AgentEntry>) -> anyhow::Result<Option<AgentEntry>> {
-    if agents.is_empty() {
-        return Ok(None);
-    }
+enum SelectorOutcome {
+    Quit,
+    Selected(AgentEntry),
+    CreateNew,
+}
 
+fn run_agent_selector(agents: Vec<AgentEntry>) -> anyhow::Result<SelectorOutcome> {
     let mut app = AgentSelectorApp {
         agents,
         selected_index: 0,
         should_quit: false,
         confirmed: false,
+        create_new: false,
     };
 
     run_tui_loop(&mut app, draw_agent_selector, handle_agent_selector_key)?;
-    if app.confirmed {
-        Ok(app.agents.get(app.selected_index).cloned())
+    if app.create_new {
+        Ok(SelectorOutcome::CreateNew)
+    } else if app.confirmed {
+        Ok(app
+            .agents
+            .get(app.selected_index)
+            .cloned()
+            .map(SelectorOutcome::Selected)
+            .unwrap_or(SelectorOutcome::Quit))
     } else {
-        Ok(None)
+        Ok(SelectorOutcome::Quit)
+    }
+}
+
+async fn create_new_agent() -> anyhow::Result<AgentInfo> {
+    let discovery_url =
+        env::var("LOOPER_DISCOVERY_URL").unwrap_or_else(|_| DEFAULT_DISCOVERY_URL.to_string());
+
+    let (ws_stream, _) = connect_async(&discovery_url)
+        .await
+        .with_context(|| format!("failed to connect to discovery server at {discovery_url}"))?;
+    let (mut writer, mut reader) = ws_stream.split();
+
+    writer
+        .send(Message::Text(
+            serde_json::to_string(&DiscoveryRequest::CreateAgent)?.into(),
+        ))
+        .await
+        .context("failed to send create-agent request")?;
+
+    let mut assigned_port = None;
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let response: DiscoveryResponse = serde_json::from_str(&text)
+                    .with_context(|| format!("invalid discovery response: {text}"))?;
+                match response {
+                    DiscoveryResponse::AgentCreated { assigned_port: port } => {
+                        assigned_port = Some(port);
+                        break;
+                    }
+                    DiscoveryResponse::Error { message } => {
+                        bail!("discovery failed to create agent: {message}")
+                    }
+                    DiscoveryResponse::Registered { .. }
+                    | DiscoveryResponse::Agents { .. }
+                    | DiscoveryResponse::AgentLaunchUpserted
+                    | DiscoveryResponse::AgentStarted { .. } => {}
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let assigned_port = assigned_port.context("discovery closed before create-agent response")?;
+    wait_for_new_agent_ready(assigned_port).await
+}
+
+async fn wait_for_new_agent_ready(assigned_port: u16) -> anyhow::Result<AgentInfo> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        let url = format!("ws://{AGENT_HOST}:{assigned_port}");
+        let ws_stream = match connect_async(&url).await {
+            Ok((ws_stream, _)) => ws_stream,
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for new agent on port {assigned_port}");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+        };
+        let (_, mut reader) = ws_stream.split();
+
+        while let Some(message) = reader.next().await {
+            match message {
+                Ok(Message::Text(text)) => {
+                    let payload: AgentSocketMessage = serde_json::from_str(&text)
+                        .with_context(|| format!("invalid agent hello payload: {text}"))?;
+                    if let AgentSocketMessage::AgentHello { agent_id, mode } = payload {
+                        return Ok(AgentInfo {
+                            agent_id,
+                            agent_name: None,
+                            assigned_port,
+                            mode,
+                            workspace_dir: None,
+                        });
+                    }
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for new agent handshake on port {assigned_port}");
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
@@ -140,7 +245,8 @@ async fn start_agent(workspace_dir: &str) -> anyhow::Result<()> {
                     }
                     DiscoveryResponse::Registered { .. }
                     | DiscoveryResponse::Agents { .. }
-                    | DiscoveryResponse::AgentLaunchUpserted => {}
+                    | DiscoveryResponse::AgentLaunchUpserted
+                    | DiscoveryResponse::AgentCreated { .. } => {}
                 }
             }
             Ok(Message::Close(_)) => break,
@@ -422,6 +528,7 @@ struct AgentSelectorApp {
     selected_index: usize,
     should_quit: bool,
     confirmed: bool,
+    create_new: bool,
 }
 
 impl TuiApp for AgentSelectorApp {
@@ -452,7 +559,13 @@ fn handle_agent_selector_key(app: &mut AgentSelectorApp, key: KeyEvent) {
             }
         }
         KeyCode::Enter => {
-            app.confirmed = true;
+            if !app.agents.is_empty() {
+                app.confirmed = true;
+                app.should_quit = true;
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.create_new = true;
             app.should_quit = true;
         }
         _ => {}
@@ -475,7 +588,12 @@ fn draw_agent_selector(frame: &mut Frame, app: &mut AgentSelectorApp) {
         ])
         .split(area);
 
-    let title = Paragraph::new("Select an available agent").style(
+    let title_text = if app.agents.is_empty() {
+        "No configured agents. Press N to create a new agent"
+    } else {
+        "Select an available agent"
+    };
+    let title = Paragraph::new(title_text).style(
         Style::default()
             .bg(Color::Rgb(34, 41, 52))
             .fg(Color::Rgb(220, 229, 239)),
@@ -511,7 +629,7 @@ fn draw_agent_selector(frame: &mut Frame, app: &mut AgentSelectorApp) {
     let mut list_state = ListState::default().with_selected(Some(app.selected_index));
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
-    let help = Paragraph::new("Up/Down to move, Enter to confirm, Esc to quit").style(
+    let help = Paragraph::new("Up/Down move, Enter select, N new agent, Esc quit").style(
         Style::default()
             .bg(Color::Rgb(34, 41, 52))
             .fg(Color::Rgb(140, 151, 166)),

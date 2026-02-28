@@ -16,6 +16,8 @@ The first terminal screen is always an agent selection list from discovery.
 
 If a selected configured agent is stopped, terminal requests discovery to start it before connecting.
 
+Press `N` in the selection screen to create a new agent on a free discovery-managed port and jump into setup.
+
 When terminal connects to an agent in setup mode, the chat view is replaced by a guided setup flow:
 
 1. Configure workspace directory (created if missing)
