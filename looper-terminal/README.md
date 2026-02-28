@@ -12,6 +12,10 @@ A terminal interface (TUI) for communicating with Looper agents.
 
 ## Setup Flow
 
+The first terminal screen is always an agent selection list from discovery.
+
+If a selected configured agent is stopped, terminal requests discovery to start it before connecting.
+
 When terminal connects to an agent in setup mode, the chat view is replaced by a guided setup flow:
 
 1. Configure workspace directory (created if missing)

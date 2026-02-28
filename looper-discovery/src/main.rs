@@ -8,8 +8,8 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use looper_common::{
-    AGENT_PORT_END, AGENT_PORT_START, AgentInfo, DISCOVERY_HOST, DISCOVERY_PORT, DiscoveryRequest,
-    DiscoveryResponse,
+    AGENT_PORT_END, AGENT_PORT_START, AgentEntry, AgentInfo, DISCOVERY_HOST, DISCOVERY_PORT,
+    DiscoveryRequest, DiscoveryResponse,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::{TcpListener, TcpStream};
@@ -82,6 +82,28 @@ impl DiscoveryState {
         self.agents.values().cloned().collect()
     }
 
+    fn agent_entries(&self) -> Vec<AgentEntry> {
+        let mut entries = Vec::new();
+
+        for cfg in &self.launch_configs {
+            let running = self
+                .agents
+                .values()
+                .find(|agent| agent.workspace_dir.as_deref() == Some(cfg.workspace_dir.as_str()));
+
+            entries.push(AgentEntry {
+                workspace_dir: cfg.workspace_dir.clone(),
+                assigned_port: cfg.port,
+                agent_name: cfg.agent_name.clone(),
+                is_running: running.is_some(),
+                mode: running.map(|agent| agent.mode),
+                agent_id: running.map(|agent| agent.agent_id.clone()),
+            });
+        }
+
+        entries
+    }
+
     fn upsert_launch_config(&mut self, cfg: AgentLaunchConfig) -> Result<(), String> {
         if !(AGENT_PORT_START..=AGENT_PORT_END).contains(&cfg.port) {
             return Err(format!(
@@ -128,10 +150,6 @@ async fn main() -> anyhow::Result<()> {
     println!("discovery listening on ws://{bind_addr}");
 
     let state = Arc::new(Mutex::new(DiscoveryState::from_launch_configs(launch_configs)));
-    {
-        let state_guard = state.lock().await;
-        spawn_configured_agents(&state_guard.launch_configs)?;
-    }
 
     loop {
         let (stream, addr) = listener
@@ -197,7 +215,7 @@ async fn handle_connection(
         DiscoveryRequest::Register {
             agent_name,
             requested_port,
-            workspace_dir: _,
+            workspace_dir,
             mode,
         } => {
             let mut state_guard = state.lock().await;
@@ -258,6 +276,7 @@ async fn handle_connection(
                 agent_name,
                 assigned_port,
                 mode,
+                workspace_dir: workspace_dir.clone(),
             };
 
             state_guard
@@ -284,11 +303,11 @@ async fn handle_connection(
         }
         DiscoveryRequest::ListAgents => {
             let state_guard = state.lock().await;
-            let active_agents = state_guard.active_agents();
+            let agents = state_guard.agent_entries();
 
             writer
                 .send(Message::Text(
-                    serde_json::to_string(&DiscoveryResponse::Agents { active_agents })?.into(),
+                    serde_json::to_string(&DiscoveryResponse::Agents { agents })?.into(),
                 ))
                 .await
                 .context("failed to send agents list response")?;
@@ -326,6 +345,60 @@ async fn handle_connection(
                         .context("failed to send launch config error response")?;
                 }
             }
+
+            return Ok(());
+        }
+        DiscoveryRequest::StartAgent { workspace_dir } => {
+            let state_guard = state.lock().await;
+            let Some(cfg) = state_guard
+                .launch_configs
+                .iter()
+                .find(|entry| entry.workspace_dir == workspace_dir)
+                .cloned()
+            else {
+                writer
+                    .send(Message::Text(
+                        serde_json::to_string(&DiscoveryResponse::Error {
+                            message: format!("workspace is not configured: {workspace_dir}"),
+                        })?
+                        .into(),
+                    ))
+                    .await
+                    .context("failed to send unknown workspace response")?;
+                return Ok(());
+            };
+
+            let already_running = state_guard
+                .agents
+                .values()
+                .any(|agent| agent.workspace_dir.as_deref() == Some(cfg.workspace_dir.as_str()));
+
+            if already_running {
+                writer
+                    .send(Message::Text(
+                        serde_json::to_string(&DiscoveryResponse::AgentStarted {
+                            workspace_dir: cfg.workspace_dir,
+                            assigned_port: cfg.port,
+                        })?
+                        .into(),
+                    ))
+                    .await
+                    .context("failed to send already-running start response")?;
+                return Ok(());
+            }
+
+            start_configured_agent(&cfg)?;
+
+            writer
+                .send(Message::Text(
+                    serde_json::to_string(&DiscoveryResponse::AgentStarted {
+                        workspace_dir: cfg.workspace_dir,
+                        assigned_port: cfg.port,
+                    })?
+                    .into(),
+                ))
+                .await
+                .context("failed to send start response")?;
 
             return Ok(());
         }
@@ -415,39 +488,29 @@ fn persist_launch_configs(path: &PathBuf, launch_configs: &[AgentLaunchConfig]) 
     Ok(())
 }
 
-fn spawn_configured_agents(launch_configs: &[AgentLaunchConfig]) -> anyhow::Result<()> {
-    if launch_configs.is_empty() {
-        return Ok(());
-    }
-
+fn start_configured_agent(config: &AgentLaunchConfig) -> anyhow::Result<()> {
     let agent_binary = resolve_agent_binary()?;
-    for config in launch_configs {
-        let mut cmd = Command::new(&agent_binary);
-        cmd.arg("--workspace-dir")
-            .arg(&config.workspace_dir)
-            .arg("--port")
-            .arg(config.port.to_string());
+    let mut cmd = Command::new(&agent_binary);
+    cmd.arg("--workspace-dir")
+        .arg(&config.workspace_dir)
+        .arg("--port")
+        .arg(config.port.to_string());
 
-        if let Some(agent_name) = &config.agent_name {
-            cmd.env("LOOPER_AGENT_NAME", agent_name);
-        }
-
-        match cmd.spawn() {
-            Ok(_) => {
-                println!(
-                    "launched configured agent for {} on port {}",
-                    config.workspace_dir, config.port
-                );
-            }
-            Err(error) => {
-                eprintln!(
-                    "failed to launch configured agent for {} on port {}: {}",
-                    config.workspace_dir, config.port, error
-                );
-            }
-        }
+    if let Some(agent_name) = &config.agent_name {
+        cmd.env("LOOPER_AGENT_NAME", agent_name);
     }
 
+    cmd.spawn().with_context(|| {
+        format!(
+            "failed to start configured agent for {} on port {}",
+            config.workspace_dir, config.port
+        )
+    })?;
+
+    println!(
+        "started configured agent for {} on port {}",
+        config.workspace_dir, config.port
+    );
     Ok(())
 }
 

@@ -135,7 +135,9 @@ async fn wait_for_registration(
                     DiscoveryResponse::Error { message } => {
                         bail!("discovery registration failed: {message}");
                     }
-                    DiscoveryResponse::Agents { .. } | DiscoveryResponse::AgentLaunchUpserted => {}
+                    DiscoveryResponse::Agents { .. }
+                    | DiscoveryResponse::AgentLaunchUpserted
+                    | DiscoveryResponse::AgentStarted { .. } => {}
                 }
             }
             Ok(_) => {}
@@ -411,7 +413,9 @@ async fn upsert_launch_config(
                     DiscoveryResponse::Error { message } => {
                         bail!("discovery could not persist launch config: {message}")
                     }
-                    DiscoveryResponse::Registered { .. } | DiscoveryResponse::Agents { .. } => {}
+                    DiscoveryResponse::Registered { .. }
+                    | DiscoveryResponse::Agents { .. }
+                    | DiscoveryResponse::AgentStarted { .. } => {}
                 }
             }
             Ok(Message::Close(_)) => break,

@@ -21,6 +21,17 @@ pub struct AgentInfo {
     pub agent_name: Option<String>,
     pub assigned_port: u16,
     pub mode: AgentMode,
+    pub workspace_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentEntry {
+    pub workspace_dir: String,
+    pub assigned_port: u16,
+    pub agent_name: Option<String>,
+    pub is_running: bool,
+    pub mode: Option<AgentMode>,
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,6 +49,9 @@ pub enum DiscoveryRequest {
         port: u16,
         agent_name: Option<String>,
     },
+    StartAgent {
+        workspace_dir: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,9 +63,13 @@ pub enum DiscoveryResponse {
         active_agents: Vec<AgentInfo>,
     },
     Agents {
-        active_agents: Vec<AgentInfo>,
+        agents: Vec<AgentEntry>,
     },
     AgentLaunchUpserted,
+    AgentStarted {
+        workspace_dir: String,
+        assigned_port: u16,
+    },
     Error {
         message: String,
     },

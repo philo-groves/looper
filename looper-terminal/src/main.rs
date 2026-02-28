@@ -10,8 +10,8 @@ use crossterm::terminal::{
 };
 use futures_util::{SinkExt, StreamExt};
 use looper_common::{
-    AGENT_HOST, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL, DiscoveryRequest,
-    DiscoveryResponse, ProviderApiKey,
+    AGENT_HOST, AgentEntry, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL,
+    DiscoveryRequest, DiscoveryResponse, ProviderApiKey,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -28,23 +28,30 @@ const PROVIDERS: [&str; 4] = ["openai", "anthropic", "google", "xai"];
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let agents = discover_agents().await?;
-    let Some(agent) = run_agent_selector(agents)? else {
-        println!("No agents discovered. Start looper-discovery and at least one looper-agent.");
+    let Some(mut agent) = run_agent_selector(agents)? else {
+        println!("No configured agents found in discovery.");
         return Ok(());
     };
 
-    let mode = fetch_agent_mode(&agent).await?;
-    if mode == AgentMode::Setup {
-        let Some(form) = run_setup_flow(&agent)? else {
-            return Ok(());
-        };
-        submit_setup(&agent, form).await?;
+    if !agent.is_running {
+        start_agent(&agent.workspace_dir).await?;
+        agent.is_running = true;
     }
 
-    run_chat_ui(&agent)
+    let runtime_agent = wait_for_agent_online(&agent.workspace_dir, agent.assigned_port).await?;
+
+    let mode = fetch_agent_mode(&runtime_agent).await?;
+    if mode == AgentMode::Setup {
+        let Some(form) = run_setup_flow(&runtime_agent)? else {
+            return Ok(());
+        };
+        submit_setup(&runtime_agent, form).await?;
+    }
+
+    run_chat_ui(&runtime_agent)
 }
 
-async fn discover_agents() -> anyhow::Result<Vec<AgentInfo>> {
+async fn discover_agents() -> anyhow::Result<Vec<AgentEntry>> {
     let discovery_url =
         env::var("LOOPER_DISCOVERY_URL").unwrap_or_else(|_| DEFAULT_DISCOVERY_URL.to_string());
 
@@ -65,11 +72,13 @@ async fn discover_agents() -> anyhow::Result<Vec<AgentInfo>> {
                 let response: DiscoveryResponse = serde_json::from_str(&text)
                     .with_context(|| format!("invalid discovery response: {text}"))?;
                 match response {
-                    DiscoveryResponse::Agents { active_agents } => return Ok(active_agents),
+                    DiscoveryResponse::Agents { agents } => return Ok(agents),
                     DiscoveryResponse::Error { message } => {
                         bail!("discovery server returned error: {message}")
                     }
-                    DiscoveryResponse::Registered { .. } | DiscoveryResponse::AgentLaunchUpserted => {
+                    DiscoveryResponse::Registered { .. }
+                    | DiscoveryResponse::AgentLaunchUpserted
+                    | DiscoveryResponse::AgentStarted { .. } => {
                     }
                 }
             }
@@ -82,13 +91,9 @@ async fn discover_agents() -> anyhow::Result<Vec<AgentInfo>> {
     bail!("discovery server closed before listing agents")
 }
 
-fn run_agent_selector(agents: Vec<AgentInfo>) -> anyhow::Result<Option<AgentInfo>> {
+fn run_agent_selector(agents: Vec<AgentEntry>) -> anyhow::Result<Option<AgentEntry>> {
     if agents.is_empty() {
         return Ok(None);
-    }
-
-    if agents.len() == 1 {
-        return Ok(Some(agents[0].clone()));
     }
 
     let mut app = AgentSelectorApp {
@@ -103,6 +108,120 @@ fn run_agent_selector(agents: Vec<AgentInfo>) -> anyhow::Result<Option<AgentInfo
         Ok(app.agents.get(app.selected_index).cloned())
     } else {
         Ok(None)
+    }
+}
+
+async fn start_agent(workspace_dir: &str) -> anyhow::Result<()> {
+    let discovery_url =
+        env::var("LOOPER_DISCOVERY_URL").unwrap_or_else(|_| DEFAULT_DISCOVERY_URL.to_string());
+
+    let (ws_stream, _) = connect_async(&discovery_url)
+        .await
+        .with_context(|| format!("failed to connect to discovery server at {discovery_url}"))?;
+    let (mut writer, mut reader) = ws_stream.split();
+
+    let request = DiscoveryRequest::StartAgent {
+        workspace_dir: workspace_dir.to_string(),
+    };
+    writer
+        .send(Message::Text(serde_json::to_string(&request)?.into()))
+        .await
+        .context("failed to send start-agent request")?;
+
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let response: DiscoveryResponse = serde_json::from_str(&text)
+                    .with_context(|| format!("invalid discovery response: {text}"))?;
+                match response {
+                    DiscoveryResponse::AgentStarted { .. } => return Ok(()),
+                    DiscoveryResponse::Error { message } => {
+                        bail!("discovery failed to start agent: {message}")
+                    }
+                    DiscoveryResponse::Registered { .. }
+                    | DiscoveryResponse::Agents { .. }
+                    | DiscoveryResponse::AgentLaunchUpserted => {}
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    bail!("discovery disconnected before start confirmation")
+}
+
+async fn wait_for_agent_online(workspace_dir: &str, port: u16) -> anyhow::Result<AgentInfo> {
+    let discovery_url =
+        env::var("LOOPER_DISCOVERY_URL").unwrap_or_else(|_| DEFAULT_DISCOVERY_URL.to_string());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let ws_stream = match connect_async(&discovery_url).await {
+            Ok((ws_stream, _)) => ws_stream,
+            Err(_) => {
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for discovery while starting agent");
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+        };
+        let (mut writer, mut reader) = ws_stream.split();
+
+        let list_request = serde_json::to_string(&DiscoveryRequest::ListAgents)?;
+        if writer
+            .send(Message::Text(list_request.into()))
+            .await
+            .is_err()
+        {
+            if Instant::now() >= deadline {
+                bail!("timed out sending list-agents request while waiting for agent start");
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            continue;
+        }
+
+        while let Some(message) = reader.next().await {
+            match message {
+                Ok(Message::Text(text)) => {
+                    let response: DiscoveryResponse = serde_json::from_str(&text)
+                        .with_context(|| format!("invalid discovery response: {text}"))?;
+                    if let DiscoveryResponse::Agents { agents } = response {
+                        if let Some(entry) = agents.iter().find(|entry| {
+                            entry.workspace_dir == workspace_dir && entry.is_running
+                        }) {
+                            return Ok(AgentInfo {
+                                agent_id: entry
+                                    .agent_id
+                                    .clone()
+                                    .unwrap_or_else(|| "pending".to_string()),
+                                agent_name: entry.agent_name.clone(),
+                                assigned_port: entry.assigned_port,
+                                mode: entry.mode.unwrap_or(AgentMode::Setup),
+                                workspace_dir: Some(entry.workspace_dir.clone()),
+                            });
+                        }
+
+                        break;
+                    }
+                }
+                Ok(Message::Close(_)) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for agent to come online on port {} for workspace {}",
+                port,
+                workspace_dir
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
@@ -299,7 +418,7 @@ where
 }
 
 struct AgentSelectorApp {
-    agents: Vec<AgentInfo>,
+    agents: Vec<AgentEntry>,
     selected_index: usize,
     should_quit: bool,
     confirmed: bool,
@@ -368,13 +487,9 @@ fn draw_agent_selector(frame: &mut Frame, app: &mut AgentSelectorApp) {
         .iter()
         .map(|agent| {
             ListItem::new(Line::from(format!(
-                "{} ({}) - {} - ws://127.0.0.1:{}",
-                agent.agent_id,
-                agent_name(agent),
-                match agent.mode {
-                    AgentMode::Setup => "setup",
-                    AgentMode::Running => "running",
-                },
+                "{} - {} - ws://127.0.0.1:{}",
+                agent.workspace_dir,
+                if agent.is_running { "running" } else { "stopped" },
                 agent.assigned_port
             )))
         })
