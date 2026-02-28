@@ -20,6 +20,7 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use ratatui_widgets::list::{List, ListItem, ListState};
+use ratatui_widgets::scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const TICK_RATE: Duration = Duration::from_millis(450);
@@ -465,6 +466,10 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
             AGENT_HOST,
             agent.assigned_port
         )],
+        scroll_offset: 0,
+        follow_tail: true,
+        status: ChatStatus::Idle,
+        status_ticks: 0,
     };
 
     run_tui_loop(&mut app, draw_chat, handle_chat_key)
@@ -948,6 +953,29 @@ struct ChatApp {
     input: String,
     cursor_visible: bool,
     messages: Vec<String>,
+    scroll_offset: usize,
+    follow_tail: bool,
+    status: ChatStatus,
+    status_ticks: u8,
+}
+
+#[derive(Clone, Copy)]
+enum ChatStatus {
+    Idle,
+    Thinking,
+    PerformingTask,
+    Responding,
+}
+
+impl ChatStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "Idle",
+            Self::Thinking => "Thinking...",
+            Self::PerformingTask => "Performing a Task...",
+            Self::Responding => "Responding...",
+        }
+    }
 }
 
 impl TuiApp for ChatApp {
@@ -957,6 +985,31 @@ impl TuiApp for ChatApp {
 
     fn on_tick(&mut self) {
         self.cursor_visible = !self.cursor_visible;
+
+        match self.status {
+            ChatStatus::Idle => {}
+            ChatStatus::Thinking => {
+                self.status_ticks = self.status_ticks.saturating_add(1);
+                if self.status_ticks >= 2 {
+                    self.status = ChatStatus::PerformingTask;
+                    self.status_ticks = 0;
+                }
+            }
+            ChatStatus::PerformingTask => {
+                self.status_ticks = self.status_ticks.saturating_add(1);
+                if self.status_ticks >= 2 {
+                    self.status = ChatStatus::Responding;
+                    self.status_ticks = 0;
+                }
+            }
+            ChatStatus::Responding => {
+                self.status_ticks = self.status_ticks.saturating_add(1);
+                if self.status_ticks >= 2 {
+                    self.status = ChatStatus::Idle;
+                    self.status_ticks = 0;
+                }
+            }
+        }
     }
 }
 
@@ -978,6 +1031,16 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
             }
             app.messages.push(format!("You: {}", app.input.trim()));
             app.input.clear();
+            app.follow_tail = true;
+            app.status = ChatStatus::Thinking;
+            app.status_ticks = 0;
+        }
+        KeyCode::Up => {
+            app.follow_tail = false;
+            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            app.scroll_offset = app.scroll_offset.saturating_add(1);
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1001,7 +1064,7 @@ fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {
     draw_sidenav(frame, split[1]);
 }
 
-fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &ChatApp) {
+fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     frame.render_widget(
         Block::default().style(Style::default().bg(Color::Rgb(23, 29, 37))),
         area,
@@ -1009,7 +1072,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &ChatApp) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(4), Constraint::Length(1)])
         .split(area);
 
     let history_text = if app.messages.is_empty() {
@@ -1018,23 +1081,62 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &ChatApp) {
         app.messages.join("\n")
     };
 
+    let content_length = app.messages.len().max(1);
+    let viewport_height = rows[0].height as usize;
+    let max_scroll = content_length.saturating_sub(viewport_height);
+
+    if app.follow_tail {
+        app.scroll_offset = max_scroll;
+    } else {
+        app.scroll_offset = app.scroll_offset.min(max_scroll);
+    }
+
     let history = Paragraph::new(history_text)
         .style(
             Style::default()
                 .bg(Color::Rgb(28, 35, 45))
                 .fg(Color::Rgb(219, 227, 238)),
         )
+        .scroll((app.scroll_offset as u16, 0))
         .wrap(Wrap { trim: false });
     frame.render_widget(history, rows[0]);
 
+    let mut scrollbar_state = ScrollbarState::new(content_length)
+        .position(app.scroll_offset)
+        .viewport_content_length(viewport_height);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .thumb_style(Style::default().fg(Color::Rgb(140, 170, 200)))
+        .track_style(Style::default().fg(Color::Rgb(70, 80, 92)));
+    frame.render_stateful_widget(scrollbar, rows[0], &mut scrollbar_state);
+
     let cursor = if app.cursor_visible { "█" } else { " " };
     let input_line = format!("> {}{cursor}", app.input);
+    let input_bg = Block::default().style(
+        Style::default()
+            .bg(Color::Rgb(43, 54, 69))
+            .fg(Color::Rgb(242, 248, 255)),
+    );
+    frame.render_widget(input_bg, rows[1]);
+
+    let input_margin = Rect {
+        x: rows[1].x.saturating_add(1),
+        y: rows[1].y,
+        width: rows[1].width.saturating_sub(2),
+        height: rows[1].height,
+    };
     let input = Paragraph::new(input_line).style(
         Style::default()
             .bg(Color::Rgb(43, 54, 69))
             .fg(Color::Rgb(242, 248, 255)),
     );
-    frame.render_widget(input, rows[1]);
+    frame.render_widget(input, input_margin);
+
+    let status = Paragraph::new(format!("Status: {}", app.status.label())).style(
+        Style::default()
+            .bg(Color::Rgb(23, 29, 37))
+            .fg(Color::Rgb(144, 163, 183)),
+    );
+    frame.render_widget(status, rows[2]);
 }
 
 fn draw_sidenav(frame: &mut Frame, area: Rect) {
