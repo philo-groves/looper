@@ -1,6 +1,6 @@
-# looper-peas
+# PEAS
 
-This library contains the core functionality for Looper agents to load and run PEAS plugins. If you are not familiar with PEAS concepts, see the repository [README.md](../README.md).
+This project contains the core functionality for Looper agents to load and run PEAS plugins. If you are not familiar with PEAS concepts, see the repository [README.md](../README.md).
 
 ## Features
 

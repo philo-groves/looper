@@ -1,6 +1,6 @@
-# looper-settings
+# Settings
 
-This library contains the core functionality for Looper agents to load and manage their global settings.
+This project contains the core functionality for Looper agents to load and manage their global settings.
 
 ## Features
 

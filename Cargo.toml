@@ -1,9 +1,8 @@
 [workspace]
 resolver = "3"
 members = [
-    "looper-agent", "looper-common", 
+    "looper-agent",
+    "looper-common", 
     "looper-discovery", 
-    "looper-peas", 
-    "looper-settings",
     "looper-terminal"
 ]

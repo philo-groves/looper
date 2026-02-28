@@ -731,14 +731,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "looper-peas"
-version = "0.1.0"
-
-[[package]]
-name = "looper-settings"
-version = "0.1.0"
-
-[[package]]
 name = "lru"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

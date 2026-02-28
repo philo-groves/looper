@@ -4,10 +4,10 @@ An experimental continuous AI agent based on the PEAS (performance measure, envi
 
 ## Crates
 
+- **looper-discovery (bin)**: A discovery server to manage a catalog of agents on a device.
 - **looper-agent (bin)**: An instance of Looper running as a background process.
 - **looper-terminal (bin)**: A terminal interface (TUI) for communicating with an agent.
-- **looper-settings (lib)**: A helper library for managing agent settings, used by `looper-agent`.
-- **looper-peas (lib)**: A helper library for managing PEAS plugins, used by `looper-agent`.
+- **looper-common (lib)**: A helper library containing shared structures between these projects.
 
 ![Agent Flow](https://i.imgur.com/nmyPI8u.png)
 
