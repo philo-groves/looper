@@ -1,5 +1,7 @@
 use std::env;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -16,7 +18,7 @@ use looper_common::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use ratatui_widgets::list::{List, ListItem, ListState};
@@ -187,7 +189,7 @@ async fn wait_for_new_agent_ready(assigned_port: u16) -> anyhow::Result<AgentInf
                 continue;
             }
         };
-        let (_, mut reader) = ws_stream.split();
+        let (mut writer, mut reader) = ws_stream.split();
 
         while let Some(message) = reader.next().await {
             match message {
@@ -195,6 +197,7 @@ async fn wait_for_new_agent_ready(assigned_port: u16) -> anyhow::Result<AgentInf
                     let payload: AgentSocketMessage = serde_json::from_str(&text)
                         .with_context(|| format!("invalid agent hello payload: {text}"))?;
                     if let AgentSocketMessage::AgentHello { agent_id, mode } = payload {
+                        writer.send(Message::Close(None)).await.ok();
                         return Ok(AgentInfo {
                             agent_id,
                             agent_name: None,
@@ -337,7 +340,7 @@ async fn fetch_agent_mode(agent: &AgentInfo) -> anyhow::Result<AgentMode> {
     let (ws_stream, _) = connect_async(&url)
         .await
         .with_context(|| format!("failed to connect to agent websocket at {url}"))?;
-    let (_, mut reader) = ws_stream.split();
+    let (mut writer, mut reader) = ws_stream.split();
 
     while let Some(message) = reader.next().await {
         match message {
@@ -345,6 +348,7 @@ async fn fetch_agent_mode(agent: &AgentInfo) -> anyhow::Result<AgentMode> {
                 let payload: AgentSocketMessage = serde_json::from_str(&text)
                     .with_context(|| format!("invalid agent hello payload: {text}"))?;
                 if let AgentSocketMessage::AgentHello { mode, .. } = payload {
+                    writer.send(Message::Close(None)).await.ok();
                     return Ok(mode);
                 }
             }
@@ -403,6 +407,7 @@ async fn submit_setup(agent: &AgentInfo, form: SetupForm) -> anyhow::Result<()> 
                     .with_context(|| format!("invalid agent payload: {text}"))?;
                 if let AgentSocketMessage::AgentHello { mode, .. } = payload {
                     if mode != AgentMode::Setup {
+                        writer.send(Message::Close(None)).await.ok();
                         return Ok(());
                     }
                     break;
@@ -437,6 +442,7 @@ async fn submit_setup(agent: &AgentInfo, form: SetupForm) -> anyhow::Result<()> 
                 match payload {
                     AgentSocketMessage::SetupAccepted { mode } if mode == AgentMode::Running => {
                         println!("Agent setup completed and switched to running mode.");
+                        writer.send(Message::Close(None)).await.ok();
                         return Ok(());
                     }
                     AgentSocketMessage::Error { message } => {
@@ -455,14 +461,21 @@ async fn submit_setup(agent: &AgentInfo, form: SetupForm) -> anyhow::Result<()> 
 }
 
 fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
+    let connection_state = Arc::new(AtomicBool::new(false));
+    let monitor_state = Arc::clone(&connection_state);
+    let agent_port = agent.assigned_port;
+    let monitor_handle = tokio::spawn(async move {
+        monitor_agent_connection(agent_port, monitor_state).await;
+    });
+
     let mut app = ChatApp {
         should_quit: false,
         input: String::new(),
         cursor_visible: true,
         messages: vec![format!(
             "Connected to {} ({}) on ws://{}:{}",
-            agent.agent_id,
             agent_name(agent),
+            agent.agent_id,
             AGENT_HOST,
             agent.assigned_port
         )],
@@ -470,9 +483,68 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         follow_tail: true,
         status: ChatStatus::Idle,
         status_ticks: 0,
+        ws_status: WebSocketStatus::Disconnected,
+        connection_state,
     };
 
-    run_tui_loop(&mut app, draw_chat, handle_chat_key)
+    let result = run_tui_loop(&mut app, draw_chat, handle_chat_key);
+    monitor_handle.abort();
+    result
+}
+
+async fn monitor_agent_connection(agent_port: u16, state: Arc<AtomicBool>) {
+    loop {
+        let connected = tokio::time::timeout(
+            Duration::from_millis(700),
+            is_agent_running(agent_port),
+        )
+        .await
+        .unwrap_or(false);
+        state.store(connected, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn is_agent_running(agent_port: u16) -> bool {
+    let discovery_url =
+        env::var("LOOPER_DISCOVERY_URL").unwrap_or_else(|_| DEFAULT_DISCOVERY_URL.to_string());
+
+    let (ws_stream, _) = match connect_async(&discovery_url).await {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let (mut writer, mut reader) = ws_stream.split();
+
+    let list_request = match serde_json::to_string(&DiscoveryRequest::ListAgents) {
+        Ok(req) => req,
+        Err(_) => return false,
+    };
+
+    if writer.send(Message::Text(list_request.into())).await.is_err() {
+        return false;
+    }
+
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let response: DiscoveryResponse = match serde_json::from_str(&text) {
+                    Ok(resp) => resp,
+                    Err(_) => return false,
+                };
+
+                if let DiscoveryResponse::Agents { agents } = response {
+                    return agents
+                        .iter()
+                        .any(|agent| agent.assigned_port == agent_port && agent.is_running);
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+
+    false
 }
 
 trait TuiApp {
@@ -957,6 +1029,30 @@ struct ChatApp {
     follow_tail: bool,
     status: ChatStatus,
     status_ticks: u8,
+    ws_status: WebSocketStatus,
+    connection_state: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+enum WebSocketStatus {
+    Connected,
+    Disconnected,
+}
+
+impl WebSocketStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connected => "Connected",
+            Self::Disconnected => "Disconnected",
+        }
+    }
+
+    fn bg_color(self) -> Color {
+        match self {
+            Self::Connected => Color::Rgb(48, 135, 83),
+            Self::Disconnected => Color::Rgb(154, 51, 51),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -985,6 +1081,11 @@ impl TuiApp for ChatApp {
 
     fn on_tick(&mut self) {
         self.cursor_visible = !self.cursor_visible;
+        self.ws_status = if self.connection_state.load(Ordering::Relaxed) {
+            WebSocketStatus::Connected
+        } else {
+            WebSocketStatus::Disconnected
+        };
 
         match self.status {
             ChatStatus::Idle => {}
@@ -1017,6 +1118,7 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
     if matches!(key.code, KeyCode::Esc)
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
     {
+        app.ws_status = WebSocketStatus::Disconnected;
         app.should_quit = true;
         return;
     }
@@ -1055,13 +1157,24 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
 
 fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {
     let area = frame.area();
-    let split = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
-        .split(area);
+    if should_render_sidenav(area) {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
+            .split(area);
 
-    draw_chat_panel(frame, split[0], app);
-    draw_sidenav(frame, split[1]);
+        draw_chat_panel(frame, split[0], app);
+        draw_sidenav(frame, split[1], app.ws_status);
+    } else {
+        draw_chat_panel(frame, area, app);
+    }
+}
+
+fn should_render_sidenav(area: Rect) -> bool {
+    match crossterm::terminal::window_size() {
+        Ok(size) => size.width >= 800,
+        Err(_) => area.width >= 120,
+    }
 }
 
 fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
@@ -1075,14 +1188,24 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
         .constraints([Constraint::Min(3), Constraint::Length(4), Constraint::Length(1)])
         .split(area);
 
-    let history_text = if app.messages.is_empty() {
-        "".to_string()
-    } else {
-        app.messages.join("\n")
+    let history_bg = Block::default().style(
+        Style::default()
+            .bg(Color::Rgb(28, 35, 45))
+            .fg(Color::Rgb(219, 227, 238)),
+    );
+    frame.render_widget(history_bg, rows[0]);
+
+    let history_area = Rect {
+        x: rows[0].x.saturating_add(1),
+        y: rows[0].y,
+        width: rows[0].width.saturating_sub(2),
+        height: rows[0].height,
     };
 
-    let content_length = app.messages.len().max(1);
-    let viewport_height = rows[0].height as usize;
+    let history_lines = build_history_lines(&app.messages, history_area.width as usize);
+
+    let content_length = history_lines.len().max(1);
+    let viewport_height = history_area.height as usize;
     let max_scroll = content_length.saturating_sub(viewport_height);
 
     if app.follow_tail {
@@ -1091,7 +1214,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
         app.scroll_offset = app.scroll_offset.min(max_scroll);
     }
 
-    let history = Paragraph::new(history_text)
+    let history = Paragraph::new(Text::from(history_lines))
         .style(
             Style::default()
                 .bg(Color::Rgb(28, 35, 45))
@@ -1099,7 +1222,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
         )
         .scroll((app.scroll_offset as u16, 0))
         .wrap(Wrap { trim: false });
-    frame.render_widget(history, rows[0]);
+    frame.render_widget(history, history_area);
 
     let mut scrollbar_state = ScrollbarState::new(content_length)
         .position(app.scroll_offset)
@@ -1107,22 +1230,36 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
         .thumb_style(Style::default().fg(Color::Rgb(140, 170, 200)))
         .track_style(Style::default().fg(Color::Rgb(70, 80, 92)));
-    frame.render_stateful_widget(scrollbar, rows[0], &mut scrollbar_state);
+    frame.render_stateful_widget(scrollbar, history_area, &mut scrollbar_state);
 
     let cursor = if app.cursor_visible { "█" } else { " " };
     let input_line = format!("> {}{cursor}", app.input);
+
+    let input_outer = Block::default().style(
+        Style::default()
+            .bg(Color::Rgb(28, 35, 45))
+            .fg(Color::Rgb(219, 227, 238)),
+    );
+    frame.render_widget(input_outer, rows[1]);
+
+    let input_container = Rect {
+        x: rows[1].x.saturating_add(1),
+        y: rows[1].y,
+        width: rows[1].width.saturating_sub(2),
+        height: rows[1].height,
+    };
     let input_bg = Block::default().style(
         Style::default()
             .bg(Color::Rgb(43, 54, 69))
             .fg(Color::Rgb(242, 248, 255)),
     );
-    frame.render_widget(input_bg, rows[1]);
+    frame.render_widget(input_bg, input_container);
 
     let input_margin = Rect {
-        x: rows[1].x.saturating_add(1),
-        y: rows[1].y,
-        width: rows[1].width.saturating_sub(2),
-        height: rows[1].height,
+        x: input_container.x.saturating_add(1),
+        y: input_container.y,
+        width: input_container.width.saturating_sub(2),
+        height: input_container.height,
     };
     let input = Paragraph::new(input_line).style(
         Style::default()
@@ -1131,7 +1268,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     );
     frame.render_widget(input, input_margin);
 
-    let status = Paragraph::new(format!("Status: {}", app.status.label())).style(
+    let status = Paragraph::new(format!(" Status: {}", app.status.label())).style(
         Style::default()
             .bg(Color::Rgb(23, 29, 37))
             .fg(Color::Rgb(144, 163, 183)),
@@ -1139,11 +1276,165 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     frame.render_widget(status, rows[2]);
 }
 
-fn draw_sidenav(frame: &mut Frame, area: Rect) {
+fn build_history_lines(messages: &[String], width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![Line::from("")];
+    }
+
+    if width <= 2 {
+        let mut compact = vec![Line::from("")];
+        for message in messages {
+            compact.push(Line::from(message.clone()));
+            compact.push(Line::from(""));
+        }
+        return compact;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(""));
+
+        let bubble_outer_width = width.saturating_sub(2);
+        let bubble_inner_width = bubble_outer_width.saturating_sub(2).max(1);
+
+    for message in messages {
+        let is_user = message.starts_with("You:");
+        if is_user {
+            lines.push(Line::from(format!(" {}", message)));
+            lines.push(Line::from(""));
+            continue;
+        }
+
+        let bubble_style = Style::default()
+            .bg(Color::Rgb(20, 24, 31))
+            .fg(Color::Rgb(224, 233, 245));
+        let wrapped = wrap_text(message, bubble_inner_width);
+
+        lines.push(Line::from(Span::styled(
+            " ".repeat(bubble_outer_width),
+            bubble_style,
+        )));
+        for part in wrapped {
+            let mut content = String::with_capacity(bubble_outer_width);
+            content.push(' ');
+            content.push_str(&pad_right(&part, bubble_inner_width));
+            content.push(' ');
+            lines.push(Line::from(Span::styled(content, bubble_style)));
+        }
+        lines.push(Line::from(Span::styled(
+            " ".repeat(bubble_outer_width),
+            bubble_style,
+        )));
+        lines.push(Line::from(""));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    lines
+}
+
+fn wrap_text(input: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut result = Vec::new();
+    for raw_line in input.lines() {
+        let mut current = String::new();
+        for word in raw_line.split_whitespace() {
+            if current.is_empty() {
+                if word.chars().count() <= max_width {
+                    current.push_str(word);
+                } else {
+                    let mut chunk = String::new();
+                    for ch in word.chars() {
+                        chunk.push(ch);
+                        if chunk.chars().count() == max_width {
+                            result.push(chunk.clone());
+                            chunk.clear();
+                        }
+                    }
+                    if !chunk.is_empty() {
+                        current.push_str(&chunk);
+                    }
+                }
+            } else if current.chars().count() + 1 + word.chars().count() <= max_width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                result.push(current.clone());
+                current.clear();
+                if word.chars().count() <= max_width {
+                    current.push_str(word);
+                } else {
+                    let mut chunk = String::new();
+                    for ch in word.chars() {
+                        chunk.push(ch);
+                        if chunk.chars().count() == max_width {
+                            result.push(chunk.clone());
+                            chunk.clear();
+                        }
+                    }
+                    if !chunk.is_empty() {
+                        current.push_str(&chunk);
+                    }
+                }
+            }
+        }
+
+        if !current.is_empty() {
+            result.push(current);
+        }
+        if raw_line.is_empty() {
+            result.push(String::new());
+        }
+    }
+
+    if result.is_empty() {
+        result.push(String::new());
+    }
+
+    result
+}
+
+fn pad_right(input: &str, width: usize) -> String {
+    let len = input.chars().count();
+    if len >= width {
+        input.to_string()
+    } else {
+        format!("{input}{}", " ".repeat(width - len))
+    }
+}
+
+fn draw_sidenav(frame: &mut Frame, area: Rect, ws_status: WebSocketStatus) {
     frame.render_widget(
         Block::default().style(Style::default().bg(Color::Rgb(16, 19, 25))),
         area,
     );
+
+    let label = format!(" {} ", ws_status.label());
+    let label_width = label.chars().count() as u16;
+    let right_margin = 1;
+    let top_margin = 1;
+
+    let badge_x = area
+        .x
+        .saturating_add(area.width.saturating_sub(label_width.saturating_add(right_margin)));
+    let badge_y = area.y.saturating_add(top_margin);
+    let badge_area = Rect {
+        x: badge_x,
+        y: badge_y,
+        width: label_width.min(area.width),
+        height: 1,
+    };
+
+    let badge = Paragraph::new(label).style(
+        Style::default()
+            .bg(ws_status.bg_color())
+            .fg(Color::Rgb(16, 19, 25)),
+    );
+    frame.render_widget(badge, badge_area);
 }
 
 fn agent_name(agent: &AgentInfo) -> &str {
