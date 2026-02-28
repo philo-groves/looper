@@ -4,17 +4,22 @@ A standalone discovery server to orchestrate the running of multiple Looper agen
 
 ## Features
 
-- [ ] Agent Port Assignments
-- [ ] Running Agent Statuses
-- [ ] Local Agent Lookup
+- [x] Agent Port Assignments
+- [x] Running Agent Statuses
+- [x] Local Agent Lookup
+- [x] Launch agents from persisted user config
 
 ## General Flow
 
 When the discovery server starts, it is available via websocket at: ws://localhost:10001
 
-After an agent starts, it will reach out to the discovery server websocket for registration. The discovery server will enumerate all active agents, then return a port number for the agent to use for its own websocket. This means each agent has two websockets: a server-side websocket for users, and a client-side websocket for discovery.
+At startup, discovery reads `%USERPROFILE%/.looper/agents.json` (or `$HOME/.looper/agents.json`) and launches each configured agent process.
+
+After an agent starts, it reaches out to the discovery websocket for registration. The discovery server enumerates active agents and confirms the port to use for the agent websocket. This means each agent has two websockets: a server-side websocket for users, and a client-side websocket for discovery.
 
 While an agent is active, it will retain its websocket connection to the discovery server, allowing agent lifetimes to be tracked easier.
+
+When an agent completes setup, discovery persists that launch configuration back into `~/.looper/agents.json`.
 
 ## How to Build
 

@@ -9,7 +9,10 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::{SinkExt, StreamExt};
-use looper_common::{AgentInfo, DEFAULT_DISCOVERY_URL, DiscoveryRequest, DiscoveryResponse};
+use looper_common::{
+    AGENT_HOST, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL, DiscoveryRequest,
+    DiscoveryResponse, ProviderApiKey,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -20,132 +23,25 @@ use ratatui_widgets::list::{List, ListItem, ListState};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const TICK_RATE: Duration = Duration::from_millis(450);
-
-#[derive(Clone, Copy)]
-enum Screen {
-    AgentSelect,
-    Chat,
-}
-
-struct App {
-    screen: Screen,
-    agents: Vec<AgentInfo>,
-    selected_agent: Option<AgentInfo>,
-    selected_index: usize,
-    messages: Vec<String>,
-    input: String,
-    cursor_visible: bool,
-    should_quit: bool,
-}
-
-impl App {
-    fn new(agents: Vec<AgentInfo>) -> Self {
-        let mut messages = Vec::new();
-        let mut selected_agent = None;
-        let screen = if agents.len() > 1 {
-            Screen::AgentSelect
-        } else {
-            Screen::Chat
-        };
-
-        if agents.is_empty() {
-            messages.push(
-                "No agents discovered. Start a looper-agent and restart terminal.".to_string(),
-            );
-        } else if agents.len() == 1 {
-            let agent = agents[0].clone();
-            messages.push(format!(
-                "Auto-selected only available agent: {} ({}) on port {}",
-                agent.agent_id,
-                agent_name(&agent),
-                agent.assigned_port
-            ));
-            selected_agent = Some(agent);
-        }
-
-        Self {
-            screen,
-            agents,
-            selected_agent,
-            selected_index: 0,
-            messages,
-            input: String::new(),
-            cursor_visible: true,
-            should_quit: false,
-        }
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) {
-        if matches!(key.code, KeyCode::Esc)
-            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
-        {
-            self.should_quit = true;
-            return;
-        }
-
-        match self.screen {
-            Screen::AgentSelect => self.handle_select_key(key),
-            Screen::Chat => self.handle_chat_key(key),
-        }
-    }
-
-    fn handle_select_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Up => {
-                if self.selected_index > 0 {
-                    self.selected_index -= 1;
-                }
-            }
-            KeyCode::Down => {
-                if self.selected_index + 1 < self.agents.len() {
-                    self.selected_index += 1;
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(agent) = self.agents.get(self.selected_index).cloned() {
-                    self.messages.push(format!(
-                        "Selected agent: {} ({}) on port {}",
-                        agent.agent_id,
-                        agent_name(&agent),
-                        agent.assigned_port
-                    ));
-                    self.selected_agent = Some(agent);
-                    self.screen = Screen::Chat;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_chat_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Enter => {
-                if self.input.trim().is_empty() {
-                    return;
-                }
-                self.messages.push(format!("You: {}", self.input.trim()));
-                self.input.clear();
-            }
-            KeyCode::Char(c) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
-                {
-                    self.input.push(c);
-                }
-            }
-            _ => {}
-        }
-    }
-}
+const PROVIDERS: [&str; 4] = ["openai", "anthropic", "google", "xai"];
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let agents = discover_agents().await?;
-    let mut app = App::new(agents);
-    run_tui(&mut app)
+    let Some(agent) = run_agent_selector(agents)? else {
+        println!("No agents discovered. Start looper-discovery and at least one looper-agent.");
+        return Ok(());
+    };
+
+    let mode = fetch_agent_mode(&agent).await?;
+    if mode == AgentMode::Setup {
+        let Some(form) = run_setup_flow(&agent)? else {
+            return Ok(());
+        };
+        submit_setup(&agent, form).await?;
+    }
+
+    run_chat_ui(&agent)
 }
 
 async fn discover_agents() -> anyhow::Result<Vec<AgentInfo>> {
@@ -173,7 +69,8 @@ async fn discover_agents() -> anyhow::Result<Vec<AgentInfo>> {
                     DiscoveryResponse::Error { message } => {
                         bail!("discovery server returned error: {message}")
                     }
-                    DiscoveryResponse::Registered { .. } => {}
+                    DiscoveryResponse::Registered { .. } | DiscoveryResponse::AgentLaunchUpserted => {
+                    }
                 }
             }
             Ok(Message::Close(_)) => break,
@@ -185,7 +82,182 @@ async fn discover_agents() -> anyhow::Result<Vec<AgentInfo>> {
     bail!("discovery server closed before listing agents")
 }
 
-fn run_tui(app: &mut App) -> anyhow::Result<()> {
+fn run_agent_selector(agents: Vec<AgentInfo>) -> anyhow::Result<Option<AgentInfo>> {
+    if agents.is_empty() {
+        return Ok(None);
+    }
+
+    if agents.len() == 1 {
+        return Ok(Some(agents[0].clone()));
+    }
+
+    let mut app = AgentSelectorApp {
+        agents,
+        selected_index: 0,
+        should_quit: false,
+        confirmed: false,
+    };
+
+    run_tui_loop(&mut app, draw_agent_selector, handle_agent_selector_key)?;
+    if app.confirmed {
+        Ok(app.agents.get(app.selected_index).cloned())
+    } else {
+        Ok(None)
+    }
+}
+
+async fn fetch_agent_mode(agent: &AgentInfo) -> anyhow::Result<AgentMode> {
+    let url = format!("ws://{AGENT_HOST}:{}", agent.assigned_port);
+    let (ws_stream, _) = connect_async(&url)
+        .await
+        .with_context(|| format!("failed to connect to agent websocket at {url}"))?;
+    let (_, mut reader) = ws_stream.split();
+
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let payload: AgentSocketMessage = serde_json::from_str(&text)
+                    .with_context(|| format!("invalid agent hello payload: {text}"))?;
+                if let AgentSocketMessage::AgentHello { mode, .. } = payload {
+                    return Ok(mode);
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    bail!("agent disconnected before sending mode")
+}
+
+struct SetupForm {
+    workspace_dir: String,
+    provider: String,
+    api_key: String,
+}
+
+fn run_setup_flow(agent: &AgentInfo) -> anyhow::Result<Option<SetupForm>> {
+    let mut app = SetupApp {
+        stage: SetupStage::Workspace,
+        should_quit: false,
+        workspace_input: String::new(),
+        provider_index: 0,
+        api_key_input: String::new(),
+        confirm_index: 0,
+        error_message: None,
+        cursor_visible: true,
+        agent_port: agent.assigned_port,
+    };
+
+    run_tui_loop(&mut app, draw_setup, handle_setup_key)?;
+
+    if app.stage != SetupStage::Done {
+        return Ok(None);
+    }
+
+    Ok(Some(SetupForm {
+        workspace_dir: app.workspace_input.trim().to_string(),
+        provider: PROVIDERS[app.provider_index].to_string(),
+        api_key: app.api_key_input.trim().to_string(),
+    }))
+}
+
+async fn submit_setup(agent: &AgentInfo, form: SetupForm) -> anyhow::Result<()> {
+    let url = format!("ws://{AGENT_HOST}:{}", agent.assigned_port);
+    let (ws_stream, _) = connect_async(&url)
+        .await
+        .with_context(|| format!("failed to connect to agent websocket at {url}"))?;
+    let (mut writer, mut reader) = ws_stream.split();
+
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let payload: AgentSocketMessage = serde_json::from_str(&text)
+                    .with_context(|| format!("invalid agent payload: {text}"))?;
+                if let AgentSocketMessage::AgentHello { mode, .. } = payload {
+                    if mode != AgentMode::Setup {
+                        return Ok(());
+                    }
+                    break;
+                }
+            }
+            Ok(Message::Close(_)) => bail!("agent disconnected before setup handshake"),
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let submit = AgentSocketMessage::SetupSubmit {
+        workspace_dir: form.workspace_dir,
+        port: agent.assigned_port,
+        provider: form.provider.clone(),
+        api_keys: vec![ProviderApiKey {
+            provider: form.provider,
+            api_key: form.api_key,
+        }],
+    };
+
+    writer
+        .send(Message::Text(serde_json::to_string(&submit)?.into()))
+        .await
+        .context("failed to send setup submission")?;
+
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let payload: AgentSocketMessage = serde_json::from_str(&text)
+                    .with_context(|| format!("invalid setup response payload: {text}"))?;
+                match payload {
+                    AgentSocketMessage::SetupAccepted { mode } if mode == AgentMode::Running => {
+                        println!("Agent setup completed and switched to running mode.");
+                        return Ok(());
+                    }
+                    AgentSocketMessage::Error { message } => {
+                        bail!("setup failed: {message}");
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    bail!("agent disconnected before setup confirmation")
+}
+
+fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
+    let mut app = ChatApp {
+        should_quit: false,
+        input: String::new(),
+        cursor_visible: true,
+        messages: vec![format!(
+            "Connected to {} ({}) on ws://{}:{}",
+            agent.agent_id,
+            agent_name(agent),
+            AGENT_HOST,
+            agent.assigned_port
+        )],
+    };
+
+    run_tui_loop(&mut app, draw_chat, handle_chat_key)
+}
+
+trait TuiApp {
+    fn should_quit(&self) -> bool;
+    fn on_tick(&mut self);
+}
+
+fn run_tui_loop<T>(
+    app: &mut T,
+    mut draw_fn: impl FnMut(&mut Frame, &mut T),
+    mut key_fn: impl FnMut(&mut T, KeyEvent),
+) -> anyhow::Result<()>
+where
+    T: TuiApp,
+{
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
@@ -193,58 +265,87 @@ fn run_tui(app: &mut App) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal backend")?;
 
-    let result = tui_loop(&mut terminal, app);
+    let result = (|| -> anyhow::Result<()> {
+        let mut last_tick = Instant::now();
+        loop {
+            terminal.draw(|frame| draw_fn(frame, app))?;
+
+            let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
+            if event::poll(timeout)? {
+                let input_event = event::read()?;
+                if let Event::Key(key) = input_event {
+                    if key.kind == KeyEventKind::Press {
+                        key_fn(app, key);
+                    }
+                }
+            }
+
+            if last_tick.elapsed() >= TICK_RATE {
+                app.on_tick();
+                last_tick = Instant::now();
+            }
+
+            if app.should_quit() {
+                break;
+            }
+        }
+        Ok(())
+    })();
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
-
     result
 }
 
-fn tui_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> anyhow::Result<()> {
-    let mut last_tick = Instant::now();
+struct AgentSelectorApp {
+    agents: Vec<AgentInfo>,
+    selected_index: usize,
+    should_quit: bool,
+    confirmed: bool,
+}
 
-    loop {
-        terminal.draw(|frame| draw(frame, app))?;
+impl TuiApp for AgentSelectorApp {
+    fn should_quit(&self) -> bool {
+        self.should_quit
+    }
 
-        let timeout = TICK_RATE.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)? {
-            let event = event::read()?;
-            if let Event::Key(key) = event {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key);
-                }
+    fn on_tick(&mut self) {}
+}
+
+fn handle_agent_selector_key(app: &mut AgentSelectorApp, key: KeyEvent) {
+    if matches!(key.code, KeyCode::Esc)
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        app.should_quit = true;
+        return;
+    }
+
+    match key.code {
+        KeyCode::Up => {
+            if app.selected_index > 0 {
+                app.selected_index -= 1;
             }
         }
-
-        if last_tick.elapsed() >= TICK_RATE {
-            app.cursor_visible = !app.cursor_visible;
-            last_tick = Instant::now();
+        KeyCode::Down => {
+            if app.selected_index + 1 < app.agents.len() {
+                app.selected_index += 1;
+            }
         }
-
-        if app.should_quit {
-            break;
+        KeyCode::Enter => {
+            app.confirmed = true;
+            app.should_quit = true;
         }
-    }
-
-    Ok(())
-}
-
-fn draw(frame: &mut Frame, app: &mut App) {
-    match app.screen {
-        Screen::AgentSelect => draw_agent_select(frame, app),
-        Screen::Chat => draw_chat(frame, app),
+        _ => {}
     }
 }
 
-fn draw_agent_select(frame: &mut Frame, app: &mut App) {
+fn draw_agent_selector(frame: &mut Frame, app: &mut AgentSelectorApp) {
     let area = frame.area();
-    let container = Block::default().style(Style::default().bg(Color::Rgb(17, 21, 28)));
-    frame.render_widget(container, area);
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(17, 21, 28))),
+        area,
+    );
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -267,9 +368,13 @@ fn draw_agent_select(frame: &mut Frame, app: &mut App) {
         .iter()
         .map(|agent| {
             ListItem::new(Line::from(format!(
-                "{} ({}) - ws://127.0.0.1:{}",
+                "{} ({}) - {} - ws://127.0.0.1:{}",
                 agent.agent_id,
                 agent_name(agent),
+                match agent.mode {
+                    AgentMode::Setup => "setup",
+                    AgentMode::Running => "running",
+                },
                 agent.assigned_port
             )))
         })
@@ -299,7 +404,360 @@ fn draw_agent_select(frame: &mut Frame, app: &mut App) {
     frame.render_widget(help, chunks[2]);
 }
 
-fn draw_chat(frame: &mut Frame, app: &App) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupStage {
+    Workspace,
+    Provider,
+    ApiKey,
+    Confirm,
+    Done,
+}
+
+struct SetupApp {
+    stage: SetupStage,
+    should_quit: bool,
+    workspace_input: String,
+    provider_index: usize,
+    api_key_input: String,
+    confirm_index: usize,
+    error_message: Option<String>,
+    cursor_visible: bool,
+    agent_port: u16,
+}
+
+impl TuiApp for SetupApp {
+    fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    fn on_tick(&mut self) {
+        self.cursor_visible = !self.cursor_visible;
+    }
+}
+
+fn handle_setup_key(app: &mut SetupApp, key: KeyEvent) {
+    if matches!(key.code, KeyCode::Esc)
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        app.should_quit = true;
+        return;
+    }
+
+    app.error_message = None;
+
+    match app.stage {
+        SetupStage::Workspace => match key.code {
+            KeyCode::Backspace => {
+                app.workspace_input.pop();
+            }
+            KeyCode::Enter => {
+                if app.workspace_input.trim().is_empty() {
+                    app.error_message = Some("Workspace directory cannot be empty".to_string());
+                    return;
+                }
+
+                if let Err(error) = std::fs::create_dir_all(app.workspace_input.trim()) {
+                    app.error_message = Some(format!("Could not create workspace directory: {error}"));
+                    return;
+                }
+
+                app.stage = SetupStage::Provider;
+            }
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    app.workspace_input.push(c);
+                }
+            }
+            _ => {}
+        },
+        SetupStage::Provider => match key.code {
+            KeyCode::Up => {
+                if app.provider_index > 0 {
+                    app.provider_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if app.provider_index + 1 < PROVIDERS.len() {
+                    app.provider_index += 1;
+                }
+            }
+            KeyCode::Enter => {
+                app.stage = SetupStage::ApiKey;
+            }
+            _ => {}
+        },
+        SetupStage::ApiKey => match key.code {
+            KeyCode::Backspace => {
+                app.api_key_input.pop();
+            }
+            KeyCode::Enter => {
+                if app.api_key_input.trim().is_empty() {
+                    app.error_message = Some("API key cannot be empty".to_string());
+                    return;
+                }
+                app.stage = SetupStage::Confirm;
+            }
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    app.api_key_input.push(c);
+                }
+            }
+            _ => {}
+        },
+        SetupStage::Confirm => match key.code {
+            KeyCode::Up => {
+                if app.confirm_index > 0 {
+                    app.confirm_index -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if app.confirm_index < 1 {
+                    app.confirm_index += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if app.confirm_index == 0 {
+                    app.stage = SetupStage::Done;
+                    app.should_quit = true;
+                } else {
+                    app.stage = SetupStage::ApiKey;
+                }
+            }
+            _ => {}
+        },
+        SetupStage::Done => {}
+    }
+}
+
+fn draw_setup(frame: &mut Frame, app: &mut SetupApp) {
+    let area = frame.area();
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(18, 20, 25))),
+        area,
+    );
+
+    match app.stage {
+        SetupStage::Workspace => draw_workspace_step(frame, app),
+        SetupStage::Provider => draw_provider_step(frame, app),
+        SetupStage::ApiKey => draw_api_step(frame, app),
+        SetupStage::Confirm => draw_confirm_step(frame, app),
+        SetupStage::Done => {}
+    }
+}
+
+fn draw_workspace_step(frame: &mut Frame, app: &SetupApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Min(2),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new("Agent Setup - Workspace Directory")
+            .style(Style::default().fg(Color::Rgb(227, 237, 255))),
+        chunks[0],
+    );
+
+    let cursor = if app.cursor_visible { "_" } else { " " };
+    frame.render_widget(
+        Paragraph::new(format!("> {}{cursor}", app.workspace_input))
+            .style(Style::default().fg(Color::Rgb(210, 218, 231))),
+        chunks[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new("Enter a workspace path. It will be created if missing.")
+            .style(Style::default().fg(Color::Rgb(150, 160, 174))),
+        chunks[2],
+    );
+
+    if let Some(error) = &app.error_message {
+        frame.render_widget(
+            Paragraph::new(error.clone()).style(Style::default().fg(Color::Rgb(255, 120, 120))),
+            chunks[3],
+        );
+    }
+}
+
+fn draw_provider_step(frame: &mut Frame, app: &SetupApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(2)])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new("Agent Setup - Select Model Provider")
+            .style(Style::default().fg(Color::Rgb(227, 237, 255))),
+        chunks[0],
+    );
+
+    let items: Vec<ListItem> = PROVIDERS
+        .iter()
+        .map(|provider| ListItem::new(Line::from((*provider).to_string())))
+        .collect();
+
+    let list = List::new(items)
+        .style(Style::default().fg(Color::Rgb(188, 202, 220)))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(56, 74, 96))
+                .fg(Color::Rgb(243, 248, 255)),
+        )
+        .highlight_symbol("  > ");
+
+    let mut state = ListState::default().with_selected(Some(app.provider_index));
+    frame.render_stateful_widget(list, chunks[1], &mut state);
+
+    frame.render_widget(
+        Paragraph::new("Up/Down to choose provider, Enter to continue")
+            .style(Style::default().fg(Color::Rgb(150, 160, 174))),
+        chunks[2],
+    );
+}
+
+fn draw_api_step(frame: &mut Frame, app: &SetupApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Min(2),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Agent Setup - API Key ({})",
+            PROVIDERS[app.provider_index]
+        ))
+        .style(Style::default().fg(Color::Rgb(227, 237, 255))),
+        chunks[0],
+    );
+
+    let masked = "*".repeat(app.api_key_input.chars().count());
+    let cursor = if app.cursor_visible { "_" } else { " " };
+    frame.render_widget(
+        Paragraph::new(format!("> {masked}{cursor}"))
+            .style(Style::default().fg(Color::Rgb(210, 218, 231))),
+        chunks[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new("Enter the API key for the selected provider, then press Enter")
+            .style(Style::default().fg(Color::Rgb(150, 160, 174))),
+        chunks[2],
+    );
+
+    if let Some(error) = &app.error_message {
+        frame.render_widget(
+            Paragraph::new(error.clone()).style(Style::default().fg(Color::Rgb(255, 120, 120))),
+            chunks[3],
+        );
+    }
+}
+
+fn draw_confirm_step(frame: &mut Frame, app: &SetupApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(frame.area());
+
+    let summary = format!(
+        "Confirm setup values:\n- workspace: {}\n- port: {}\n- provider: {}",
+        app.workspace_input.trim(),
+        app.agent_port,
+        PROVIDERS[app.provider_index]
+    );
+    frame.render_widget(
+        Paragraph::new(summary)
+            .style(Style::default().fg(Color::Rgb(225, 235, 250)))
+            .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+
+    let options = vec![
+        ListItem::new(Line::from("Confirm and save")),
+        ListItem::new(Line::from("Back to API key")),
+    ];
+    let list = List::new(options)
+        .style(Style::default().fg(Color::Rgb(188, 202, 220)))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Rgb(56, 74, 96))
+                .fg(Color::Rgb(243, 248, 255)),
+        )
+        .highlight_symbol("  > ");
+    let mut state = ListState::default().with_selected(Some(app.confirm_index));
+    frame.render_stateful_widget(list, chunks[1], &mut state);
+
+    frame.render_widget(
+        Paragraph::new("Up/Down to choose, Enter to continue")
+            .style(Style::default().fg(Color::Rgb(150, 160, 174))),
+        chunks[2],
+    );
+}
+
+struct ChatApp {
+    should_quit: bool,
+    input: String,
+    cursor_visible: bool,
+    messages: Vec<String>,
+}
+
+impl TuiApp for ChatApp {
+    fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
+    fn on_tick(&mut self) {
+        self.cursor_visible = !self.cursor_visible;
+    }
+}
+
+fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
+    if matches!(key.code, KeyCode::Esc)
+        || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        app.should_quit = true;
+        return;
+    }
+
+    match key.code {
+        KeyCode::Backspace => {
+            app.input.pop();
+        }
+        KeyCode::Enter => {
+            if app.input.trim().is_empty() {
+                return;
+            }
+            app.messages.push(format!("You: {}", app.input.trim()));
+            app.input.clear();
+        }
+        KeyCode::Char(c) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                app.input.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {
     let area = frame.area();
     let split = Layout::default()
         .direction(Direction::Horizontal)
@@ -310,7 +768,7 @@ fn draw_chat(frame: &mut Frame, app: &App) {
     draw_sidenav(frame, split[1]);
 }
 
-fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &ChatApp) {
     frame.render_widget(
         Block::default().style(Style::default().bg(Color::Rgb(23, 29, 37))),
         area,
@@ -337,7 +795,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(history, rows[0]);
 
     let cursor = if app.cursor_visible { "█" } else { " " };
-    let input_line = format!("> {}{}", app.input, cursor);
+    let input_line = format!("> {}{cursor}", app.input);
     let input = Paragraph::new(input_line).style(
         Style::default()
             .bg(Color::Rgb(43, 54, 69))

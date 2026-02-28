@@ -10,6 +10,17 @@ A terminal interface (TUI) for communicating with Looper agents.
 [ ] Session History
 [ ] PEAS Plugin Management
 
+## Setup Flow
+
+When terminal connects to an agent in setup mode, the chat view is replaced by a guided setup flow:
+
+1. Configure workspace directory (created if missing)
+2. Select model provider from a navigable list
+3. Enter provider API key
+4. Confirm settings before persisting
+
+After confirmation, the agent persists `settings.json` and `keys.json` in the workspace and switches to running mode.
+
 ## Commands
 
 Each command is executed in the format: `/<command> <subcommand> <args>`
