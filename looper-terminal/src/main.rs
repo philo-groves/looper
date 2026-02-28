@@ -485,6 +485,8 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         status_ticks: 0,
         ws_status: WebSocketStatus::Disconnected,
         connection_state,
+        agent_name: agent.agent_name.clone(),
+        agent_workspace: agent.workspace_dir.clone(),
     };
 
     let result = run_tui_loop(&mut app, draw_chat, handle_chat_key);
@@ -1031,6 +1033,8 @@ struct ChatApp {
     status_ticks: u8,
     ws_status: WebSocketStatus,
     connection_state: Arc<AtomicBool>,
+    agent_name: Option<String>,
+    agent_workspace: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1164,7 +1168,13 @@ fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {
             .split(area);
 
         draw_chat_panel(frame, split[0], app);
-        draw_sidenav(frame, split[1], app.ws_status);
+        draw_sidenav(
+            frame,
+            split[1],
+            app.ws_status,
+            app.agent_name.as_deref(),
+            app.agent_workspace.as_deref(),
+        );
     } else {
         draw_chat_panel(frame, area, app);
     }
@@ -1407,11 +1417,43 @@ fn pad_right(input: &str, width: usize) -> String {
     }
 }
 
-fn draw_sidenav(frame: &mut Frame, area: Rect, ws_status: WebSocketStatus) {
+fn draw_sidenav(
+    frame: &mut Frame,
+    area: Rect,
+    ws_status: WebSocketStatus,
+    agent_name: Option<&str>,
+    agent_workspace: Option<&str>,
+) {
     frame.render_widget(
         Block::default().style(Style::default().bg(Color::Rgb(16, 19, 25))),
         area,
     );
+
+    let display_name = agent_name.unwrap_or("(unnamed)");
+    let name_area = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(display_name).style(Style::default().fg(Color::Rgb(220, 229, 239))),
+        name_area,
+    );
+
+    if agent_name.is_none() {
+        let tip_area = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(2),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new("Tip: /rename <new name>")
+                .style(Style::default().fg(Color::Rgb(144, 163, 183))),
+            tip_area,
+        );
+    }
 
     let label = format!(" {} ", ws_status.label());
     let label_width = label.chars().count() as u16;
@@ -1435,6 +1477,64 @@ fn draw_sidenav(frame: &mut Frame, area: Rect, ws_status: WebSocketStatus) {
             .fg(Color::Rgb(16, 19, 25)),
     );
     frame.render_widget(badge, badge_area);
+
+    if area.height >= 3 {
+        let workspace_label_area = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(area.height.saturating_sub(3)),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new("Agent Workspace")
+                .style(Style::default().fg(Color::Rgb(220, 229, 239))),
+            workspace_label_area,
+        );
+
+        let workspace_value = format_workspace_path(agent_workspace);
+        let workspace_path_area = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(area.height.saturating_sub(2)),
+            width: area.width.saturating_sub(2),
+            height: 2,
+        };
+        frame.render_widget(
+            Paragraph::new(workspace_value)
+                .style(Style::default().fg(Color::Rgb(144, 163, 183)))
+                .wrap(Wrap { trim: false }),
+            workspace_path_area,
+        );
+    }
+}
+
+fn format_workspace_path(path: Option<&str>) -> String {
+    let Some(path) = path else {
+        return "(not set)".to_string();
+    };
+
+    let home = env::var("USERPROFILE")
+        .ok()
+        .or_else(|| env::var("HOME").ok())
+        .unwrap_or_default();
+    if home.is_empty() {
+        return path.to_string();
+    }
+
+    let normalized_home = home.replace('\\', "/").to_lowercase();
+    let normalized_path = path.replace('\\', "/");
+    let normalized_path_lower = normalized_path.to_lowercase();
+    if normalized_path_lower.starts_with(&normalized_home) {
+        let suffix = &normalized_path[normalized_home.len()..];
+        if suffix.is_empty() {
+            return "~".to_string();
+        }
+        if suffix.starts_with('/') {
+            return format!("~{suffix}");
+        }
+        return format!("~/{suffix}");
+    }
+
+    normalized_path
 }
 
 fn agent_name(agent: &AgentInfo) -> &str {
