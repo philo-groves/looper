@@ -1424,8 +1424,9 @@ fn draw_sidenav(
     agent_name: Option<&str>,
     agent_workspace: Option<&str>,
 ) {
+    let sidenav_bg = Color::Rgb(16, 19, 25);
     frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(16, 19, 25))),
+        Block::default().style(Style::default().bg(sidenav_bg)),
         area,
     );
 
@@ -1455,6 +1456,27 @@ fn draw_sidenav(
         );
     }
 
+    let todos_top = area.y.saturating_add(4);
+    let todos_bottom_exclusive = area.y.saturating_add(area.height.saturating_sub(4));
+    let todos_height = todos_bottom_exclusive.saturating_sub(todos_top);
+    if todos_height > 0 {
+        let todos_area = Rect {
+            x: area.x.saturating_add(1),
+            y: todos_top,
+            width: area.width.saturating_sub(2),
+            height: todos_height,
+        };
+
+        let todos_container = Paragraph::new("Todo")
+            .style(
+                Style::default()
+                    .bg(Color::Rgb(24, 29, 37))
+                    .fg(Color::Rgb(220, 229, 239)),
+            )
+            .wrap(Wrap { trim: false });
+        frame.render_widget(todos_container, todos_area);
+    }
+
     let label = format!(" {} ", ws_status.label());
     let label_width = label.chars().count() as u16;
     let right_margin = 1;
@@ -1474,11 +1496,11 @@ fn draw_sidenav(
     let badge = Paragraph::new(label).style(
         Style::default()
             .bg(ws_status.bg_color())
-            .fg(Color::Rgb(16, 19, 25)),
+            .fg(sidenav_bg),
     );
     frame.render_widget(badge, badge_area);
 
-    if area.height >= 3 {
+    if area.height >= 4 {
         let workspace_label_area = Rect {
             x: area.x.saturating_add(1),
             y: area.y.saturating_add(area.height.saturating_sub(3)),
