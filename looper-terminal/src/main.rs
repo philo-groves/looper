@@ -475,6 +475,7 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
     let mut app = ChatApp {
         should_quit: false,
         input: String::new(),
+        input_view_backscroll: 0,
         cursor_visible: true,
         messages: vec![format!(
             "Connected to {} ({}) on ws://{}:{}",
@@ -1030,6 +1031,7 @@ fn draw_confirm_step(frame: &mut Frame, app: &SetupApp) {
 struct ChatApp {
     should_quit: bool,
     input: String,
+    input_view_backscroll: usize,
     cursor_visible: bool,
     messages: Vec<String>,
     scroll_offset: usize,
@@ -1136,6 +1138,7 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
     match key.code {
         KeyCode::Backspace => {
             app.input.pop();
+            app.input_view_backscroll = 0;
         }
         KeyCode::Enter => {
             if app.input.trim().is_empty() {
@@ -1143,22 +1146,23 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
             }
             app.messages.push(format!("You: {}", app.input.trim()));
             app.input.clear();
+            app.input_view_backscroll = 0;
             app.follow_tail = true;
             app.status = ChatStatus::Thinking;
             app.status_ticks = 0;
         }
         KeyCode::Up => {
-            app.follow_tail = false;
-            app.scroll_offset = app.scroll_offset.saturating_sub(1);
+            app.input_view_backscroll = app.input_view_backscroll.saturating_add(1);
         }
         KeyCode::Down => {
-            app.scroll_offset = app.scroll_offset.saturating_add(1);
+            app.input_view_backscroll = app.input_view_backscroll.saturating_sub(1);
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
             {
                 app.input.push(c);
+                app.input_view_backscroll = 0;
             }
         }
         _ => {}
@@ -1205,7 +1209,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
         .constraints([
             Constraint::Min(3),
             Constraint::Length(1),
-            Constraint::Length(4),
+            Constraint::Length(5),
             Constraint::Length(1),
         ])
         .split(area);
@@ -1255,7 +1259,6 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     frame.render_stateful_widget(scrollbar, history_area, &mut scrollbar_state);
 
     let cursor = if app.cursor_visible { "█" } else { " " };
-    let input_line = format!("{}{cursor}", app.input);
 
     let input_label_outer = Block::default().style(
         Style::default()
@@ -1337,18 +1340,46 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     );
     frame.render_widget(input_border_widget, input_border_area);
 
-    let input_margin = Rect {
+    let input_text_area = Rect {
         x: input_container.x.saturating_add(2),
         y: input_container.y,
         width: input_container.width.saturating_sub(3),
-        height: input_container.height,
+        height: 2,
     };
-    let input = Paragraph::new(input_line).style(
+
+    let input_with_cursor = format!("{}{cursor}", app.input);
+    let wrapped_input = wrap_text(&input_with_cursor, input_text_area.width.max(1) as usize);
+    let max_input_scroll = wrapped_input
+        .len()
+        .saturating_sub(input_text_area.height as usize);
+    let input_scroll = max_input_scroll.saturating_sub(app.input_view_backscroll);
+    let input_lines: Vec<Line> = wrapped_input
+        .into_iter()
+        .skip(input_scroll)
+        .take(input_text_area.height as usize)
+        .map(Line::from)
+        .collect();
+
+    let input = Paragraph::new(Text::from(input_lines)).style(
         Style::default()
             .bg(Color::Rgb(43, 54, 69))
             .fg(Color::Rgb(242, 248, 255)),
     );
-    frame.render_widget(input, input_margin);
+    frame.render_widget(input, input_text_area);
+
+    let provider_area = Rect {
+        x: input_container.x.saturating_add(2),
+        y: input_container.y.saturating_add(input_container.height.saturating_sub(2)),
+        width: input_container.width.saturating_sub(3),
+        height: 1,
+    };
+    let provider_line = Line::from(vec![
+        Span::styled("OpenAI", Style::default().fg(Color::Rgb(88, 166, 255))),
+        Span::raw(" "),
+        Span::styled("Codex 5.3", Style::default().fg(Color::Rgb(144, 163, 183))),
+    ]);
+    let provider = Paragraph::new(provider_line).style(Style::default().bg(Color::Rgb(43, 54, 69)));
+    frame.render_widget(provider, provider_area);
 
     let status = Paragraph::new(format!(" {}", app.status.label())).style(
         Style::default()
