@@ -19,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState};
@@ -468,6 +468,10 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         monitor_agent_connection(agent_port, monitor_state).await;
     });
 
+    let project_workspace = env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+
     let mut app = ChatApp {
         should_quit: false,
         input: String::new(),
@@ -487,6 +491,7 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         connection_state,
         agent_name: agent.agent_name.clone(),
         agent_workspace: agent.workspace_dir.clone(),
+        project_workspace,
     };
 
     let result = run_tui_loop(&mut app, draw_chat, handle_chat_key);
@@ -880,7 +885,7 @@ fn draw_workspace_step(frame: &mut Frame, app: &SetupApp) {
 
     let cursor = if app.cursor_visible { "_" } else { " " };
     frame.render_widget(
-        Paragraph::new(format!("> {}{cursor}", app.workspace_input))
+        Paragraph::new(format!("{}{cursor}", app.workspace_input))
             .style(Style::default().fg(Color::Rgb(210, 218, 231))),
         chunks[1],
     );
@@ -958,7 +963,7 @@ fn draw_api_step(frame: &mut Frame, app: &SetupApp) {
     let masked = "*".repeat(app.api_key_input.chars().count());
     let cursor = if app.cursor_visible { "_" } else { " " };
     frame.render_widget(
-        Paragraph::new(format!("> {masked}{cursor}"))
+        Paragraph::new(format!("{masked}{cursor}"))
             .style(Style::default().fg(Color::Rgb(210, 218, 231))),
         chunks[1],
     );
@@ -1035,6 +1040,7 @@ struct ChatApp {
     connection_state: Arc<AtomicBool>,
     agent_name: Option<String>,
     agent_workspace: Option<String>,
+    project_workspace: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1174,6 +1180,7 @@ fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {
             app.ws_status,
             app.agent_name.as_deref(),
             app.agent_workspace.as_deref(),
+            app.project_workspace.as_deref(),
         );
     } else {
         draw_chat_panel(frame, area, app);
@@ -1195,7 +1202,12 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(4), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Length(1),
+        ])
         .split(area);
 
     let history_bg = Block::default().style(
@@ -1243,20 +1255,63 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     frame.render_stateful_widget(scrollbar, history_area, &mut scrollbar_state);
 
     let cursor = if app.cursor_visible { "█" } else { " " };
-    let input_line = format!("> {}{cursor}", app.input);
+    let input_line = format!("{}{cursor}", app.input);
+
+    let input_label_outer = Block::default().style(
+        Style::default()
+            .bg(Color::Rgb(28, 35, 45))
+            .fg(Color::Rgb(219, 227, 238)),
+    );
+    frame.render_widget(input_label_outer, rows[1]);
+
+    let input_label_container = Rect {
+        x: rows[1].x.saturating_add(1),
+        y: rows[1].y,
+        width: rows[1].width.saturating_sub(2),
+        height: rows[1].height,
+    };
+    let input_label_border_area = Rect {
+        x: input_label_container.x,
+        y: input_label_container.y,
+        width: 1,
+        height: input_label_container.height,
+    };
+    let input_label_border = std::iter::repeat("▌")
+        .take(input_label_container.height as usize)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input_label_border_widget = Paragraph::new(input_label_border).style(
+        Style::default()
+            .bg(Color::Rgb(43, 54, 69))
+            .fg(Color::Rgb(88, 166, 255)),
+    );
+    frame.render_widget(input_label_border_widget, input_label_border_area);
+
+    let input_label_margin = Rect {
+        x: input_label_container.x.saturating_add(1),
+        y: input_label_container.y,
+        width: input_label_container.width.saturating_sub(1),
+        height: input_label_container.height,
+    };
+    let input_label = Paragraph::new("").style(
+        Style::default()
+            .bg(Color::Rgb(43, 54, 69))
+            .fg(Color::Rgb(144, 163, 183)),
+    );
+    frame.render_widget(input_label, input_label_margin);
 
     let input_outer = Block::default().style(
         Style::default()
             .bg(Color::Rgb(28, 35, 45))
             .fg(Color::Rgb(219, 227, 238)),
     );
-    frame.render_widget(input_outer, rows[1]);
+    frame.render_widget(input_outer, rows[2]);
 
     let input_container = Rect {
-        x: rows[1].x.saturating_add(1),
-        y: rows[1].y,
-        width: rows[1].width.saturating_sub(2),
-        height: rows[1].height,
+        x: rows[2].x.saturating_add(1),
+        y: rows[2].y,
+        width: rows[2].width.saturating_sub(2),
+        height: rows[2].height,
     };
     let input_bg = Block::default().style(
         Style::default()
@@ -1265,10 +1320,27 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     );
     frame.render_widget(input_bg, input_container);
 
-    let input_margin = Rect {
-        x: input_container.x.saturating_add(1),
+    let input_border_area = Rect {
+        x: input_container.x,
         y: input_container.y,
-        width: input_container.width.saturating_sub(2),
+        width: 1,
+        height: input_container.height,
+    };
+    let input_border = std::iter::repeat("▌")
+        .take(input_container.height as usize)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let input_border_widget = Paragraph::new(input_border).style(
+        Style::default()
+            .bg(Color::Rgb(43, 54, 69))
+            .fg(Color::Rgb(88, 166, 255)),
+    );
+    frame.render_widget(input_border_widget, input_border_area);
+
+    let input_margin = Rect {
+        x: input_container.x.saturating_add(2),
+        y: input_container.y,
+        width: input_container.width.saturating_sub(3),
         height: input_container.height,
     };
     let input = Paragraph::new(input_line).style(
@@ -1278,12 +1350,12 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     );
     frame.render_widget(input, input_margin);
 
-    let status = Paragraph::new(format!(" Status: {}", app.status.label())).style(
+    let status = Paragraph::new(format!(" {}", app.status.label())).style(
         Style::default()
             .bg(Color::Rgb(23, 29, 37))
             .fg(Color::Rgb(144, 163, 183)),
     );
-    frame.render_widget(status, rows[2]);
+    frame.render_widget(status, rows[3]);
 }
 
 fn build_history_lines(messages: &[String], width: usize) -> Vec<Line<'static>> {
@@ -1423,6 +1495,7 @@ fn draw_sidenav(
     ws_status: WebSocketStatus,
     agent_name: Option<&str>,
     agent_workspace: Option<&str>,
+    project_workspace: Option<&str>,
 ) {
     let sidenav_bg = Color::Rgb(16, 19, 25);
     frame.render_widget(
@@ -1457,7 +1530,7 @@ fn draw_sidenav(
     }
 
     let todos_top = area.y.saturating_add(4);
-    let todos_bottom_exclusive = area.y.saturating_add(area.height.saturating_sub(4));
+    let todos_bottom_exclusive = area.y.saturating_add(area.height.saturating_sub(6));
     let todos_height = todos_bottom_exclusive.saturating_sub(todos_top);
     if todos_height > 0 {
         let todos_area = Rect {
@@ -1467,7 +1540,24 @@ fn draw_sidenav(
             height: todos_height,
         };
 
-        let todos_container = Paragraph::new("Todo")
+        let todos_content = Text::from(vec![
+            Line::from(Span::styled(
+                "Task Planning",
+                Style::default().fg(Color::Rgb(220, 229, 239)),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "No planning to show yet...",
+                Style::default().fg(Color::Rgb(180, 196, 214)),
+            )),
+        ]);
+
+        let todos_container = Paragraph::new(todos_content)
+            .block(
+                Block::default()
+                    .style(Style::default().bg(Color::Rgb(24, 29, 37)))
+                    .padding(Padding::new(1, 1, 1, 1)),
+            )
             .style(
                 Style::default()
                     .bg(Color::Rgb(24, 29, 37))
@@ -1500,10 +1590,11 @@ fn draw_sidenav(
     );
     frame.render_widget(badge, badge_area);
 
-    if area.height >= 4 {
+    if area.height >= 5 {
+        let workspace_top = area.y.saturating_add(area.height.saturating_sub(5));
         let workspace_label_area = Rect {
             x: area.x.saturating_add(1),
-            y: area.y.saturating_add(area.height.saturating_sub(3)),
+            y: workspace_top,
             width: area.width.saturating_sub(2),
             height: 1,
         };
@@ -1516,15 +1607,41 @@ fn draw_sidenav(
         let workspace_value = format_workspace_path(agent_workspace);
         let workspace_path_area = Rect {
             x: area.x.saturating_add(1),
-            y: area.y.saturating_add(area.height.saturating_sub(2)),
+            y: workspace_top.saturating_add(1),
             width: area.width.saturating_sub(2),
-            height: 2,
+            height: 1,
         };
         frame.render_widget(
             Paragraph::new(workspace_value)
                 .style(Style::default().fg(Color::Rgb(144, 163, 183)))
                 .wrap(Wrap { trim: false }),
             workspace_path_area,
+        );
+
+        let project_label_area = Rect {
+            x: area.x.saturating_add(1),
+            y: workspace_top.saturating_add(2),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new("Project Workspace")
+                .style(Style::default().fg(Color::Rgb(220, 229, 239))),
+            project_label_area,
+        );
+
+        let project_workspace_value = format_workspace_path(project_workspace);
+        let project_path_area = Rect {
+            x: area.x.saturating_add(1),
+            y: workspace_top.saturating_add(3),
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(project_workspace_value)
+                .style(Style::default().fg(Color::Rgb(144, 163, 183)))
+                .wrap(Wrap { trim: false }),
+            project_path_area,
         );
     }
 }
