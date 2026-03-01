@@ -1381,6 +1381,28 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     let provider = Paragraph::new(provider_line).style(Style::default().bg(Color::Rgb(43, 54, 69)));
     frame.render_widget(provider, provider_area);
 
+    let send_label = " Send ";
+    let send_width = send_label.chars().count() as u16;
+    let send_area = Rect {
+        x: provider_area
+            .x
+            .saturating_add(provider_area.width.saturating_sub(send_width)),
+        y: provider_area.y,
+        width: send_width.min(provider_area.width),
+        height: 1,
+    };
+    let send_bg = if app.input.trim().is_empty() {
+        Color::Rgb(96, 106, 120)
+    } else {
+        Color::Rgb(88, 166, 255)
+    };
+    let send = Paragraph::new(send_label).style(
+        Style::default()
+            .bg(send_bg)
+            .fg(Color::Rgb(16, 22, 31)),
+    );
+    frame.render_widget(send, send_area);
+
     let status = Paragraph::new(format!(" {}", app.status.label())).style(
         Style::default()
             .bg(Color::Rgb(23, 29, 37))
@@ -1561,7 +1583,7 @@ fn draw_sidenav(
     }
 
     let todos_top = area.y.saturating_add(4);
-    let todos_bottom_exclusive = area.y.saturating_add(area.height.saturating_sub(6));
+    let todos_bottom_exclusive = area.y.saturating_add(area.height.saturating_sub(7));
     let todos_height = todos_bottom_exclusive.saturating_sub(todos_top);
     if todos_height > 0 {
         let todos_area = Rect {
@@ -1621,11 +1643,11 @@ fn draw_sidenav(
     );
     frame.render_widget(badge, badge_area);
 
-    if area.height >= 5 {
-        let workspace_top = area.y.saturating_add(area.height.saturating_sub(5));
+    if area.height >= 7 {
+        let workspace_top = area.y.saturating_add(area.height.saturating_sub(7));
         let workspace_label_area = Rect {
             x: area.x.saturating_add(1),
-            y: workspace_top,
+            y: workspace_top.saturating_add(1),
             width: area.width.saturating_sub(2),
             height: 1,
         };
@@ -1638,7 +1660,7 @@ fn draw_sidenav(
         let workspace_value = format_workspace_path(agent_workspace);
         let workspace_path_area = Rect {
             x: area.x.saturating_add(1),
-            y: workspace_top.saturating_add(1),
+            y: workspace_top.saturating_add(2),
             width: area.width.saturating_sub(2),
             height: 1,
         };
@@ -1651,7 +1673,7 @@ fn draw_sidenav(
 
         let project_label_area = Rect {
             x: area.x.saturating_add(1),
-            y: workspace_top.saturating_add(2),
+            y: workspace_top.saturating_add(4),
             width: area.width.saturating_sub(2),
             height: 1,
         };
@@ -1664,7 +1686,7 @@ fn draw_sidenav(
         let project_workspace_value = format_workspace_path(project_workspace);
         let project_path_area = Rect {
             x: area.x.saturating_add(1),
-            y: workspace_top.saturating_add(3),
+            y: workspace_top.saturating_add(5),
             width: area.width.saturating_sub(2),
             height: 1,
         };
