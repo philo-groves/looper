@@ -13,7 +13,7 @@ use crossterm::terminal::{
 use futures_util::{SinkExt, StreamExt};
 use looper_common::{
     AGENT_HOST, AgentEntry, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL,
-    DiscoveryRequest, DiscoveryResponse, ProviderApiKey,
+    DiscoveryRequest, DiscoveryResponse, Effect, Percept, ProviderApiKey, SessionOrigin,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -23,10 +23,20 @@ use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use ratatui_widgets::list::{List, ListItem, ListState};
 use ratatui_widgets::scrollbar::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const TICK_RATE: Duration = Duration::from_millis(450);
-const PROVIDERS: [&str; 4] = ["openai", "anthropic", "google", "xai"];
+const PROVIDERS: [&str; 3] = ["openai", "anthropic", "opencode-zen"];
+
+fn default_model_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "openai" => "gpt-4o-mini",
+        "anthropic" => "claude-3-5-sonnet-latest",
+        "opencode-zen" => "openai/gpt-5.1-mini",
+        _ => "gpt-4o-mini",
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -85,8 +95,7 @@ async fn discover_agents() -> anyhow::Result<Vec<AgentEntry>> {
                     DiscoveryResponse::Registered { .. }
                     | DiscoveryResponse::AgentLaunchUpserted
                     | DiscoveryResponse::AgentStarted { .. }
-                    | DiscoveryResponse::AgentCreated { .. } => {
-                    }
+                    | DiscoveryResponse::AgentCreated { .. } => {}
                 }
             }
             Ok(Message::Close(_)) => break,
@@ -151,7 +160,9 @@ async fn create_new_agent() -> anyhow::Result<AgentInfo> {
                 let response: DiscoveryResponse = serde_json::from_str(&text)
                     .with_context(|| format!("invalid discovery response: {text}"))?;
                 match response {
-                    DiscoveryResponse::AgentCreated { assigned_port: port } => {
+                    DiscoveryResponse::AgentCreated {
+                        assigned_port: port,
+                    } => {
                         assigned_port = Some(port);
                         break;
                     }
@@ -299,9 +310,10 @@ async fn wait_for_agent_online(workspace_dir: &str, port: u16) -> anyhow::Result
                     let response: DiscoveryResponse = serde_json::from_str(&text)
                         .with_context(|| format!("invalid discovery response: {text}"))?;
                     if let DiscoveryResponse::Agents { agents } = response {
-                        if let Some(entry) = agents.iter().find(|entry| {
-                            entry.workspace_dir == workspace_dir && entry.is_running
-                        }) {
+                        if let Some(entry) = agents
+                            .iter()
+                            .find(|entry| entry.workspace_dir == workspace_dir && entry.is_running)
+                        {
                             return Ok(AgentInfo {
                                 agent_id: entry
                                     .agent_id
@@ -364,6 +376,7 @@ async fn fetch_agent_mode(agent: &AgentInfo) -> anyhow::Result<AgentMode> {
 struct SetupForm {
     workspace_dir: String,
     provider: String,
+    model: String,
     api_key: String,
 }
 
@@ -373,6 +386,7 @@ fn run_setup_flow(agent: &AgentInfo) -> anyhow::Result<Option<SetupForm>> {
         should_quit: false,
         workspace_input: String::new(),
         provider_index: 0,
+        model_input: default_model_for_provider(PROVIDERS[0]).to_string(),
         api_key_input: String::new(),
         confirm_index: 0,
         error_message: None,
@@ -389,6 +403,7 @@ fn run_setup_flow(agent: &AgentInfo) -> anyhow::Result<Option<SetupForm>> {
     Ok(Some(SetupForm {
         workspace_dir: app.workspace_input.trim().to_string(),
         provider: PROVIDERS[app.provider_index].to_string(),
+        model: app.model_input.trim().to_string(),
         api_key: app.api_key_input.trim().to_string(),
     }))
 }
@@ -423,6 +438,7 @@ async fn submit_setup(agent: &AgentInfo, form: SetupForm) -> anyhow::Result<()> 
         workspace_dir: form.workspace_dir,
         port: agent.assigned_port,
         provider: form.provider.clone(),
+        model: form.model,
         api_keys: vec![ProviderApiKey {
             provider: form.provider,
             api_key: form.api_key,
@@ -468,6 +484,13 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         monitor_agent_connection(agent_port, monitor_state).await;
     });
 
+    let (chat_cmd_tx, chat_cmd_rx) = unbounded_channel();
+    let (chat_event_tx, chat_event_rx) = unbounded_channel();
+    let socket_port = agent.assigned_port;
+    let socket_handle = tokio::spawn(async move {
+        chat_socket_loop(socket_port, chat_cmd_rx, chat_event_tx).await;
+    });
+
     let project_workspace = env::current_dir()
         .ok()
         .map(|path| path.to_string_lossy().into_owned());
@@ -477,13 +500,7 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         input: String::new(),
         input_view_backscroll: 0,
         cursor_visible: true,
-        messages: vec![format!(
-            "Connected to {} ({}) on ws://{}:{}",
-            agent_name(agent),
-            agent.agent_id,
-            AGENT_HOST,
-            agent.assigned_port
-        )],
+        messages: Vec::new(),
         scroll_offset: 0,
         follow_tail: true,
         status: ChatStatus::Idle,
@@ -493,21 +510,247 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         agent_name: agent.agent_name.clone(),
         agent_workspace: agent.workspace_dir.clone(),
         project_workspace,
+        chat_cmd_tx,
+        chat_event_rx,
+        session_id: None,
+        next_turn_id: 1,
+        active_provider: "(pending)".to_string(),
+        active_model: "(pending)".to_string(),
+        agent_port: agent.assigned_port,
     };
 
     let result = run_tui_loop(&mut app, draw_chat, handle_chat_key);
+    let _ = app.chat_cmd_tx.send(ChatCommand::EndSession);
     monitor_handle.abort();
+    socket_handle.abort();
     result
+}
+
+#[derive(Debug)]
+enum ChatCommand {
+    SendPercept { turn_id: String, text: String },
+    EndSession,
+}
+
+#[derive(Debug)]
+enum ChatEvent {
+    SessionStarted {
+        session_id: String,
+        provider: String,
+        model: String,
+    },
+    EffectApplied {
+        effect: Effect,
+    },
+    Error {
+        message: String,
+    },
+    Disconnected,
+}
+
+async fn chat_socket_loop(
+    assigned_port: u16,
+    mut cmd_rx: UnboundedReceiver<ChatCommand>,
+    event_tx: UnboundedSender<ChatEvent>,
+) {
+    let url = format!("ws://{AGENT_HOST}:{assigned_port}");
+    let (ws_stream, _) = match connect_async(&url).await {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = event_tx.send(ChatEvent::Error {
+                message: format!("chat connection failed: {error}"),
+            });
+            let _ = event_tx.send(ChatEvent::Disconnected);
+            return;
+        }
+    };
+    let (mut writer, mut reader) = ws_stream.split();
+
+    let mut session_id: Option<String> = None;
+    let mut started = false;
+    while let Some(message) = reader.next().await {
+        match message {
+            Ok(Message::Text(text)) => {
+                let payload: AgentSocketMessage = match serde_json::from_str(&text) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        let _ = event_tx.send(ChatEvent::Error {
+                            message: format_handshake_parse_error(&text, &error),
+                        });
+                        continue;
+                    }
+                };
+                match payload {
+                    AgentSocketMessage::AgentHello { mode, .. } => {
+                        if mode != AgentMode::Running {
+                            let _ = event_tx.send(ChatEvent::Error {
+                                message: "agent is not in running mode".to_string(),
+                            });
+                            let _ = event_tx.send(ChatEvent::Disconnected);
+                            return;
+                        }
+                        let request = AgentSocketMessage::SessionStart {
+                            origin: SessionOrigin::TerminalChat,
+                        };
+                        if writer
+                            .send(Message::Text(
+                                serde_json::to_string(&request)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                                    .into(),
+                            ))
+                            .await
+                            .is_err()
+                        {
+                            let _ = event_tx.send(ChatEvent::Error {
+                                message: "failed to request chat session".to_string(),
+                            });
+                            let _ = event_tx.send(ChatEvent::Disconnected);
+                            return;
+                        }
+                    }
+                    AgentSocketMessage::SessionStarted {
+                        session_id: id,
+                        provider,
+                        model,
+                        ..
+                    } => {
+                        session_id = Some(id.clone());
+                        started = true;
+                        let _ = event_tx.send(ChatEvent::SessionStarted {
+                            session_id: id,
+                            provider,
+                            model,
+                        });
+                        break;
+                    }
+                    AgentSocketMessage::Error { message } => {
+                        let _ = event_tx.send(ChatEvent::Error { message });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(error) => {
+                let _ = event_tx.send(ChatEvent::Error {
+                    message: format!("socket handshake read failed: {error}"),
+                });
+                break;
+            }
+        }
+    }
+
+    if !started {
+        let _ = event_tx.send(ChatEvent::Disconnected);
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            maybe_cmd = cmd_rx.recv() => {
+                let Some(cmd) = maybe_cmd else {
+                    break;
+                };
+
+                match cmd {
+                    ChatCommand::SendPercept { turn_id, text } => {
+                        let Some(active_session_id) = session_id.clone() else {
+                            let _ = event_tx.send(ChatEvent::Error { message: "session is not started".to_string() });
+                            continue;
+                        };
+                        let percept = AgentSocketMessage::PerceptObserved {
+                            session_id: active_session_id,
+                            domain: "chat".to_string(),
+                            percept: Percept::UserText { turn_id, text },
+                        };
+                        if let Err(error) = writer
+                            .send(Message::Text(
+                                serde_json::to_string(&percept)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                                    .into(),
+                            ))
+                            .await
+                        {
+                            let _ = event_tx.send(ChatEvent::Error {
+                                message: format!("failed to send percept: {error}"),
+                            });
+                            break;
+                        }
+                    }
+                    ChatCommand::EndSession => {
+                        if let Some(active_session_id) = session_id.clone() {
+                            let end = AgentSocketMessage::SessionEnd {
+                                session_id: active_session_id,
+                            };
+                            let _ = writer
+                                .send(Message::Text(
+                                    serde_json::to_string(&end)
+                                        .unwrap_or_else(|_| "{}".to_string())
+                                        .into(),
+                                ))
+                                .await;
+                        }
+                        let _ = writer.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
+            }
+            maybe_msg = reader.next() => {
+                let Some(message) = maybe_msg else {
+                    break;
+                };
+                match message {
+                    Ok(Message::Text(text)) => {
+                        let payload: AgentSocketMessage = match serde_json::from_str(&text) {
+                            Ok(parsed) => parsed,
+                            Err(error) => {
+                                let _ = event_tx.send(ChatEvent::Error {
+                                    message: format!("invalid socket payload: {error}"),
+                                });
+                                continue;
+                            }
+                        };
+                        match payload {
+                            AgentSocketMessage::EffectApplied { effect, .. } => {
+                                let _ = event_tx.send(ChatEvent::EffectApplied { effect });
+                            }
+                            AgentSocketMessage::Error { message } => {
+                                let _ = event_tx.send(ChatEvent::Error { message });
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(Message::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = event_tx.send(ChatEvent::Error {
+                            message: format!("socket read failed: {error}"),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = event_tx.send(ChatEvent::Disconnected);
+}
+
+fn format_handshake_parse_error(text: &str, error: &serde_json::Error) -> String {
+    let error_text = error.to_string();
+    if error_text.contains("unknown variant `user_text`") {
+        return "received legacy 'user_text' protocol from agent; restart looper-discovery and looper-agent so both run the new PEAS protocol binaries".to_string();
+    }
+
+    format!("invalid handshake payload: {error}; payload={text}")
 }
 
 async fn monitor_agent_connection(agent_port: u16, state: Arc<AtomicBool>) {
     loop {
-        let connected = tokio::time::timeout(
-            Duration::from_millis(700),
-            is_agent_running(agent_port),
-        )
-        .await
-        .unwrap_or(false);
+        let connected =
+            tokio::time::timeout(Duration::from_millis(700), is_agent_running(agent_port))
+                .await
+                .unwrap_or(false);
         state.store(connected, Ordering::Relaxed);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -528,7 +771,11 @@ async fn is_agent_running(agent_port: u16) -> bool {
         Err(_) => return false,
     };
 
-    if writer.send(Message::Text(list_request.into())).await.is_err() {
+    if writer
+        .send(Message::Text(list_request.into()))
+        .await
+        .is_err()
+    {
         return false;
     }
 
@@ -692,7 +939,11 @@ fn draw_agent_selector(frame: &mut Frame, app: &mut AgentSelectorApp) {
             ListItem::new(Line::from(format!(
                 "{} - {} - ws://127.0.0.1:{}",
                 agent.workspace_dir,
-                if agent.is_running { "running" } else { "stopped" },
+                if agent.is_running {
+                    "running"
+                } else {
+                    "stopped"
+                },
                 agent.assigned_port
             )))
         })
@@ -726,6 +977,7 @@ fn draw_agent_selector(frame: &mut Frame, app: &mut AgentSelectorApp) {
 enum SetupStage {
     Workspace,
     Provider,
+    Model,
     ApiKey,
     Confirm,
     Done,
@@ -736,6 +988,7 @@ struct SetupApp {
     should_quit: bool,
     workspace_input: String,
     provider_index: usize,
+    model_input: String,
     api_key_input: String,
     confirm_index: usize,
     error_message: Option<String>,
@@ -775,7 +1028,8 @@ fn handle_setup_key(app: &mut SetupApp, key: KeyEvent) {
                 }
 
                 if let Err(error) = std::fs::create_dir_all(app.workspace_input.trim()) {
-                    app.error_message = Some(format!("Could not create workspace directory: {error}"));
+                    app.error_message =
+                        Some(format!("Could not create workspace directory: {error}"));
                     return;
                 }
 
@@ -802,7 +1056,29 @@ fn handle_setup_key(app: &mut SetupApp, key: KeyEvent) {
                 }
             }
             KeyCode::Enter => {
+                app.model_input =
+                    default_model_for_provider(PROVIDERS[app.provider_index]).to_string();
+                app.stage = SetupStage::Model;
+            }
+            _ => {}
+        },
+        SetupStage::Model => match key.code {
+            KeyCode::Backspace => {
+                app.model_input.pop();
+            }
+            KeyCode::Enter => {
+                if app.model_input.trim().is_empty() {
+                    app.error_message = Some("Model cannot be empty".to_string());
+                    return;
+                }
                 app.stage = SetupStage::ApiKey;
+            }
+            KeyCode::Char(c) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    app.model_input.push(c);
+                }
             }
             _ => {}
         },
@@ -842,7 +1118,7 @@ fn handle_setup_key(app: &mut SetupApp, key: KeyEvent) {
                     app.stage = SetupStage::Done;
                     app.should_quit = true;
                 } else {
-                    app.stage = SetupStage::ApiKey;
+                    app.stage = SetupStage::Model;
                 }
             }
             _ => {}
@@ -861,9 +1137,51 @@ fn draw_setup(frame: &mut Frame, app: &mut SetupApp) {
     match app.stage {
         SetupStage::Workspace => draw_workspace_step(frame, app),
         SetupStage::Provider => draw_provider_step(frame, app),
+        SetupStage::Model => draw_model_step(frame, app),
         SetupStage::ApiKey => draw_api_step(frame, app),
         SetupStage::Confirm => draw_confirm_step(frame, app),
         SetupStage::Done => {}
+    }
+}
+
+fn draw_model_step(frame: &mut Frame, app: &SetupApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(2),
+            Constraint::Min(2),
+        ])
+        .split(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Agent Setup - Model ({})",
+            PROVIDERS[app.provider_index]
+        ))
+        .style(Style::default().fg(Color::Rgb(227, 237, 255))),
+        chunks[0],
+    );
+
+    let cursor = if app.cursor_visible { "_" } else { " " };
+    frame.render_widget(
+        Paragraph::new(format!("{}{cursor}", app.model_input))
+            .style(Style::default().fg(Color::Rgb(210, 218, 231))),
+        chunks[1],
+    );
+
+    frame.render_widget(
+        Paragraph::new("Enter model ID for selected provider, then press Enter")
+            .style(Style::default().fg(Color::Rgb(150, 160, 174))),
+        chunks[2],
+    );
+
+    if let Some(error) = &app.error_message {
+        frame.render_widget(
+            Paragraph::new(error.clone()).style(Style::default().fg(Color::Rgb(255, 120, 120))),
+            chunks[3],
+        );
     }
 }
 
@@ -908,7 +1226,11 @@ fn draw_workspace_step(frame: &mut Frame, app: &SetupApp) {
 fn draw_provider_step(frame: &mut Frame, app: &SetupApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
         .split(frame.area());
 
     frame.render_widget(
@@ -994,10 +1316,11 @@ fn draw_confirm_step(frame: &mut Frame, app: &SetupApp) {
         .split(frame.area());
 
     let summary = format!(
-        "Confirm setup values:\n- workspace: {}\n- port: {}\n- provider: {}",
+        "Confirm setup values:\n- workspace: {}\n- port: {}\n- provider: {}\n- model: {}",
         app.workspace_input.trim(),
         app.agent_port,
-        PROVIDERS[app.provider_index]
+        PROVIDERS[app.provider_index],
+        app.model_input.trim()
     );
     frame.render_widget(
         Paragraph::new(summary)
@@ -1008,7 +1331,7 @@ fn draw_confirm_step(frame: &mut Frame, app: &SetupApp) {
 
     let options = vec![
         ListItem::new(Line::from("Confirm and save")),
-        ListItem::new(Line::from("Back to API key")),
+        ListItem::new(Line::from("Back to model")),
     ];
     let list = List::new(options)
         .style(Style::default().fg(Color::Rgb(188, 202, 220)))
@@ -1033,7 +1356,7 @@ struct ChatApp {
     input: String,
     input_view_backscroll: usize,
     cursor_visible: bool,
-    messages: Vec<String>,
+    messages: Vec<ChatMessage>,
     scroll_offset: usize,
     follow_tail: bool,
     status: ChatStatus,
@@ -1043,6 +1366,25 @@ struct ChatApp {
     agent_name: Option<String>,
     agent_workspace: Option<String>,
     project_workspace: Option<String>,
+    chat_cmd_tx: UnboundedSender<ChatCommand>,
+    chat_event_rx: UnboundedReceiver<ChatEvent>,
+    session_id: Option<String>,
+    next_turn_id: u64,
+    active_provider: String,
+    active_model: String,
+    agent_port: u16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MessageRole {
+    User,
+    Assistant,
+    System,
+}
+
+struct ChatMessage {
+    role: MessageRole,
+    text: String,
 }
 
 #[derive(Clone, Copy)]
@@ -1071,17 +1413,13 @@ impl WebSocketStatus {
 enum ChatStatus {
     Idle,
     Thinking,
-    PerformingTask,
-    Responding,
 }
 
 impl ChatStatus {
     fn label(self) -> &'static str {
         match self {
-            Self::Idle => "Idle",
+            Self::Idle => "Idle...",
             Self::Thinking => "Thinking...",
-            Self::PerformingTask => "Performing a Task...",
-            Self::Responding => "Responding...",
         }
     }
 }
@@ -1099,27 +1437,80 @@ impl TuiApp for ChatApp {
             WebSocketStatus::Disconnected
         };
 
-        match self.status {
-            ChatStatus::Idle => {}
-            ChatStatus::Thinking => {
-                self.status_ticks = self.status_ticks.saturating_add(1);
-                if self.status_ticks >= 2 {
-                    self.status = ChatStatus::PerformingTask;
-                    self.status_ticks = 0;
-                }
-            }
-            ChatStatus::PerformingTask => {
-                self.status_ticks = self.status_ticks.saturating_add(1);
-                if self.status_ticks >= 2 {
-                    self.status = ChatStatus::Responding;
-                    self.status_ticks = 0;
-                }
-            }
-            ChatStatus::Responding => {
-                self.status_ticks = self.status_ticks.saturating_add(1);
-                if self.status_ticks >= 2 {
+        while let Ok(event) = self.chat_event_rx.try_recv() {
+            match event {
+                ChatEvent::SessionStarted {
+                    session_id,
+                    provider,
+                    model,
+                } => {
+                    self.session_id = Some(session_id.clone());
+                    self.active_provider = provider;
+                    self.active_model = model;
+                    self.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        text: format!("Connected to {session_id} on ws://{AGENT_HOST}:{}", self.agent_port),
+                    });
                     self.status = ChatStatus::Idle;
                     self.status_ticks = 0;
+                    self.follow_tail = true;
+                }
+                ChatEvent::EffectApplied { effect } => {
+                    match effect {
+                        Effect::ChatResponseDelta { text_delta, .. } => {
+                            match self.messages.last_mut() {
+                                Some(last) if last.role == MessageRole::Assistant => {
+                                    last.text.push_str(&text_delta);
+                                }
+                                _ => {
+                                    self.messages.push(ChatMessage {
+                                        role: MessageRole::Assistant,
+                                        text: text_delta,
+                                    });
+                                }
+                            }
+                        }
+                        Effect::ChatResponse { text, .. } => match self.messages.last_mut() {
+                            Some(last)
+                                if last.role == MessageRole::Assistant && !last.text.is_empty() =>
+                            {
+                                last.text = text;
+                            }
+                            _ => self.messages.push(ChatMessage {
+                                role: MessageRole::Assistant,
+                                text,
+                            }),
+                        },
+                        Effect::TaskCompletion {
+                            status, details, ..
+                        } => {
+                            self.messages.push(ChatMessage {
+                                role: MessageRole::System,
+                                text: format!("Task Completion: {status} - {details}"),
+                            });
+                        }
+                    }
+                    self.status = ChatStatus::Idle;
+                    self.status_ticks = 0;
+                    self.follow_tail = true;
+                }
+                ChatEvent::Error { message } => {
+                    self.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        text: format!("Error: {message}"),
+                    });
+                    self.status = ChatStatus::Idle;
+                    self.status_ticks = 0;
+                    self.follow_tail = true;
+                }
+                ChatEvent::Disconnected => {
+                    self.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        text: "Connection closed.".to_string(),
+                    });
+                    self.status = ChatStatus::Idle;
+                    self.status_ticks = 0;
+                    self.follow_tail = true;
                 }
             }
         }
@@ -1144,7 +1535,23 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
             if app.input.trim().is_empty() {
                 return;
             }
-            app.messages.push(format!("You: {}", app.input.trim()));
+            let text = app.input.trim().to_string();
+            let turn_id = format!("turn-{}", app.next_turn_id);
+            app.next_turn_id = app.next_turn_id.saturating_add(1);
+            app.messages.push(ChatMessage {
+                role: MessageRole::User,
+                text: text.clone(),
+            });
+            if app
+                .chat_cmd_tx
+                .send(ChatCommand::SendPercept { turn_id, text })
+                .is_err()
+            {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    text: "Error: Unable to send percept to agent.".to_string(),
+                });
+            }
             app.input.clear();
             app.input_view_backscroll = 0;
             app.follow_tail = true;
@@ -1183,6 +1590,7 @@ fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {
             split[1],
             app.ws_status,
             app.agent_name.as_deref(),
+            app.agent_port,
             app.agent_workspace.as_deref(),
             app.project_workspace.as_deref(),
         );
@@ -1369,14 +1777,22 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
 
     let provider_area = Rect {
         x: input_container.x.saturating_add(2),
-        y: input_container.y.saturating_add(input_container.height.saturating_sub(2)),
+        y: input_container
+            .y
+            .saturating_add(input_container.height.saturating_sub(2)),
         width: input_container.width.saturating_sub(3),
         height: 1,
     };
     let provider_line = Line::from(vec![
-        Span::styled("OpenAI", Style::default().fg(Color::Rgb(88, 166, 255))),
+        Span::styled(
+            app.active_provider.clone(),
+            Style::default().fg(Color::Rgb(88, 166, 255)),
+        ),
         Span::raw(" "),
-        Span::styled("Codex 5.3", Style::default().fg(Color::Rgb(144, 163, 183))),
+        Span::styled(
+            app.active_model.clone(),
+            Style::default().fg(Color::Rgb(144, 163, 183)),
+        ),
     ]);
     let provider = Paragraph::new(provider_line).style(Style::default().bg(Color::Rgb(43, 54, 69)));
     frame.render_widget(provider, provider_area);
@@ -1396,11 +1812,8 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     } else {
         Color::Rgb(88, 166, 255)
     };
-    let send = Paragraph::new(send_label).style(
-        Style::default()
-            .bg(send_bg)
-            .fg(Color::Rgb(16, 22, 31)),
-    );
+    let send =
+        Paragraph::new(send_label).style(Style::default().bg(send_bg).fg(Color::Rgb(16, 22, 31)));
     frame.render_widget(send, send_area);
 
     let status = Paragraph::new(format!(" {}", app.status.label())).style(
@@ -1411,7 +1824,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     frame.render_widget(status, rows[3]);
 }
 
-fn build_history_lines(messages: &[String], width: usize) -> Vec<Line<'static>> {
+fn build_history_lines(messages: &[ChatMessage], width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return vec![Line::from("")];
     }
@@ -1419,7 +1832,7 @@ fn build_history_lines(messages: &[String], width: usize) -> Vec<Line<'static>> 
     if width <= 2 {
         let mut compact = vec![Line::from("")];
         for message in messages {
-            compact.push(Line::from(message.clone()));
+            compact.push(Line::from(message.text.clone()));
             compact.push(Line::from(""));
         }
         return compact;
@@ -1428,13 +1841,13 @@ fn build_history_lines(messages: &[String], width: usize) -> Vec<Line<'static>> 
     let mut lines = Vec::new();
     lines.push(Line::from(""));
 
-        let bubble_outer_width = width.saturating_sub(2);
-        let bubble_inner_width = bubble_outer_width.saturating_sub(2).max(1);
+    let bubble_outer_width = width.saturating_sub(2);
+    let bubble_inner_width = bubble_outer_width.saturating_sub(2).max(1);
 
     for message in messages {
-        let is_user = message.starts_with("You:");
+        let is_user = message.role == MessageRole::User;
         if is_user {
-            lines.push(Line::from(format!(" {}", message)));
+            lines.push(Line::from(format!(" {}", message.text)));
             lines.push(Line::from(""));
             continue;
         }
@@ -1442,7 +1855,7 @@ fn build_history_lines(messages: &[String], width: usize) -> Vec<Line<'static>> 
         let bubble_style = Style::default()
             .bg(Color::Rgb(20, 24, 31))
             .fg(Color::Rgb(224, 233, 245));
-        let wrapped = wrap_text(message, bubble_inner_width);
+        let wrapped = wrap_text(&message.text, bubble_inner_width);
 
         lines.push(Line::from(Span::styled(
             " ".repeat(bubble_outer_width),
@@ -1547,6 +1960,7 @@ fn draw_sidenav(
     area: Rect,
     ws_status: WebSocketStatus,
     agent_name: Option<&str>,
+    agent_port: u16,
     agent_workspace: Option<&str>,
     project_workspace: Option<&str>,
 ) {
@@ -1568,19 +1982,17 @@ fn draw_sidenav(
         name_area,
     );
 
-    if agent_name.is_none() {
-        let tip_area = Rect {
-            x: area.x.saturating_add(1),
-            y: area.y.saturating_add(2),
-            width: area.width.saturating_sub(2),
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new("Tip: /rename <new name>")
-                .style(Style::default().fg(Color::Rgb(144, 163, 183))),
-            tip_area,
-        );
-    }
+    let tip_area = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(2),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(format!("ws://{AGENT_HOST}:{agent_port}"))
+            .style(Style::default().fg(Color::Rgb(144, 163, 183))),
+        tip_area,
+    );
 
     let todos_top = area.y.saturating_add(4);
     let todos_bottom_exclusive = area.y.saturating_add(area.height.saturating_sub(7));
@@ -1625,9 +2037,10 @@ fn draw_sidenav(
     let right_margin = 1;
     let top_margin = 1;
 
-    let badge_x = area
-        .x
-        .saturating_add(area.width.saturating_sub(label_width.saturating_add(right_margin)));
+    let badge_x = area.x.saturating_add(
+        area.width
+            .saturating_sub(label_width.saturating_add(right_margin)),
+    );
     let badge_y = area.y.saturating_add(top_margin);
     let badge_area = Rect {
         x: badge_x,
@@ -1636,11 +2049,8 @@ fn draw_sidenav(
         height: 1,
     };
 
-    let badge = Paragraph::new(label).style(
-        Style::default()
-            .bg(ws_status.bg_color())
-            .fg(sidenav_bg),
-    );
+    let badge =
+        Paragraph::new(label).style(Style::default().bg(ws_status.bg_color()).fg(sidenav_bg));
     frame.render_widget(badge, badge_area);
 
     if area.height >= 7 {
@@ -1652,8 +2062,7 @@ fn draw_sidenav(
             height: 1,
         };
         frame.render_widget(
-            Paragraph::new("Agent Workspace")
-                .style(Style::default().fg(Color::Rgb(220, 229, 239))),
+            Paragraph::new("Agent Workspace").style(Style::default().fg(Color::Rgb(220, 229, 239))),
             workspace_label_area,
         );
 
@@ -1727,8 +2136,4 @@ fn format_workspace_path(path: Option<&str>) -> String {
     }
 
     normalized_path
-}
-
-fn agent_name(agent: &AgentInfo) -> &str {
-    agent.agent_name.as_deref().unwrap_or("unnamed")
 }

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -174,7 +174,9 @@ async fn main() -> anyhow::Result<()> {
 
     println!("discovery listening on ws://{bind_addr}");
 
-    let state = Arc::new(Mutex::new(DiscoveryState::from_launch_configs(launch_configs)));
+    let state = Arc::new(Mutex::new(DiscoveryState::from_launch_configs(
+        launch_configs,
+    )));
 
     loop {
         let (stream, addr) = listener
@@ -402,13 +404,10 @@ async fn handle_connection(
                 return Ok(());
             };
 
-            let already_running = state_guard
-                .agents
-                .values()
-                .any(|agent| {
-                    agent.workspace_dir.as_deref() == Some(cfg.workspace_dir.as_str())
-                        || agent.assigned_port == cfg.port
-                });
+            let already_running = state_guard.agents.values().any(|agent| {
+                agent.workspace_dir.as_deref() == Some(cfg.workspace_dir.as_str())
+                    || agent.assigned_port == cfg.port
+            });
 
             if already_running {
                 writer
@@ -547,7 +546,10 @@ fn load_launch_configs(path: &PathBuf) -> anyhow::Result<Vec<AgentLaunchConfig>>
     Ok(configs)
 }
 
-fn persist_launch_configs(path: &PathBuf, launch_configs: &[AgentLaunchConfig]) -> anyhow::Result<()> {
+fn persist_launch_configs(
+    path: &PathBuf,
+    launch_configs: &[AgentLaunchConfig],
+) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("invalid launch config path {}", path.display()))?;
@@ -565,6 +567,7 @@ fn persist_launch_configs(path: &PathBuf, launch_configs: &[AgentLaunchConfig]) 
 }
 
 fn start_configured_agent(config: &AgentLaunchConfig) -> anyhow::Result<()> {
+    ensure_agent_binary_is_current()?;
     let agent_binary = resolve_agent_binary()?;
     let mut cmd = Command::new(&agent_binary);
     cmd.arg("--workspace-dir")
@@ -591,6 +594,7 @@ fn start_configured_agent(config: &AgentLaunchConfig) -> anyhow::Result<()> {
 }
 
 fn start_new_agent(assigned_port: u16) -> anyhow::Result<()> {
+    ensure_agent_binary_is_current()?;
     let agent_binary = resolve_agent_binary()?;
     let mut cmd = Command::new(&agent_binary);
     cmd.arg("--port").arg(assigned_port.to_string());
@@ -616,4 +620,62 @@ fn resolve_agent_binary() -> anyhow::Result<PathBuf> {
     }
 
     Ok(PathBuf::from(executable_name))
+}
+
+fn ensure_agent_binary_is_current() -> anyhow::Result<()> {
+    let current_exe = env::current_exe().context("failed to resolve current executable path")?;
+    let executable_name = if cfg!(windows) {
+        "looper-agent.exe"
+    } else {
+        "looper-agent"
+    };
+    let agent_binary = current_exe.with_file_name(executable_name);
+
+    let Some(workspace_root) = discover_workspace_root(&current_exe) else {
+        return Ok(());
+    };
+
+    let cargo_toml = workspace_root.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        return Ok(());
+    }
+
+    let discovery_mtime = fs::metadata(&current_exe)
+        .and_then(|meta| meta.modified())
+        .ok();
+    let agent_mtime = fs::metadata(&agent_binary)
+        .and_then(|meta| meta.modified())
+        .ok();
+
+    let should_build = match (discovery_mtime, agent_mtime) {
+        (_, None) => true,
+        (Some(discovery), Some(agent)) => discovery > agent,
+        (None, Some(_)) => false,
+    };
+
+    if !should_build {
+        return Ok(());
+    }
+
+    println!("building looper-agent to match discovery protocol...");
+    let status = Command::new("cargo")
+        .current_dir(&workspace_root)
+        .arg("build")
+        .arg("-p")
+        .arg("looper-agent")
+        .status()
+        .context("failed to invoke cargo build for looper-agent")?;
+
+    if !status.success() {
+        anyhow::bail!("cargo build -p looper-agent failed while preparing agent binary");
+    }
+
+    Ok(())
+}
+
+fn discover_workspace_root(current_exe: &Path) -> Option<PathBuf> {
+    let debug_dir = current_exe.parent()?;
+    let target_dir = debug_dir.parent()?;
+    let workspace_root = target_dir.parent()?;
+    Some(workspace_root.to_path_buf())
 }

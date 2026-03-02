@@ -1,0 +1,41 @@
+{
+  "name": "internal-chat",
+  "description": "Internal chat plugin that maps terminal percepts to chat effects",
+  "version": "0.1.0",
+  "entry": "main.ts",
+  "permissions": {
+    "read": ["."],
+    "run": []
+  },
+  "peas": {
+    "performance": [
+      {
+        "name": "chat-response-completeness",
+        "description": "Every terminal chat percept receives a response effect",
+        "rewards": [
+          {
+            "name": "responded",
+            "when": "A response effect is emitted for each percept",
+            "weight": 1.0
+          }
+        ]
+      }
+    ],
+    "environment": {
+      "name": "local-chat-server",
+      "description": "Terminal chat over local websocket on same machine"
+    },
+    "actuators": [
+      {
+        "name": "chat_effect_append",
+        "description": "Append chat responses and task completion effects"
+      }
+    ],
+    "sensors": [
+      {
+        "name": "terminal_chat_percept",
+        "description": "Observe user chat percepts from terminal websocket session"
+      }
+    ]
+  }
+}

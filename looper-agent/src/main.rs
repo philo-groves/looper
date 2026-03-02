@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use futures_util::{SinkExt, StreamExt};
-use looper_common::{
-    AGENT_HOST, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL, DiscoveryRequest,
-    DiscoveryResponse,
-};
+use looper_agent::peas::PeasRuntime;
 use looper_agent::settings::{
     AgentKeys, AgentSettings, PersistedAgentConfig, is_config_complete, load_persisted_config,
     normalize_workspace_dir, persist_config,
+};
+use looper_common::{
+    AGENT_HOST, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL, DiscoveryRequest,
+    DiscoveryResponse, SessionOrigin,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -32,10 +33,7 @@ async fn main() -> anyhow::Result<()> {
         Some(path) => load_persisted_config(path)?,
         None => None,
     };
-    let startup_mode = if persisted_config
-        .as_ref()
-        .is_some_and(is_config_complete)
-    {
+    let startup_mode = if persisted_config.as_ref().is_some_and(is_config_complete) {
         AgentMode::Running
     } else {
         AgentMode::Setup
@@ -87,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         persisted: persisted_config,
         workspace_hint,
         agent_name,
+        peas: PeasRuntime::new(registration.agent_id.clone())?,
     }));
 
     let server_handle = tokio::spawn(run_agent_server(runtime, discovery_url.clone()));
@@ -167,6 +166,7 @@ struct AgentRuntime {
     persisted: Option<PersistedAgentConfig>,
     workspace_hint: Option<PathBuf>,
     agent_name: Option<String>,
+    peas: PeasRuntime,
 }
 
 fn parse_args() -> anyhow::Result<CliArgs> {
@@ -177,9 +177,7 @@ fn parse_args() -> anyhow::Result<CliArgs> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--port" => {
-                let raw = args
-                    .next()
-                    .context("--port requires a numeric value")?;
+                let raw = args.next().context("--port requires a numeric value")?;
                 let parsed = raw
                     .parse::<u16>()
                     .with_context(|| format!("invalid --port value: {raw}"))?;
@@ -251,24 +249,37 @@ async fn handle_user_socket(
     drop(runtime_guard);
 
     writer
-        .send(Message::Text(
-            serde_json::to_string(&hello)?
-            .into(),
-        ))
+        .send(Message::Text(serde_json::to_string(&hello)?.into()))
         .await
         .context("failed to send agent hello message")?;
+
+    let mut active_session_id: Option<String> = None;
 
     while let Some(message) = reader.next().await {
         match message {
             Ok(Message::Text(text)) => {
-                let parsed = serde_json::from_str::<AgentSocketMessage>(&text)
-                    .unwrap_or(AgentSocketMessage::UserText { text: text.to_string() });
+                let parsed = serde_json::from_str::<AgentSocketMessage>(&text);
+
+                let parsed = match parsed {
+                    Ok(message) => message,
+                    Err(error) => {
+                        let response = AgentSocketMessage::Error {
+                            message: format!("invalid agent socket payload: {error}"),
+                        };
+                        writer
+                            .send(Message::Text(serde_json::to_string(&response)?.into()))
+                            .await
+                            .context("failed to send parse error")?;
+                        continue;
+                    }
+                };
 
                 match parsed {
                     AgentSocketMessage::SetupSubmit {
                         workspace_dir,
                         port,
                         provider,
+                        model,
                         api_keys,
                     } => match complete_setup(
                         &runtime,
@@ -276,6 +287,7 @@ async fn handle_user_socket(
                         workspace_dir,
                         port,
                         provider,
+                        model,
                         api_keys,
                     )
                     .await
@@ -299,7 +311,18 @@ async fn handle_user_socket(
                                 .context("failed to send setup error")?;
                         }
                     },
-                    AgentSocketMessage::UserText { text } => {
+                    AgentSocketMessage::SessionStart { origin } => {
+                        if origin != SessionOrigin::TerminalChat {
+                            let response = AgentSocketMessage::Error {
+                                message: "only terminal_chat origin is supported".to_string(),
+                            };
+                            writer
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await
+                                .context("failed to send session origin error")?;
+                            continue;
+                        }
+
                         let runtime_guard = runtime.lock().await;
                         if runtime_guard.mode != AgentMode::Running {
                             drop(runtime_guard);
@@ -312,23 +335,139 @@ async fn handle_user_socket(
                                 .context("failed to send setup mode warning")?;
                             continue;
                         }
+                        let (provider, model) = match runtime_guard.persisted.as_ref() {
+                            Some(config) => (
+                                config.settings.provider.clone(),
+                                config.settings.model.clone(),
+                            ),
+                            None => {
+                                drop(runtime_guard);
+                                let response = AgentSocketMessage::Error {
+                                    message: "agent is missing provider/model configuration"
+                                        .to_string(),
+                                };
+                                writer
+                                    .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                    .await
+                                    .context("failed to send missing config warning")?;
+                                continue;
+                            }
+                        };
+
+                        let peas = runtime_guard.peas.clone();
                         drop(runtime_guard);
 
-                        let response = AgentSocketMessage::UserText { text };
+                        let session_id = peas.start_session(origin)?;
+
+                        active_session_id = Some(session_id.clone());
+                        let response = AgentSocketMessage::SessionStarted {
+                            origin,
+                            session_id,
+                            provider,
+                            model,
+                        };
                         writer
                             .send(Message::Text(serde_json::to_string(&response)?.into()))
                             .await
-                            .context("failed to echo user message")?;
+                            .context("failed to send session started")?;
+                    }
+                    AgentSocketMessage::PerceptObserved {
+                        session_id,
+                        domain,
+                        percept,
+                    } => {
+                        let runtime_guard = runtime.lock().await;
+                        if runtime_guard.mode != AgentMode::Running {
+                            drop(runtime_guard);
+                            let response = AgentSocketMessage::Error {
+                                message: "agent is in setup mode".to_string(),
+                            };
+                            writer
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await
+                                .context("failed to send setup mode warning")?;
+                            continue;
+                        }
+                        let persisted = runtime_guard.persisted.clone();
+                        let peas = runtime_guard.peas.clone();
+                        drop(runtime_guard);
+
+                        if active_session_id.as_deref() != Some(session_id.as_str()) {
+                            let response = AgentSocketMessage::Error {
+                                message: "percept session does not match active terminal session"
+                                    .to_string(),
+                            };
+                            writer
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await
+                                .context("failed to send session mismatch warning")?;
+                            continue;
+                        }
+
+                        let Some(persisted) = persisted else {
+                            let response = AgentSocketMessage::Error {
+                                message: "agent is missing persisted provider settings".to_string(),
+                            };
+                            writer
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await
+                                .context("failed to send missing persisted config warning")?;
+                            continue;
+                        };
+
+                        let mut effects = peas
+                            .stream_percept_effects(
+                                &session_id,
+                                &domain,
+                                percept,
+                                &persisted.settings.provider,
+                                &persisted.settings.model,
+                                &persisted.keys,
+                            )
+                            .await?;
+
+                        while let Some(effect) = effects.next().await {
+                            let effect = effect?;
+                            let response = AgentSocketMessage::EffectApplied {
+                                session_id: session_id.clone(),
+                                domain: domain.clone(),
+                                effect: effect.clone(),
+                            };
+                            writer
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await
+                                .context("failed to send effect response")?;
+                            peas.record_effect(&session_id, &effect)?;
+                        }
+                    }
+                    AgentSocketMessage::SessionEnd { session_id } => {
+                        let runtime_guard = runtime.lock().await;
+                        let peas = runtime_guard.peas.clone();
+                        drop(runtime_guard);
+                        peas.end_session(&session_id)?;
+
+                        if active_session_id.as_deref() == Some(session_id.as_str()) {
+                            active_session_id = None;
+                        }
                     }
                     AgentSocketMessage::AgentHello { .. }
                     | AgentSocketMessage::SetupAccepted { .. }
-                    | AgentSocketMessage::Error { .. } => {}
+                    | AgentSocketMessage::Error { .. }
+                    | AgentSocketMessage::SessionStarted { .. }
+                    | AgentSocketMessage::EffectApplied { .. } => {}
                 }
             }
             Ok(Message::Close(_)) => break,
             Ok(_) => {}
             Err(error) => return Err(error.into()),
         }
+    }
+
+    if let Some(session_id) = active_session_id {
+        let runtime_guard = runtime.lock().await;
+        let peas = runtime_guard.peas.clone();
+        drop(runtime_guard);
+        peas.end_session(&session_id).ok();
     }
 
     Ok(())
@@ -340,6 +479,7 @@ async fn complete_setup(
     workspace_dir: String,
     port: u16,
     provider: String,
+    model: String,
     api_keys: Vec<looper_common::ProviderApiKey>,
 ) -> anyhow::Result<()> {
     let workspace_path = normalize_workspace_dir(&workspace_dir)?;
@@ -357,6 +497,7 @@ async fn complete_setup(
         workspace_dir: workspace_path.to_string_lossy().to_string(),
         port,
         provider,
+        model,
     };
     let keys = AgentKeys { api_keys };
 

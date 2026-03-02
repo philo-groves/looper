@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use looper_common::ProviderApiKey;
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +10,8 @@ pub struct AgentSettings {
     pub workspace_dir: String,
     pub port: u16,
     pub provider: String,
+    #[serde(default)]
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -51,6 +53,9 @@ pub fn load_persisted_config(workspace_dir: &Path) -> anyhow::Result<Option<Pers
 
 pub fn is_config_complete(config: &PersistedAgentConfig) -> bool {
     if config.settings.provider.trim().is_empty() {
+        return false;
+    }
+    if config.settings.model.trim().is_empty() {
         return false;
     }
 

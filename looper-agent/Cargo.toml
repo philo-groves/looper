@@ -11,3 +11,6 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
 looper-common = { path = "../looper-common" }
+rusqlite = { version = "0.33", features = ["bundled"] }
+fiddlesticks = { path = "../../fiddlesticks/fiddlesticks", default-features = false, features = ["provider-openai", "provider-anthropic", "provider-opencode-zen"] }
+async-stream = "0.3"

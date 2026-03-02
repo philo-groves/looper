@@ -90,6 +90,7 @@ pub enum AgentSocketMessage {
         workspace_dir: String,
         port: u16,
         provider: String,
+        model: String,
         api_keys: Vec<ProviderApiKey>,
     },
     SetupAccepted {
@@ -98,8 +99,57 @@ pub enum AgentSocketMessage {
     Error {
         message: String,
     },
-    UserText {
+    SessionStart {
+        origin: SessionOrigin,
+    },
+    SessionStarted {
+        session_id: String,
+        origin: SessionOrigin,
+        provider: String,
+        model: String,
+    },
+    SessionEnd {
+        session_id: String,
+    },
+    PerceptObserved {
+        session_id: String,
+        domain: String,
+        percept: Percept,
+    },
+    EffectApplied {
+        session_id: String,
+        domain: String,
+        effect: Effect,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOrigin {
+    TerminalChat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Percept {
+    UserText { turn_id: String, text: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Effect {
+    ChatResponseDelta {
+        turn_id: String,
+        text_delta: String,
+    },
+    ChatResponse {
+        turn_id: String,
         text: String,
+    },
+    TaskCompletion {
+        turn_id: String,
+        status: String,
+        details: String,
     },
 }
 
