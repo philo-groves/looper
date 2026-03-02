@@ -1694,7 +1694,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     let input_label_border_widget = Paragraph::new(input_label_border).style(
         Style::default()
             .bg(Color::Rgb(43, 54, 69))
-            .fg(Color::Rgb(88, 166, 255)),
+            .fg(Color::Rgb(255, 240, 140)),
     );
     frame.render_widget(input_label_border_widget, input_label_border_area);
 
@@ -1744,7 +1744,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     let input_border_widget = Paragraph::new(input_border).style(
         Style::default()
             .bg(Color::Rgb(43, 54, 69))
-            .fg(Color::Rgb(88, 166, 255)),
+            .fg(Color::Rgb(255, 240, 140)),
     );
     frame.render_widget(input_border_widget, input_border_area);
 
@@ -1786,7 +1786,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     let provider_line = Line::from(vec![
         Span::styled(
             app.active_provider.clone(),
-            Style::default().fg(Color::Rgb(88, 166, 255)),
+            Style::default().fg(Color::Rgb(255, 240, 140)),
         ),
         Span::raw(" "),
         Span::styled(
@@ -1810,7 +1810,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     let send_bg = if app.input.trim().is_empty() {
         Color::Rgb(96, 106, 120)
     } else {
-        Color::Rgb(88, 166, 255)
+        Color::Rgb(255, 240, 140)
     };
     let send =
         Paragraph::new(send_label).style(Style::default().bg(send_bg).fg(Color::Rgb(16, 22, 31)));
