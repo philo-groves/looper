@@ -479,7 +479,7 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fchat"
-version = "1.0.0"
+version = "3.0.0"
 dependencies = [
  "async-stream",
  "fcommon",
@@ -492,11 +492,11 @@ dependencies = [
 
 [[package]]
 name = "fcommon"
-version = "1.0.0"
+version = "3.0.0"
 
 [[package]]
 name = "fharness"
-version = "1.0.0"
+version = "3.0.0"
 dependencies = [
  "fchat",
  "fcommon",
@@ -550,7 +550,7 @@ checksum = "0ce7134b9999ecaf8bcd65542e436736ef32ddca1b3e06094cb6ec5755203b80"
 
 [[package]]
 name = "fmemory"
-version = "1.0.0"
+version = "3.0.0"
 dependencies = [
  "fchat",
  "fcommon",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "fprovider"
-version = "1.0.0"
+version = "3.0.0"
 dependencies = [
  "async-stream",
  "fcommon",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "ftooling"
-version = "1.0.0"
+version = "3.0.0"
 dependencies = [
  "fcommon",
  "fprovider",
