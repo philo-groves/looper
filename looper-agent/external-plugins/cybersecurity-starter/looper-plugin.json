@@ -22,6 +22,17 @@
         ]
       },
       {
+        "name": "evidence-completeness",
+        "description": "Maintain evidence references and reproducible validation records",
+        "weight": 1.5,
+        "evaluation_mode": "strict",
+        "success_criteria": [
+          "Validated findings include evidence and repro steps",
+          "Evidence artifacts are linked by finding ID",
+          "Report output includes evidence index metadata"
+        ]
+      },
+      {
         "name": "false-positive-control",
         "description": "Avoid speculative claims and clearly mark confidence",
         "weight": 1.2,
@@ -29,6 +40,17 @@
         "success_criteria": [
           "Mark confidence per finding",
           "Avoid unverified exploit claims"
+        ]
+      },
+      {
+        "name": "passive-first-safety",
+        "description": "Keep assessments passive-first and non-destructive by default",
+        "weight": 1.4,
+        "evaluation_mode": "strict",
+        "success_criteria": [
+          "No active exploitation is attempted by default",
+          "Validation mode is passive_validation_only",
+          "Recon outputs are clearly marked passive"
         ]
       }
     ],
@@ -38,13 +60,53 @@
     },
     "actuators": [
       {
+        "name": "cyber_surface_map",
+        "description": "Build passive asset and surface map from target inputs",
+        "executor": "plugin_process"
+      },
+      {
+        "name": "cyber_endpoint_inventory",
+        "description": "Build passive endpoint inventory from hints and common paths",
+        "executor": "plugin_process"
+      },
+      {
+        "name": "cyber_tech_fingerprint",
+        "description": "Classify technology stack hints into passive fingerprint signals",
+        "executor": "plugin_process"
+      },
+      {
         "name": "cyber_triage",
         "description": "Convert raw observations into structured candidate findings",
         "executor": "plugin_process"
       },
       {
+        "name": "cyber_hypothesis_generate",
+        "description": "Generate passive validation hypotheses from findings",
+        "executor": "plugin_process"
+      },
+      {
+        "name": "cyber_validate_finding",
+        "description": "Validate findings with passive evidence and reproducibility checks",
+        "executor": "plugin_process"
+      },
+      {
         "name": "cyber_report_outline",
         "description": "Build a concise security report outline from findings",
+        "executor": "plugin_process"
+      },
+      {
+        "name": "cyber_report_draft",
+        "description": "Prepare report draft metadata from validated findings",
+        "executor": "plugin_process"
+      },
+      {
+        "name": "cyber_report_evidence_pack",
+        "description": "Build an evidence index mapped to finding identifiers",
+        "executor": "plugin_process"
+      },
+      {
+        "name": "cyber_report_exec_summary",
+        "description": "Generate executive summary metrics for security reports",
         "executor": "plugin_process"
       }
     ],
