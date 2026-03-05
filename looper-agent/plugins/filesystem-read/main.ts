@@ -5,10 +5,12 @@ type PerceptInput = {
 };
 
 type ActionPlan = {
-  actuator: "filesystem_grep" | "filesystem_glob";
-  pattern: string;
+  actuator: "filesystem_grep" | "filesystem_glob" | "filesystem_read";
+  pattern?: string;
   path?: string;
   max_results?: number;
+  file_path?: string;
+  max_lines?: number;
 };
 
 type PluginPlan = {
@@ -40,12 +42,12 @@ function parseAction(text: string): ActionPlan | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
 
-  const slashCommand = trimmed.match(/^\/(grep|glob|glop)\s+(.+)$/i);
+  const slashCommand = trimmed.match(/^\/(grep|glob|glop|read)\s+(.+)$/i);
   if (slashCommand) {
     return parseCommand(slashCommand[1], slashCommand[2]);
   }
 
-  const bareCommand = trimmed.match(/^(grep|glob|glop)\s+(.+)$/i);
+  const bareCommand = trimmed.match(/^(grep|glob|glop|read)\s+(.+)$/i);
   if (bareCommand) {
     return parseCommand(bareCommand[1], bareCommand[2]);
   }
@@ -54,6 +56,12 @@ function parseAction(text: string): ActionPlan | null {
 }
 
 function parseCommand(keyword: string, rest: string): ActionPlan | null {
+  if (keyword.toLowerCase() === "read") {
+    const filePath = cleanToken(rest);
+    if (!filePath) return null;
+    return { actuator: "filesystem_read", file_path: filePath, max_lines: 250 };
+  }
+
   const actuator = keyword.toLowerCase() === "grep"
     ? "filesystem_grep"
     : "filesystem_glob";

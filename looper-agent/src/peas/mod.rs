@@ -124,11 +124,16 @@ struct FilesystemPluginPlan {
 #[derive(Debug, Deserialize)]
 struct FilesystemActionPlan {
     actuator: String,
+    #[serde(default)]
     pattern: String,
     #[serde(default)]
     path: Option<String>,
     #[serde(default)]
     max_results: Option<usize>,
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    max_lines: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -579,7 +584,11 @@ impl PeasRuntime {
             return Ok(FilesystemActionOutcome {
                 actuator: action.actuator.clone(),
                 pattern: action.pattern.clone(),
-                path: action.path.clone().unwrap_or_else(|| ".".to_string()),
+                path: action
+                    .file_path
+                    .clone()
+                    .or_else(|| action.path.clone())
+                    .unwrap_or_else(|| ".".to_string()),
                 status: "skipped".to_string(),
                 details: "filesystem plugin is not active".to_string(),
                 stdout: String::new(),
@@ -589,7 +598,15 @@ impl PeasRuntime {
         };
 
         let workspace_root = PathBuf::from(workspace_dir);
-        let requested_path = action.path.as_deref().unwrap_or(".");
+        let requested_path = if action.actuator == "filesystem_read" {
+            action
+                .file_path
+                .as_deref()
+                .or(action.path.as_deref())
+                .unwrap_or(action.pattern.as_str())
+        } else {
+            action.path.as_deref().unwrap_or(".")
+        };
         let target_dir = resolve_requested_path(&workspace_root, requested_path);
 
         if !is_allowed_read_path(plugin, &workspace_root, &target_dir) {
@@ -618,6 +635,10 @@ impl PeasRuntime {
         let (stdout, stderr, details, outcome_status) = match action.actuator.as_str() {
             "filesystem_grep" => run_native_grep(&workspace_root, &target_dir, &action.pattern, limit)?,
             "filesystem_glob" => run_native_glob(&workspace_root, &target_dir, &action.pattern, limit)?,
+            "filesystem_read" => {
+                let max_lines = action.max_lines.unwrap_or(250).clamp(1, 1000);
+                run_native_read(&workspace_root, &target_dir, max_lines)?
+            }
             other => {
                 return Ok(FilesystemActionOutcome {
                     actuator: action.actuator.clone(),
@@ -881,12 +902,20 @@ fn format_filesystem_response(outcomes: &[FilesystemActionOutcome]) -> String {
 
     for outcome in outcomes {
         let mut block = Vec::new();
-        block.push(format!(
-            "{} `{}` in `{}`",
-            pretty_actuator_name(&outcome.actuator),
-            outcome.pattern,
-            outcome.path
-        ));
+        if outcome.actuator == "filesystem_read" {
+            block.push(format!(
+                "{} `{}`",
+                pretty_actuator_name(&outcome.actuator),
+                outcome.path
+            ));
+        } else {
+            block.push(format!(
+                "{} `{}` in `{}`",
+                pretty_actuator_name(&outcome.actuator),
+                outcome.pattern,
+                outcome.path
+            ));
+        }
 
         match outcome.status.as_str() {
             "blocked" => {
@@ -924,6 +953,7 @@ fn pretty_actuator_name(actuator: &str) -> &str {
     match actuator {
         "filesystem_grep" => "Grep",
         "filesystem_glob" => "Glob",
+        "filesystem_read" => "Read",
         _ => "Filesystem",
     }
 }
@@ -934,9 +964,11 @@ fn is_filesystem_command(text: &str) -> bool {
     lowered.starts_with("/glob ")
         || lowered.starts_with("/glop ")
         || lowered.starts_with("/grep ")
+        || lowered.starts_with("/read ")
         || lowered.starts_with("glob ")
         || lowered.starts_with("glop ")
         || lowered.starts_with("grep ")
+        || lowered.starts_with("read ")
 }
 
 fn resolve_requested_path(workspace_root: &Path, requested_path: &str) -> PathBuf {
@@ -1121,6 +1153,77 @@ fn run_native_grep(
     };
 
     Ok((stdout, String::new(), details, "completed".to_string()))
+}
+
+fn run_native_read(
+    workspace_root: &Path,
+    target_path: &Path,
+    max_lines: usize,
+) -> anyhow::Result<(String, String, String, String)> {
+    if !target_path.exists() {
+        return Ok((
+            String::new(),
+            format!("target file does not exist: {}", target_path.display()),
+            format!(
+                "filesystem actuator filesystem_read failed: target file {} does not exist",
+                target_path.display()
+            ),
+            "failed".to_string(),
+        ));
+    }
+
+    if !target_path.is_file() {
+        return Ok((
+            String::new(),
+            format!("target path is not a file: {}", target_path.display()),
+            format!(
+                "filesystem actuator filesystem_read failed: target path {} is not a file",
+                target_path.display()
+            ),
+            "failed".to_string(),
+        ));
+    }
+
+    let bytes = fs::read(target_path)
+        .with_context(|| format!("failed to read file {}", target_path.display()))?;
+    if bytes.contains(&0) {
+        return Ok((
+            String::new(),
+            format!(
+                "target file appears to be binary and cannot be read as text: {}",
+                target_path.display()
+            ),
+            "filesystem actuator filesystem_read failed: file is not text".to_string(),
+            "failed".to_string(),
+        ));
+    }
+
+    let content = String::from_utf8_lossy(&bytes).to_string();
+    let all_lines = content.lines().collect::<Vec<_>>();
+    let truncated = all_lines.len() > max_lines;
+    let displayed = all_lines
+        .iter()
+        .take(max_lines)
+        .enumerate()
+        .map(|(idx, line)| format!("{}: {}", idx + 1, line))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let stderr = if truncated {
+        format!(
+            "output truncated: showing {} of {} lines",
+            max_lines,
+            all_lines.len()
+        )
+    } else {
+        String::new()
+    };
+    let details = format!(
+        "filesystem actuator filesystem_read completed for {}",
+        display_path(workspace_root, target_path)
+    );
+
+    Ok((displayed, stderr, details, "completed".to_string()))
 }
 
 fn display_path(workspace_root: &Path, path: &Path) -> String {

@@ -21,11 +21,15 @@
     "actuators": [
       {
         "name": "filesystem_grep",
-        "description": "Run ripgrep content searches on allowed workspace paths"
+        "description": "Run regex content searches on allowed workspace paths"
       },
       {
         "name": "filesystem_glob",
         "description": "List files by glob pattern on allowed workspace paths"
+      },
+      {
+        "name": "filesystem_read",
+        "description": "Read text file contents on allowed workspace paths"
       }
     ],
     "sensors": [
