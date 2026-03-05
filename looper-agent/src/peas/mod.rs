@@ -4,6 +4,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,6 +37,7 @@ pub struct PeasRuntime {
     agent_id: String,
     db_path: PathBuf,
     plugins: Vec<LoadedPlugin>,
+    pending_approvals: Arc<Mutex<HashMap<String, Vec<PendingApproval>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +154,24 @@ struct FilesystemActionOutcome {
     sensor_output: String,
 }
 
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    action: PlannedAction,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PermissionMode {
+    Enforce,
+    AllowOneShot,
+}
+
+#[derive(Debug, Clone)]
+enum ApprovalDecision {
+    Approve { action_ids: HashSet<String> },
+    Deny { action_ids: HashSet<String> },
+}
+
 fn default_mode() -> String {
     "stream_chat".to_string()
 }
@@ -172,6 +193,7 @@ impl PeasRuntime {
             agent_id,
             db_path,
             plugins,
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -237,6 +259,112 @@ impl PeasRuntime {
             &text,
         )?;
 
+        let pending = runtime.take_pending_approvals(&session_id);
+        if !pending.is_empty() {
+            let Some(decision) = parse_approval_decision(&text, &pending) else {
+                runtime.set_pending_approvals(&session_id, pending.clone());
+                let pending_prompt = format_pending_approval_prompt(&pending);
+                let stream = try_stream! {
+                    yield Effect::ChatResponse {
+                        turn_id: turn_id.clone(),
+                        text: pending_prompt,
+                    };
+                };
+                return Ok(Box::pin(stream));
+            };
+
+            let mut pending_by_id = pending
+                .into_iter()
+                .map(|entry| (entry.action.action_id.clone(), entry))
+                .collect::<HashMap<_, _>>();
+
+            let mut effects = Vec::new();
+            let mut sensor_notes = Vec::new();
+            let mut remaining = Vec::new();
+
+            match decision {
+                ApprovalDecision::Approve { action_ids } => {
+                    for action_id in action_ids {
+                        if let Some(entry) = pending_by_id.remove(&action_id) {
+                            let mut action = entry.action;
+                            action.status = PlannedActionStatus::InProgress;
+                            action.details = Some("Action resumed after approval".to_string());
+                            effects.push(Effect::ActionStatusChanged {
+                                turn_id: turn_id.clone(),
+                                action: action.clone(),
+                            });
+
+                            match runtime.execute_planned_action(
+                                &workspace_dir,
+                                &action,
+                                PermissionMode::AllowOneShot,
+                            )? {
+                                Some(outcome) => {
+                                    action.status = map_outcome_status(&outcome.status);
+                                    action.details = Some(outcome.details.clone());
+                                    effects.push(Effect::ActionStatusChanged {
+                                        turn_id: turn_id.clone(),
+                                        action,
+                                    });
+                                    sensor_notes.push(outcome.sensor_output);
+                                }
+                                None => {
+                                    action.status = PlannedActionStatus::Skipped;
+                                    action.details =
+                                        Some("No executor available for approved action".to_string());
+                                    effects.push(Effect::ActionStatusChanged {
+                                        turn_id: turn_id.clone(),
+                                        action,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    remaining.extend(pending_by_id.into_values());
+                }
+                ApprovalDecision::Deny { action_ids } => {
+                    for action_id in action_ids {
+                        if let Some(entry) = pending_by_id.remove(&action_id) {
+                            let mut action = entry.action;
+                            action.status = PlannedActionStatus::Skipped;
+                            action.details = Some("Action denied by user".to_string());
+                            effects.push(Effect::ActionStatusChanged {
+                                turn_id: turn_id.clone(),
+                                action,
+                            });
+                        }
+                    }
+                    remaining.extend(pending_by_id.into_values());
+                }
+            }
+
+            runtime.set_pending_approvals(&session_id, remaining.clone());
+
+            let mut response = String::new();
+            if !sensor_notes.is_empty() {
+                response.push_str("Approved action results:\n\n");
+                response.push_str(&sensor_notes.join("\n\n"));
+            } else {
+                response.push_str("Acknowledged. Updated pending actions.");
+            }
+
+            if !remaining.is_empty() {
+                response.push_str("\n\n");
+                response.push_str(&format_pending_approval_prompt(&remaining));
+            }
+
+            let stream = try_stream! {
+                for effect in effects {
+                    yield effect;
+                }
+                yield Effect::ChatResponse {
+                    turn_id: turn_id.clone(),
+                    text: response,
+                };
+            };
+            return Ok(Box::pin(stream));
+        }
+
         let chat_plugin = runtime.chat_plugin()?;
         let plan = runtime.run_chat_plugin(chat_plugin, ChatPluginPerceptInput {
             session_id: session_id.clone(),
@@ -267,11 +395,23 @@ impl PeasRuntime {
                 action: action.clone(),
             });
 
-            match runtime.execute_planned_action(&workspace_dir, action)? {
+            match runtime.execute_planned_action(&workspace_dir, action, PermissionMode::Enforce)? {
                 Some(outcome) => {
                     sensor_notes.push(outcome.sensor_output.clone());
-                    action.status = map_outcome_status(&outcome.status);
-                    action.details = Some(outcome.details.clone());
+                    if outcome.status == "blocked" {
+                        action.status = PlannedActionStatus::AwaitingApproval;
+                        action.details = Some(outcome.details.clone());
+                        runtime.push_pending_approval(
+                            &session_id,
+                            PendingApproval {
+                                action: action.clone(),
+                                reason: outcome.details,
+                            },
+                        );
+                    } else {
+                        action.status = map_outcome_status(&outcome.status);
+                        action.details = Some(outcome.details.clone());
+                    }
                     pre_effects.push(Effect::ActionStatusChanged {
                         turn_id: turn_id.clone(),
                         action: action.clone(),
@@ -296,6 +436,22 @@ impl PeasRuntime {
         }
 
         let turn_id_for_stream = turn_id.clone();
+
+        let awaiting = runtime.take_pending_approvals(&session_id);
+        if !awaiting.is_empty() {
+            let approval_prompt = format_pending_approval_prompt(&awaiting);
+            runtime.set_pending_approvals(&session_id, awaiting);
+            let stream = try_stream! {
+                for effect in pre_effects {
+                    yield effect;
+                }
+                yield Effect::ChatResponse {
+                    turn_id: turn_id_for_stream,
+                    text: approval_prompt,
+                };
+            };
+            return Ok(Box::pin(stream));
+        }
 
         let stream = try_stream! {
             for effect in pre_effects {
@@ -560,6 +716,7 @@ impl PeasRuntime {
         &self,
         workspace_dir: &str,
         action: &PlannedAction,
+        permission_mode: PermissionMode,
     ) -> anyhow::Result<Option<FilesystemActionOutcome>> {
         let Some(plugin) = self.resolve_action_plugin(action) else {
             return Ok(None);
@@ -597,7 +754,7 @@ impl PeasRuntime {
             };
 
             return self
-                .execute_filesystem_action(plugin, workspace_dir, &fs_action)
+                .execute_filesystem_action(plugin, workspace_dir, &fs_action, permission_mode)
                 .map(Some);
         }
 
@@ -642,6 +799,7 @@ impl PeasRuntime {
         plugin: &LoadedPlugin,
         workspace_dir: &str,
         action: &FilesystemActionPlan,
+        permission_mode: PermissionMode,
     ) -> anyhow::Result<FilesystemActionOutcome> {
         let workspace_root = PathBuf::from(workspace_dir);
         let requested_path = if action.actuator == "filesystem_read" {
@@ -655,7 +813,9 @@ impl PeasRuntime {
         };
         let target_dir = resolve_requested_path(&workspace_root, requested_path);
 
-        if !is_allowed_read_path(plugin, &workspace_root, &target_dir) {
+        if matches!(permission_mode, PermissionMode::Enforce)
+            && !is_allowed_read_path(plugin, &workspace_root, &target_dir)
+        {
             let sensor_output = format!(
                 "sensor filesystem_command_error: actuator={} blocked; requested path '{}' is outside allowed read roots {:?}. Ask the user for explicit per-action approval.",
                 action.actuator,
@@ -820,6 +980,32 @@ impl PeasRuntime {
         .with_context(|| format!("failed to append event for session {session_id}"))?;
         Ok(())
     }
+
+    fn take_pending_approvals(&self, session_id: &str) -> Vec<PendingApproval> {
+        let Ok(mut guard) = self.pending_approvals.lock() else {
+            return Vec::new();
+        };
+        guard.remove(session_id).unwrap_or_default()
+    }
+
+    fn set_pending_approvals(&self, session_id: &str, pending: Vec<PendingApproval>) {
+        if let Ok(mut guard) = self.pending_approvals.lock() {
+            if pending.is_empty() {
+                guard.remove(session_id);
+            } else {
+                guard.insert(session_id.to_string(), pending);
+            }
+        }
+    }
+
+    fn push_pending_approval(&self, session_id: &str, pending: PendingApproval) {
+        if let Ok(mut guard) = self.pending_approvals.lock() {
+            guard
+                .entry(session_id.to_string())
+                .or_insert_with(Vec::new)
+                .push(pending);
+        }
+    }
 }
 
 fn load_plugins(plugins_root: &Path) -> anyhow::Result<Vec<LoadedPlugin>> {
@@ -936,6 +1122,97 @@ fn map_outcome_status(status: &str) -> PlannedActionStatus {
         "skipped" => PlannedActionStatus::Skipped,
         _ => PlannedActionStatus::Failed,
     }
+}
+
+fn parse_approval_decision(text: &str, pending: &[PendingApproval]) -> Option<ApprovalDecision> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let pending_ids = pending
+        .iter()
+        .map(|entry| entry.action.action_id.clone())
+        .collect::<HashSet<_>>();
+
+    let lowered = trimmed.to_ascii_lowercase();
+    if lowered == "approve all" || lowered == "approve" {
+        return Some(ApprovalDecision::Approve {
+            action_ids: pending_ids,
+        });
+    }
+    if lowered == "deny all" || lowered == "deny" {
+        return Some(ApprovalDecision::Deny {
+            action_ids: pending
+                .iter()
+                .map(|entry| entry.action.action_id.clone())
+                .collect(),
+        });
+    }
+
+    if pending.len() == 1 {
+        if matches!(lowered.as_str(), "yes" | "y" | "ok" | "okay" | "sure") {
+            return Some(ApprovalDecision::Approve {
+                action_ids: pending
+                    .iter()
+                    .map(|entry| entry.action.action_id.clone())
+                    .collect(),
+            });
+        }
+        if matches!(lowered.as_str(), "no" | "n" | "cancel") {
+            return Some(ApprovalDecision::Deny {
+                action_ids: pending
+                    .iter()
+                    .map(|entry| entry.action.action_id.clone())
+                    .collect(),
+            });
+        }
+    }
+
+    if lowered.starts_with("approve ") {
+        let ids = parse_action_ids(&trimmed[8..], &pending_ids);
+        if !ids.is_empty() {
+            return Some(ApprovalDecision::Approve { action_ids: ids });
+        }
+    }
+
+    if lowered.starts_with("deny ") {
+        let ids = parse_action_ids(&trimmed[5..], &pending_ids);
+        if !ids.is_empty() {
+            return Some(ApprovalDecision::Deny { action_ids: ids });
+        }
+    }
+
+    None
+}
+
+fn parse_action_ids(raw: &str, pending_ids: &HashSet<String>) -> HashSet<String> {
+    raw.split([',', ' '])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .filter(|token| pending_ids.contains(*token))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn format_pending_approval_prompt(pending: &[PendingApproval]) -> String {
+    let mut lines = vec![
+        "I need your approval to continue with actions outside current plugin read permissions."
+            .to_string(),
+        "Approve one or more actions with `approve <action_id>` (or `approve all`).".to_string(),
+        "Deny with `deny <action_id>` (or `deny all`).".to_string(),
+        String::new(),
+        "Pending actions:".to_string(),
+    ];
+
+    for entry in pending {
+        lines.push(format!(
+            "- {} {} ({})",
+            entry.action.action_id, entry.action.actuator, entry.reason
+        ));
+    }
+
+    lines.join("\n")
 }
 
 fn resolve_requested_path(workspace_root: &Path, requested_path: &str) -> PathBuf {

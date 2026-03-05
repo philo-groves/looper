@@ -81,11 +81,17 @@ function buildEffects(input: ChatPluginPerceptInput): ChatPluginEffectOutput {
 }
 
 function planActions(text: string): PlannedAction[] {
-  const parsed = parseFilesystemCommand(text) ?? parseFilesystemRequest(text);
-  return parsed ? [parsed] : [];
+  const lowered = text.trim().toLowerCase();
+  if (lowered.startsWith("approve") || lowered.startsWith("deny")) {
+    return [];
+  }
+
+  const fromCommand = parseFilesystemCommand(text);
+  if (fromCommand.length > 0) return fromCommand;
+  return parseFilesystemRequest(text);
 }
 
-function parseFilesystemCommand(text: string): PlannedAction | null {
+function parseFilesystemCommand(text: string): PlannedAction[] {
   const slashCommand = text.match(/^\/(grep|glob|glop|read)\s+(.+)$/i);
   if (slashCommand) {
     return parseFilesystemCommandParts(slashCommand[1], slashCommand[2]);
@@ -96,25 +102,24 @@ function parseFilesystemCommand(text: string): PlannedAction | null {
     return parseFilesystemCommandParts(bareCommand[1], bareCommand[2]);
   }
 
-  return null;
+  return [];
 }
 
 function parseFilesystemCommandParts(
   keyword: string,
   rest: string,
-): PlannedAction | null {
+): PlannedAction[] {
   const normalized = keyword.toLowerCase();
   if (normalized === "read") {
-    const filePath = cleanToken(rest);
-    if (!filePath) return null;
-    return {
+    const filePaths = extractReadPaths(rest);
+    return filePaths.map((filePath) => ({
       plugin: "filesystem-read",
       actuator: "filesystem_read",
       args: {
         file_path: filePath,
         max_lines: 250,
       },
-    };
+    }));
   }
 
   const actuator = normalized === "grep"
@@ -125,8 +130,8 @@ function parseFilesystemCommandParts(
   if (inMatch) {
     const pattern = cleanToken(inMatch[1]);
     const path = cleanToken(inMatch[2]);
-    if (!pattern) return null;
-    return {
+    if (!pattern) return [];
+    return [{
       plugin: "filesystem-read",
       actuator,
       args: {
@@ -134,12 +139,12 @@ function parseFilesystemCommandParts(
         path: path || ".",
         max_results: 200,
       },
-    };
+    }];
   }
 
   const pattern = cleanToken(rest);
-  if (!pattern) return null;
-  return {
+  if (!pattern) return [];
+  return [{
     plugin: "filesystem-read",
     actuator,
     args: {
@@ -147,29 +152,27 @@ function parseFilesystemCommandParts(
       path: ".",
       max_results: 200,
     },
-  };
+  }];
 }
 
-function parseFilesystemRequest(text: string): PlannedAction | null {
-  const readMatch = text.match(
-    /(?:read|open|show)(?:\s+me)?(?:\s+the)?(?:\s+contents?\s+of|\s+file)?\s+([./\\][^\s,;]+|[\w.-]+\.[\w.-]+)/i,
-  );
-  if (readMatch) {
-    return {
+function parseFilesystemRequest(text: string): PlannedAction[] {
+  const readMatches = extractReadPaths(text);
+  if (readMatches.length > 0 && /\b(read|open|show)\b/i.test(text)) {
+    return readMatches.map((path) => ({
       plugin: "filesystem-read",
       actuator: "filesystem_read",
       args: {
-        file_path: cleanToken(readMatch[1]),
+        file_path: path,
         max_lines: 250,
       },
-    };
+    }));
   }
 
   const grepMatch = text.match(
     /(?:search\s+for|find|grep)\s+["'`]?([^"'`]+)["'`]?\s+in\s+([./\\][^\s,;]+|[\w./\\-]+)/i,
   );
   if (grepMatch) {
-    return {
+    return [{
       plugin: "filesystem-read",
       actuator: "filesystem_grep",
       args: {
@@ -177,14 +180,14 @@ function parseFilesystemRequest(text: string): PlannedAction | null {
         path: cleanToken(grepMatch[2]),
         max_results: 200,
       },
-    };
+    }];
   }
 
   const globMatch = text.match(
     /(?:list|show)\s+(?:all\s+)?files?\s+(?:matching\s+)?["'`]?([^"'`]+)["'`]?(?:\s+in\s+([./\\][^\s,;]+|[\w./\\-]+))?/i,
   );
   if (globMatch && globMatch[1].includes("*")) {
-    return {
+    return [{
       plugin: "filesystem-read",
       actuator: "filesystem_glob",
       args: {
@@ -192,10 +195,28 @@ function parseFilesystemRequest(text: string): PlannedAction | null {
         path: cleanToken(globMatch[2] || "."),
         max_results: 200,
       },
-    };
+    }];
   }
 
-  return null;
+  return [];
+}
+
+function extractReadPaths(raw: string): string[] {
+  const normalized = raw
+    .replace(/\band\b/gi, ",")
+    .split(",")
+    .map((part) => cleanToken(part))
+    .flatMap((part) => {
+      const matches = part.match(/([./\\][^\s,;]+|[\w.-]+\.[\w.-]+)/g);
+      return matches ? matches.map((item) => cleanToken(item)) : [];
+    })
+    .filter((part) => part.length > 0);
+
+  const unique = new Set<string>();
+  for (const item of normalized) {
+    unique.add(item);
+  }
+  return Array.from(unique);
 }
 
 function cleanToken(raw: string): string {

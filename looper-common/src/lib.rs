@@ -167,6 +167,7 @@ pub enum Effect {
 pub enum PlannedActionStatus {
     Planned,
     InProgress,
+    AwaitingApproval,
     Completed,
     Failed,
     Blocked,

@@ -2218,6 +2218,7 @@ fn status_icon(status: PlannedActionStatus) -> &'static str {
     match status {
         PlannedActionStatus::Planned => "[ ]",
         PlannedActionStatus::InProgress => "[~]",
+        PlannedActionStatus::AwaitingApproval => "[?]",
         PlannedActionStatus::Completed => "[x]",
         PlannedActionStatus::Failed => "[!]",
         PlannedActionStatus::Blocked => "[!]",
@@ -2229,6 +2230,7 @@ fn status_color(status: PlannedActionStatus) -> Color {
     match status {
         PlannedActionStatus::Planned => Color::Rgb(180, 196, 214),
         PlannedActionStatus::InProgress => Color::Rgb(255, 240, 140),
+        PlannedActionStatus::AwaitingApproval => Color::Rgb(255, 214, 120),
         PlannedActionStatus::Completed => Color::Rgb(127, 214, 154),
         PlannedActionStatus::Failed => Color::Rgb(255, 120, 120),
         PlannedActionStatus::Blocked => Color::Rgb(255, 164, 89),
