@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const DISCOVERY_HOST: &str = "127.0.0.1";
 pub const DISCOVERY_PORT: u16 = 10001;
@@ -151,6 +152,35 @@ pub enum Effect {
         status: String,
         details: String,
     },
+    PlanUpdated {
+        turn_id: String,
+        actions: Vec<PlannedAction>,
+    },
+    ActionStatusChanged {
+        turn_id: String,
+        action: PlannedAction,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannedActionStatus {
+    Planned,
+    InProgress,
+    Completed,
+    Failed,
+    Blocked,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannedAction {
+    pub action_id: String,
+    pub plugin: String,
+    pub actuator: String,
+    pub args: Value,
+    pub status: PlannedActionStatus,
+    pub details: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

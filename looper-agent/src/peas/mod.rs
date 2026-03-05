@@ -15,11 +15,14 @@ use fiddlesticks::{
 };
 use futures_util::{Stream, StreamExt};
 use globset::Glob;
-use looper_common::{Effect, Percept, SessionOrigin};
+use looper_common::{
+    Effect, Percept, PlannedAction, PlannedActionStatus, SessionOrigin,
+};
 use regex::Regex;
 use rusqlite::{Connection, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use walkdir::WalkDir;
 
 use crate::settings::AgentKeys;
@@ -107,6 +110,8 @@ struct ChatPluginPerceptPlan {
     system_prompt: Option<String>,
     #[serde(default)]
     task_completion: Option<ChatTaskCompletionOutput>,
+    #[serde(default)]
+    planned_actions: Vec<PlannedActionSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,10 +120,13 @@ struct ChatTaskCompletionOutput {
     details: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct FilesystemPluginPlan {
+#[derive(Debug, Clone, Deserialize)]
+struct PlannedActionSpec {
     #[serde(default)]
-    actions: Vec<FilesystemActionPlan>,
+    plugin: Option<String>,
+    actuator: String,
+    #[serde(default)]
+    args: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,13 +146,8 @@ struct FilesystemActionPlan {
 
 #[derive(Debug, Clone)]
 struct FilesystemActionOutcome {
-    actuator: String,
-    pattern: String,
-    path: String,
     status: String,
     details: String,
-    stdout: String,
-    stderr: String,
     sensor_output: String,
 }
 
@@ -248,88 +251,55 @@ impl PeasRuntime {
         let mut prompt = plan.user_prompt.unwrap_or(text);
         let mut pre_effects = Vec::new();
         let mut sensor_notes = Vec::new();
-        let mut fs_outcomes: Vec<FilesystemActionOutcome> = Vec::new();
-        let fs_actions = match runtime.filesystem_plugin() {
-            Some(plugin) => {
-                match runtime.run_filesystem_plugin(plugin, ChatPluginPerceptInput {
-                    session_id: session_id.clone(),
-                    turn_id: turn_id.clone(),
-                    text: prompt.clone(),
-                }) {
-                    Ok(plan) => plan.actions,
-                    Err(error) => {
-                        sensor_notes.push(format!(
-                            "sensor filesystem_command_error: plugin planning failed: {}",
-                            error
-                        ));
-                        Vec::new()
-                    }
+        let mut planned_actions = runtime.materialize_planned_actions(&plan.planned_actions);
+        if !planned_actions.is_empty() {
+            pre_effects.push(Effect::PlanUpdated {
+                turn_id: turn_id.clone(),
+                actions: planned_actions.clone(),
+            });
+        }
+
+        for action in &mut planned_actions {
+            action.status = PlannedActionStatus::InProgress;
+            action.details = Some("Action started".to_string());
+            pre_effects.push(Effect::ActionStatusChanged {
+                turn_id: turn_id.clone(),
+                action: action.clone(),
+            });
+
+            match runtime.execute_planned_action(&workspace_dir, action)? {
+                Some(outcome) => {
+                    sensor_notes.push(outcome.sensor_output.clone());
+                    action.status = map_outcome_status(&outcome.status);
+                    action.details = Some(outcome.details.clone());
+                    pre_effects.push(Effect::ActionStatusChanged {
+                        turn_id: turn_id.clone(),
+                        action: action.clone(),
+                    });
+                }
+                None => {
+                    action.status = PlannedActionStatus::Skipped;
+                    action.details = Some("No executor available for action".to_string());
+                    pre_effects.push(Effect::ActionStatusChanged {
+                        turn_id: turn_id.clone(),
+                        action: action.clone(),
+                    });
                 }
             }
-            None => Vec::new(),
-        };
-
-        for action in fs_actions {
-            pre_effects.push(Effect::TaskCompletion {
-                turn_id: turn_id.clone(),
-                status: "in_progress".to_string(),
-                details: format!("filesystem actuator started: {}", action.actuator),
-            });
-
-            let outcome = runtime.execute_filesystem_action(&workspace_dir, &action)?;
-            sensor_notes.push(outcome.sensor_output.clone());
-            fs_outcomes.push(outcome.clone());
-            pre_effects.push(Effect::TaskCompletion {
-                turn_id: turn_id.clone(),
-                status: outcome.status,
-                details: outcome.details,
-            });
         }
 
         if !sensor_notes.is_empty() {
             prompt = format!(
-                "{prompt}\n\nFilesystem sensor observations:\n{}\nUse these observations directly. If an action is blocked by permissions, ask the user for explicit per-action approval before requesting broader access.",
+                "{prompt}\n\nPlugin sensor observations:\n{}\nUse these observations directly. If an action is blocked by permissions, ask the user for explicit per-action approval before requesting broader access.",
                 sensor_notes.join("\n\n")
             );
         }
 
         let turn_id_for_stream = turn_id.clone();
-        let requested_fs_command = is_filesystem_command(&prompt);
-        let fs_short_circuit_response = if !fs_outcomes.is_empty() {
-            Some(format_filesystem_response(&fs_outcomes))
-        } else if requested_fs_command {
-            Some(
-                sensor_notes
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        "Filesystem command was requested, but no filesystem plugin action could be planned."
-                            .to_string()
-                    }),
-            )
-        } else {
-            None
-        };
 
         let stream = try_stream! {
             for effect in pre_effects {
                 yield effect;
-            }
-
-            if let Some(response) = fs_short_circuit_response {
-                yield Effect::ChatResponse {
-                    turn_id: turn_id_for_stream.clone(),
-                    text: response,
-                };
-
-                if let Some(task_completion) = plan.task_completion {
-                    yield Effect::TaskCompletion {
-                        turn_id: turn_id_for_stream,
-                        status: task_completion.status,
-                        details: task_completion.details,
-                    };
-                }
-                return;
             }
 
             let provider_id = parse_provider_id(&provider_name)
@@ -454,6 +424,28 @@ impl PeasRuntime {
                     &payload,
                 )
             }
+            Effect::PlanUpdated { turn_id, actions } => {
+                let payload = serde_json::to_string(actions)
+                    .context("failed to serialize planned actions")?;
+                self.append_event(
+                    session_id,
+                    Some(turn_id.as_str()),
+                    "effect_plan_updated",
+                    Some("assistant"),
+                    &payload,
+                )
+            }
+            Effect::ActionStatusChanged { turn_id, action } => {
+                let payload = serde_json::to_string(action)
+                    .context("failed to serialize planned action update")?;
+                self.append_event(
+                    session_id,
+                    Some(turn_id.as_str()),
+                    "effect_action_status_changed",
+                    Some("assistant"),
+                    &payload,
+                )
+            }
         }
     }
 
@@ -464,15 +456,6 @@ impl PeasRuntime {
     ) -> anyhow::Result<ChatPluginPerceptPlan> {
         self.run_plugin_with_input(plugin, &input)
             .context("chat plugin returned invalid json plan payload")
-    }
-
-    fn run_filesystem_plugin(
-        &self,
-        plugin: &LoadedPlugin,
-        input: ChatPluginPerceptInput,
-    ) -> anyhow::Result<FilesystemPluginPlan> {
-        self.run_plugin_with_input(plugin, &input)
-            .context("filesystem plugin returned invalid json plan payload")
     }
 
     fn run_plugin_with_input<TInput, TOutput>(
@@ -558,45 +541,108 @@ impl PeasRuntime {
             })
     }
 
-    fn filesystem_plugin(&self) -> Option<&LoadedPlugin> {
+    fn materialize_planned_actions(&self, specs: &[PlannedActionSpec]) -> Vec<PlannedAction> {
+        specs
+            .iter()
+            .enumerate()
+            .map(|(index, spec)| PlannedAction {
+                action_id: format!("act-{}-{}", now_millis(), index + 1),
+                plugin: spec.plugin.clone().unwrap_or_else(|| "auto".to_string()),
+                actuator: spec.actuator.clone(),
+                args: spec.args.clone(),
+                status: PlannedActionStatus::Planned,
+                details: None,
+            })
+            .collect()
+    }
+
+    fn execute_planned_action(
+        &self,
+        workspace_dir: &str,
+        action: &PlannedAction,
+    ) -> anyhow::Result<Option<FilesystemActionOutcome>> {
+        let Some(plugin) = self.resolve_action_plugin(action) else {
+            return Ok(None);
+        };
+
+        if action.actuator.starts_with("filesystem_") {
+            let fs_action = FilesystemActionPlan {
+                actuator: action.actuator.clone(),
+                pattern: action
+                    .args
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                path: action
+                    .args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                max_results: action
+                    .args
+                    .get("max_results")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
+                file_path: action
+                    .args
+                    .get("file_path")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                max_lines: action
+                    .args
+                    .get("max_lines")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
+            };
+
+            return self
+                .execute_filesystem_action(plugin, workspace_dir, &fs_action)
+                .map(Some);
+        }
+
+        Ok(None)
+    }
+
+    fn resolve_action_plugin(&self, action: &PlannedAction) -> Option<&LoadedPlugin> {
+        if action.plugin != "auto"
+            && let Some(plugin) = self.plugin_by_name(&action.plugin)
+            && plugin
+                .manifest
+                .peas
+                .actuators
+                .iter()
+                .any(|actuator| actuator.name == action.actuator)
+        {
+            return Some(plugin);
+        }
+
+        self.plugin_for_actuator(&action.actuator)
+    }
+
+    fn plugin_by_name(&self, plugin_name: &str) -> Option<&LoadedPlugin> {
+        self.plugins
+            .iter()
+            .find(|plugin| plugin.manifest.name == plugin_name)
+    }
+
+    fn plugin_for_actuator(&self, actuator_name: &str) -> Option<&LoadedPlugin> {
         self.plugins.iter().find(|plugin| {
             plugin
                 .manifest
                 .peas
                 .actuators
                 .iter()
-                .any(|actuator| actuator.name == "filesystem_grep")
-                && plugin
-                    .manifest
-                    .peas
-                    .actuators
-                    .iter()
-                    .any(|actuator| actuator.name == "filesystem_glob")
+                .any(|actuator| actuator.name == actuator_name)
         })
     }
 
     fn execute_filesystem_action(
         &self,
+        plugin: &LoadedPlugin,
         workspace_dir: &str,
         action: &FilesystemActionPlan,
     ) -> anyhow::Result<FilesystemActionOutcome> {
-        let Some(plugin) = self.filesystem_plugin() else {
-            return Ok(FilesystemActionOutcome {
-                actuator: action.actuator.clone(),
-                pattern: action.pattern.clone(),
-                path: action
-                    .file_path
-                    .clone()
-                    .or_else(|| action.path.clone())
-                    .unwrap_or_else(|| ".".to_string()),
-                status: "skipped".to_string(),
-                details: "filesystem plugin is not active".to_string(),
-                stdout: String::new(),
-                stderr: String::new(),
-                sensor_output: "filesystem sensor: plugin is not active".to_string(),
-            });
-        };
-
         let workspace_root = PathBuf::from(workspace_dir);
         let requested_path = if action.actuator == "filesystem_read" {
             action
@@ -617,16 +663,11 @@ impl PeasRuntime {
                 plugin.permissions().read
             );
             return Ok(FilesystemActionOutcome {
-                actuator: action.actuator.clone(),
-                pattern: action.pattern.clone(),
-                path: target_dir.display().to_string(),
                 status: "blocked".to_string(),
                 details: format!(
                     "filesystem action blocked for path '{}'; ask user for per-action approval",
                     target_dir.display()
                 ),
-                stdout: String::new(),
-                stderr: String::new(),
                 sensor_output,
             });
         }
@@ -641,13 +682,8 @@ impl PeasRuntime {
             }
             other => {
                 return Ok(FilesystemActionOutcome {
-                    actuator: action.actuator.clone(),
-                    pattern: action.pattern.clone(),
-                    path: target_dir.display().to_string(),
                     status: "skipped".to_string(),
                     details: format!("unsupported filesystem actuator '{other}'"),
-                    stdout: String::new(),
-                    stderr: String::new(),
                     sensor_output: format!(
                         "sensor filesystem_command_error: unsupported actuator '{other}'"
                     ),
@@ -679,13 +715,8 @@ impl PeasRuntime {
         }
 
         Ok(FilesystemActionOutcome {
-            actuator: action.actuator.clone(),
-            pattern: action.pattern.clone(),
-            path: target_dir.display().to_string(),
             status: outcome_status,
             details,
-            stdout,
-            stderr,
             sensor_output,
         })
     }
@@ -897,78 +928,14 @@ impl LoadedPlugin {
     }
 }
 
-fn format_filesystem_response(outcomes: &[FilesystemActionOutcome]) -> String {
-    let mut sections = Vec::new();
-
-    for outcome in outcomes {
-        let mut block = Vec::new();
-        if outcome.actuator == "filesystem_read" {
-            block.push(format!(
-                "{} `{}`",
-                pretty_actuator_name(&outcome.actuator),
-                outcome.path
-            ));
-        } else {
-            block.push(format!(
-                "{} `{}` in `{}`",
-                pretty_actuator_name(&outcome.actuator),
-                outcome.pattern,
-                outcome.path
-            ));
-        }
-
-        match outcome.status.as_str() {
-            "blocked" => {
-                block.push("Blocked by plugin read permissions. Please approve this specific action if you want me to run it.".to_string());
-            }
-            "failed" => {
-                block.push(format!("Failed: {}", outcome.details));
-            }
-            "completed" | "skipped" => {
-                block.push(outcome.details.clone());
-            }
-            _ => {
-                block.push(outcome.details.clone());
-            }
-        }
-
-        if !outcome.stdout.trim().is_empty() {
-            block.push("Result:".to_string());
-            block.push(outcome.stdout.clone());
-        } else if outcome.status == "completed" {
-            block.push("Result: (no matches)".to_string());
-        }
-
-        if !outcome.stderr.trim().is_empty() {
-            block.push("Error output: ".to_string() + outcome.stderr.trim());
-        }
-
-        sections.push(block.join("\n"));
+fn map_outcome_status(status: &str) -> PlannedActionStatus {
+    match status {
+        "completed" => PlannedActionStatus::Completed,
+        "failed" => PlannedActionStatus::Failed,
+        "blocked" => PlannedActionStatus::Blocked,
+        "skipped" => PlannedActionStatus::Skipped,
+        _ => PlannedActionStatus::Failed,
     }
-
-    sections.join("\n\n")
-}
-
-fn pretty_actuator_name(actuator: &str) -> &str {
-    match actuator {
-        "filesystem_grep" => "Grep",
-        "filesystem_glob" => "Glob",
-        "filesystem_read" => "Read",
-        _ => "Filesystem",
-    }
-}
-
-fn is_filesystem_command(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    let lowered = trimmed.to_ascii_lowercase();
-    lowered.starts_with("/glob ")
-        || lowered.starts_with("/glop ")
-        || lowered.starts_with("/grep ")
-        || lowered.starts_with("/read ")
-        || lowered.starts_with("glob ")
-        || lowered.starts_with("glop ")
-        || lowered.starts_with("grep ")
-        || lowered.starts_with("read ")
 }
 
 fn resolve_requested_path(workspace_root: &Path, requested_path: &str) -> PathBuf {

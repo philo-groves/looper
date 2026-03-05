@@ -13,7 +13,8 @@ use crossterm::terminal::{
 use futures_util::{SinkExt, StreamExt};
 use looper_common::{
     AGENT_HOST, AgentEntry, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL,
-    DiscoveryRequest, DiscoveryResponse, Effect, Percept, ProviderApiKey, SessionOrigin,
+    DiscoveryRequest, DiscoveryResponse, Effect, Percept, PlannedAction, PlannedActionStatus,
+    ProviderApiKey, SessionOrigin,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -518,6 +519,7 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         active_provider: "(pending)".to_string(),
         active_model: "(pending)".to_string(),
         agent_port: agent.assigned_port,
+        planned_actions: Vec::new(),
     };
 
     let result = run_tui_loop(&mut app, draw_chat, handle_chat_key);
@@ -1375,6 +1377,7 @@ struct ChatApp {
     active_provider: String,
     active_model: String,
     agent_port: u16,
+    planned_actions: Vec<PlannedAction>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1449,6 +1452,7 @@ impl TuiApp for ChatApp {
                     self.session_id = Some(session_id.clone());
                     self.active_provider = provider;
                     self.active_model = model;
+                    self.planned_actions.clear();
                     self.messages.push(ChatMessage {
                         role: MessageRole::System,
                         text: format!("Connected to {session_id} on ws://{AGENT_HOST}:{}", self.agent_port),
@@ -1489,6 +1493,20 @@ impl TuiApp for ChatApp {
                                 role: MessageRole::System,
                                 text: format!("Task Completion: {status} - {details}"),
                             });
+                        }
+                        Effect::PlanUpdated { actions, .. } => {
+                            self.planned_actions = actions;
+                        }
+                        Effect::ActionStatusChanged { action, .. } => {
+                            if let Some(existing) = self
+                                .planned_actions
+                                .iter_mut()
+                                .find(|existing| existing.action_id == action.action_id)
+                            {
+                                *existing = action;
+                            } else {
+                                self.planned_actions.push(action);
+                            }
                         }
                     }
                     self.status = ChatStatus::Idle;
@@ -1615,6 +1633,7 @@ fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {
             app.agent_port,
             app.agent_workspace.as_deref(),
             app.project_workspace.as_deref(),
+            &app.planned_actions,
         );
     } else {
         draw_chat_panel(frame, area, app);
@@ -1986,6 +2005,7 @@ fn draw_sidenav(
     agent_port: u16,
     agent_workspace: Option<&str>,
     project_workspace: Option<&str>,
+    planned_actions: &[PlannedAction],
 ) {
     let sidenav_bg = Color::Rgb(16, 19, 25);
     frame.render_widget(
@@ -2028,17 +2048,7 @@ fn draw_sidenav(
             height: todos_height,
         };
 
-        let todos_content = Text::from(vec![
-            Line::from(Span::styled(
-                "Task Planning",
-                Style::default().fg(Color::Rgb(220, 229, 239)),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "No planning to show yet...",
-                Style::default().fg(Color::Rgb(180, 196, 214)),
-            )),
-        ]);
+        let todos_content = build_planning_text(planned_actions);
 
         let todos_container = Paragraph::new(todos_content)
             .block(
@@ -2128,6 +2138,101 @@ fn draw_sidenav(
                 .wrap(Wrap { trim: false }),
             project_path_area,
         );
+    }
+}
+
+fn build_planning_text(planned_actions: &[PlannedAction]) -> Text<'static> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Task Planning",
+            Style::default().fg(Color::Rgb(220, 229, 239)),
+        )),
+        Line::from(""),
+    ];
+
+    if planned_actions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No planning to show yet...",
+            Style::default().fg(Color::Rgb(180, 196, 214)),
+        )));
+        return Text::from(lines);
+    }
+
+    for action in planned_actions.iter().rev().take(6) {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {}",
+                status_icon(action.status.clone()),
+                action.actuator.replace("filesystem_", "")
+            ),
+            Style::default().fg(status_color(action.status.clone())),
+        )));
+
+        if let Some(summary) = summarize_action_args(action) {
+            lines.push(Line::from(Span::styled(
+                format!("  {summary}"),
+                Style::default().fg(Color::Rgb(180, 196, 214)),
+            )));
+        }
+
+        if let Some(details) = &action.details {
+            lines.push(Line::from(Span::styled(
+                format!("  {details}"),
+                Style::default().fg(Color::Rgb(155, 171, 191)),
+            )));
+        }
+
+        lines.push(Line::from(""));
+    }
+
+    Text::from(lines)
+}
+
+fn summarize_action_args(action: &PlannedAction) -> Option<String> {
+    if action.actuator == "filesystem_read" {
+        return action
+            .args
+            .get("file_path")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string);
+    }
+
+    let pattern = action
+        .args
+        .get("pattern")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if pattern.is_empty() {
+        return None;
+    }
+
+    let path = action
+        .args
+        .get("path")
+        .and_then(|value| value.as_str())
+        .unwrap_or(".");
+    Some(format!("{pattern} in {path}"))
+}
+
+fn status_icon(status: PlannedActionStatus) -> &'static str {
+    match status {
+        PlannedActionStatus::Planned => "[ ]",
+        PlannedActionStatus::InProgress => "[~]",
+        PlannedActionStatus::Completed => "[x]",
+        PlannedActionStatus::Failed => "[!]",
+        PlannedActionStatus::Blocked => "[!]",
+        PlannedActionStatus::Skipped => "[-]",
+    }
+}
+
+fn status_color(status: PlannedActionStatus) -> Color {
+    match status {
+        PlannedActionStatus::Planned => Color::Rgb(180, 196, 214),
+        PlannedActionStatus::InProgress => Color::Rgb(255, 240, 140),
+        PlannedActionStatus::Completed => Color::Rgb(127, 214, 154),
+        PlannedActionStatus::Failed => Color::Rgb(255, 120, 120),
+        PlannedActionStatus::Blocked => Color::Rgb(255, 164, 89),
+        PlannedActionStatus::Skipped => Color::Rgb(152, 165, 181),
     }
 }
 
