@@ -160,18 +160,16 @@ You can install it in a workspace from chat with:
 
 ## Starter Pack Templates
 
-Looper includes external plugin starter packs for domain-specific workflows:
+Looper includes an external plugin starter pack for domain-specific workflows:
 
-- `looper-agent/external-plugins/cybersecurity-starter`
 - `looper-agent/external-plugins/blogging-starter`
 
 You can view bundled starter packs from terminal chat with:
 
 - `/plugin catalog`
 
-Install either pack with:
+Install it with:
 
-- `/plugin add looper-agent/external-plugins/cybersecurity-starter`
 - `/plugin add looper-agent/external-plugins/blogging-starter`
 
 ## Guidance Priority
