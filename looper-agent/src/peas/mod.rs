@@ -14,9 +14,13 @@ use fiddlesticks::{
     parse_provider_id,
 };
 use futures_util::{Stream, StreamExt};
+use globset::Glob;
 use looper_common::{Effect, Percept, SessionOrigin};
+use regex::Regex;
 use rusqlite::{Connection, params};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use walkdir::WalkDir;
 
 use crate::settings::AgentKeys;
 
@@ -111,6 +115,34 @@ struct ChatTaskCompletionOutput {
     details: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct FilesystemPluginPlan {
+    #[serde(default)]
+    actions: Vec<FilesystemActionPlan>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FilesystemActionPlan {
+    actuator: String,
+    pattern: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    max_results: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct FilesystemActionOutcome {
+    actuator: String,
+    pattern: String,
+    path: String,
+    status: String,
+    details: String,
+    stdout: String,
+    stderr: String,
+    sensor_output: String,
+}
+
 fn default_mode() -> String {
     "stream_chat".to_string()
 }
@@ -172,6 +204,7 @@ impl PeasRuntime {
         session_id: &str,
         domain: &str,
         percept: Percept,
+        workspace_dir: &str,
         provider_name: &str,
         model: &str,
         keys: &AgentKeys,
@@ -184,6 +217,7 @@ impl PeasRuntime {
         let model = model.to_string();
         let keys = keys.clone();
         let session_id = session_id.to_string();
+        let workspace_dir = workspace_dir.to_string();
         let runtime = self.clone();
 
         let Percept::UserText { turn_id, text } = percept;
@@ -206,10 +240,93 @@ impl PeasRuntime {
             bail!("unsupported chat plugin mode: {}", plan.mode);
         }
 
-        let prompt = plan.user_prompt.unwrap_or(text);
+        let mut prompt = plan.user_prompt.unwrap_or(text);
+        let mut pre_effects = Vec::new();
+        let mut sensor_notes = Vec::new();
+        let mut fs_outcomes: Vec<FilesystemActionOutcome> = Vec::new();
+        let fs_actions = match runtime.filesystem_plugin() {
+            Some(plugin) => {
+                match runtime.run_filesystem_plugin(plugin, ChatPluginPerceptInput {
+                    session_id: session_id.clone(),
+                    turn_id: turn_id.clone(),
+                    text: prompt.clone(),
+                }) {
+                    Ok(plan) => plan.actions,
+                    Err(error) => {
+                        sensor_notes.push(format!(
+                            "sensor filesystem_command_error: plugin planning failed: {}",
+                            error
+                        ));
+                        Vec::new()
+                    }
+                }
+            }
+            None => Vec::new(),
+        };
+
+        for action in fs_actions {
+            pre_effects.push(Effect::TaskCompletion {
+                turn_id: turn_id.clone(),
+                status: "in_progress".to_string(),
+                details: format!("filesystem actuator started: {}", action.actuator),
+            });
+
+            let outcome = runtime.execute_filesystem_action(&workspace_dir, &action)?;
+            sensor_notes.push(outcome.sensor_output.clone());
+            fs_outcomes.push(outcome.clone());
+            pre_effects.push(Effect::TaskCompletion {
+                turn_id: turn_id.clone(),
+                status: outcome.status,
+                details: outcome.details,
+            });
+        }
+
+        if !sensor_notes.is_empty() {
+            prompt = format!(
+                "{prompt}\n\nFilesystem sensor observations:\n{}\nUse these observations directly. If an action is blocked by permissions, ask the user for explicit per-action approval before requesting broader access.",
+                sensor_notes.join("\n\n")
+            );
+        }
+
         let turn_id_for_stream = turn_id.clone();
+        let requested_fs_command = is_filesystem_command(&prompt);
+        let fs_short_circuit_response = if !fs_outcomes.is_empty() {
+            Some(format_filesystem_response(&fs_outcomes))
+        } else if requested_fs_command {
+            Some(
+                sensor_notes
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        "Filesystem command was requested, but no filesystem plugin action could be planned."
+                            .to_string()
+                    }),
+            )
+        } else {
+            None
+        };
 
         let stream = try_stream! {
+            for effect in pre_effects {
+                yield effect;
+            }
+
+            if let Some(response) = fs_short_circuit_response {
+                yield Effect::ChatResponse {
+                    turn_id: turn_id_for_stream.clone(),
+                    text: response,
+                };
+
+                if let Some(task_completion) = plan.task_completion {
+                    yield Effect::TaskCompletion {
+                        turn_id: turn_id_for_stream,
+                        status: task_completion.status,
+                        details: task_completion.details,
+                    };
+                }
+                return;
+            }
+
             let provider_id = parse_provider_id(&provider_name)
                 .ok_or_else(|| anyhow::anyhow!("unsupported provider '{provider_name}' for fiddlesticks facade"))?;
 
@@ -340,9 +457,31 @@ impl PeasRuntime {
         plugin: &LoadedPlugin,
         input: ChatPluginPerceptInput,
     ) -> anyhow::Result<ChatPluginPerceptPlan> {
+        self.run_plugin_with_input(plugin, &input)
+            .context("chat plugin returned invalid json plan payload")
+    }
+
+    fn run_filesystem_plugin(
+        &self,
+        plugin: &LoadedPlugin,
+        input: ChatPluginPerceptInput,
+    ) -> anyhow::Result<FilesystemPluginPlan> {
+        self.run_plugin_with_input(plugin, &input)
+            .context("filesystem plugin returned invalid json plan payload")
+    }
+
+    fn run_plugin_with_input<TInput, TOutput>(
+        &self,
+        plugin: &LoadedPlugin,
+        input: &TInput,
+    ) -> anyhow::Result<TOutput>
+    where
+        TInput: Serialize,
+        TOutput: DeserializeOwned,
+    {
         if !plugin.entry_path.exists() {
             bail!(
-                "chat plugin '{}' entrypoint is missing at {}",
+                "plugin '{}' entrypoint is missing at {}",
                 plugin.manifest.name,
                 plugin.entry_path.display()
             );
@@ -359,19 +498,14 @@ impl PeasRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to start deno for chat plugin '{}'",
-                    plugin.manifest.name
-                )
-            })?;
+            .with_context(|| format!("failed to start deno for plugin '{}'", plugin.manifest.name))?;
 
-        let input_json = serde_json::to_string(&input).context("serialize plugin percept input")?;
+        let input_json = serde_json::to_string(input).context("serialize plugin percept input")?;
         {
             let stdin = child
                 .stdin
                 .as_mut()
-                .context("failed to open stdin for chat plugin")?;
+                .context("failed to open stdin for plugin")?;
             stdin
                 .write_all(input_json.as_bytes())
                 .context("failed to write plugin percept input")?;
@@ -379,22 +513,20 @@ impl PeasRuntime {
 
         let output = child
             .wait_with_output()
-            .context("failed to wait for chat plugin process")?;
+            .context("failed to wait for plugin process")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("chat plugin execution failed: {stderr}");
+            bail!("plugin '{}' execution failed: {stderr}", plugin.manifest.name);
         }
 
-        let stdout =
-            String::from_utf8(output.stdout).context("chat plugin emitted invalid utf8")?;
+        let stdout = String::from_utf8(output.stdout).context("plugin emitted invalid utf8")?;
         let trimmed = stdout.trim();
         if trimmed.is_empty() {
-            bail!("chat plugin returned empty output");
+            bail!("plugin '{}' returned empty output", plugin.manifest.name);
         }
 
-        serde_json::from_str::<ChatPluginPerceptPlan>(trimmed)
-            .context("chat plugin returned invalid json plan payload")
+        Ok(serde_json::from_str::<TOutput>(trimmed)?)
     }
 
     fn chat_plugin(&self) -> anyhow::Result<&LoadedPlugin> {
@@ -419,6 +551,122 @@ impl PeasRuntime {
                     "no active plugin can process chat percepts (missing sensor 'terminal_chat_percept' and actuator 'chat_effect_append')"
                 )
             })
+    }
+
+    fn filesystem_plugin(&self) -> Option<&LoadedPlugin> {
+        self.plugins.iter().find(|plugin| {
+            plugin
+                .manifest
+                .peas
+                .actuators
+                .iter()
+                .any(|actuator| actuator.name == "filesystem_grep")
+                && plugin
+                    .manifest
+                    .peas
+                    .actuators
+                    .iter()
+                    .any(|actuator| actuator.name == "filesystem_glob")
+        })
+    }
+
+    fn execute_filesystem_action(
+        &self,
+        workspace_dir: &str,
+        action: &FilesystemActionPlan,
+    ) -> anyhow::Result<FilesystemActionOutcome> {
+        let Some(plugin) = self.filesystem_plugin() else {
+            return Ok(FilesystemActionOutcome {
+                actuator: action.actuator.clone(),
+                pattern: action.pattern.clone(),
+                path: action.path.clone().unwrap_or_else(|| ".".to_string()),
+                status: "skipped".to_string(),
+                details: "filesystem plugin is not active".to_string(),
+                stdout: String::new(),
+                stderr: String::new(),
+                sensor_output: "filesystem sensor: plugin is not active".to_string(),
+            });
+        };
+
+        let workspace_root = PathBuf::from(workspace_dir);
+        let requested_path = action.path.as_deref().unwrap_or(".");
+        let target_dir = resolve_requested_path(&workspace_root, requested_path);
+
+        if !is_allowed_read_path(plugin, &workspace_root, &target_dir) {
+            let sensor_output = format!(
+                "sensor filesystem_command_error: actuator={} blocked; requested path '{}' is outside allowed read roots {:?}. Ask the user for explicit per-action approval.",
+                action.actuator,
+                target_dir.display(),
+                plugin.permissions().read
+            );
+            return Ok(FilesystemActionOutcome {
+                actuator: action.actuator.clone(),
+                pattern: action.pattern.clone(),
+                path: target_dir.display().to_string(),
+                status: "blocked".to_string(),
+                details: format!(
+                    "filesystem action blocked for path '{}'; ask user for per-action approval",
+                    target_dir.display()
+                ),
+                stdout: String::new(),
+                stderr: String::new(),
+                sensor_output,
+            });
+        }
+        let limit = action.max_results.unwrap_or(200).clamp(1, 500);
+
+        let (stdout, stderr, details, outcome_status) = match action.actuator.as_str() {
+            "filesystem_grep" => run_native_grep(&workspace_root, &target_dir, &action.pattern, limit)?,
+            "filesystem_glob" => run_native_glob(&workspace_root, &target_dir, &action.pattern, limit)?,
+            other => {
+                return Ok(FilesystemActionOutcome {
+                    actuator: action.actuator.clone(),
+                    pattern: action.pattern.clone(),
+                    path: target_dir.display().to_string(),
+                    status: "skipped".to_string(),
+                    details: format!("unsupported filesystem actuator '{other}'"),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    sensor_output: format!(
+                        "sensor filesystem_command_error: unsupported actuator '{other}'"
+                    ),
+                });
+            }
+        };
+
+        let (stdout_capped, stdout_truncated) = truncate_text(&stdout, 12_000);
+        let (stderr_capped, stderr_truncated) = truncate_text(&stderr, 4_000);
+
+        let mut sensor_output = format!(
+            "sensor filesystem_command_output: actuator={} path={} pattern={}\nstdout:\n{}",
+            action.actuator,
+            target_dir.display(),
+            action.pattern,
+            if stdout_capped.trim().is_empty() {
+                "(empty)"
+            } else {
+                stdout_capped.as_str()
+            }
+        );
+
+        if !stderr_capped.trim().is_empty() {
+            sensor_output.push_str("\n\nstderr:\n");
+            sensor_output.push_str(&stderr_capped);
+        }
+        if stdout_truncated || stderr_truncated {
+            sensor_output.push_str("\n\n(truncated output)");
+        }
+
+        Ok(FilesystemActionOutcome {
+            actuator: action.actuator.clone(),
+            pattern: action.pattern.clone(),
+            path: target_dir.display().to_string(),
+            status: outcome_status,
+            details,
+            stdout,
+            stderr,
+            sensor_output,
+        })
     }
 
     fn build_chat_system_prompt(&self, plugin_system_prompt: Option<String>) -> String {
@@ -626,6 +874,271 @@ impl LoadedPlugin {
     fn permissions(&self) -> &PluginPermissions {
         &self.manifest.permissions
     }
+}
+
+fn format_filesystem_response(outcomes: &[FilesystemActionOutcome]) -> String {
+    let mut sections = Vec::new();
+
+    for outcome in outcomes {
+        let mut block = Vec::new();
+        block.push(format!(
+            "{} `{}` in `{}`",
+            pretty_actuator_name(&outcome.actuator),
+            outcome.pattern,
+            outcome.path
+        ));
+
+        match outcome.status.as_str() {
+            "blocked" => {
+                block.push("Blocked by plugin read permissions. Please approve this specific action if you want me to run it.".to_string());
+            }
+            "failed" => {
+                block.push(format!("Failed: {}", outcome.details));
+            }
+            "completed" | "skipped" => {
+                block.push(outcome.details.clone());
+            }
+            _ => {
+                block.push(outcome.details.clone());
+            }
+        }
+
+        if !outcome.stdout.trim().is_empty() {
+            block.push("Result:".to_string());
+            block.push(outcome.stdout.clone());
+        } else if outcome.status == "completed" {
+            block.push("Result: (no matches)".to_string());
+        }
+
+        if !outcome.stderr.trim().is_empty() {
+            block.push("Error output: ".to_string() + outcome.stderr.trim());
+        }
+
+        sections.push(block.join("\n"));
+    }
+
+    sections.join("\n\n")
+}
+
+fn pretty_actuator_name(actuator: &str) -> &str {
+    match actuator {
+        "filesystem_grep" => "Grep",
+        "filesystem_glob" => "Glob",
+        _ => "Filesystem",
+    }
+}
+
+fn is_filesystem_command(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    let lowered = trimmed.to_ascii_lowercase();
+    lowered.starts_with("/glob ")
+        || lowered.starts_with("/glop ")
+        || lowered.starts_with("/grep ")
+        || lowered.starts_with("glob ")
+        || lowered.starts_with("glop ")
+        || lowered.starts_with("grep ")
+}
+
+fn resolve_requested_path(workspace_root: &Path, requested_path: &str) -> PathBuf {
+    let requested = Path::new(requested_path.trim());
+    if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        workspace_root.join(requested)
+    }
+}
+
+fn is_allowed_read_path(plugin: &LoadedPlugin, workspace_root: &Path, target_path: &Path) -> bool {
+    let read = &plugin.permissions().read;
+    if read.iter().any(|entry| entry.trim() == ".") {
+        let target_abs = canonicalize_for_check(target_path);
+        let workspace_abs = canonicalize_for_check(workspace_root);
+        return target_abs.starts_with(workspace_abs);
+    }
+
+    let target_abs = canonicalize_for_check(target_path);
+    read.iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            if Path::new(entry).is_absolute() {
+                PathBuf::from(entry)
+            } else {
+                workspace_root.join(entry)
+            }
+        })
+        .map(|root| canonicalize_for_check(&root))
+        .any(|allowed_root| target_abs.starts_with(allowed_root))
+}
+
+fn canonicalize_for_check(path: &Path) -> PathBuf {
+    if let Ok(abs) = fs::canonicalize(path) {
+        return abs;
+    }
+
+    if let Some(parent) = path.parent()
+        && let Ok(parent_abs) = fs::canonicalize(parent)
+    {
+        if let Some(name) = path.file_name() {
+            return parent_abs.join(name);
+        }
+        return parent_abs;
+    }
+
+    path.to_path_buf()
+}
+
+fn run_native_glob(
+    workspace_root: &Path,
+    target_dir: &Path,
+    pattern: &str,
+    limit: usize,
+) -> anyhow::Result<(String, String, String, String)> {
+    if !target_dir.exists() {
+        return Ok((
+            String::new(),
+            format!("target path does not exist: {}", target_dir.display()),
+            format!("filesystem actuator filesystem_glob failed: target path {} does not exist", target_dir.display()),
+            "failed".to_string(),
+        ));
+    }
+
+    let glob = Glob::new(pattern)
+        .with_context(|| format!("invalid glob pattern '{pattern}'"))?
+        .compile_matcher();
+
+    let mut matches = Vec::new();
+    for entry in WalkDir::new(target_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let rel_to_target = path
+            .strip_prefix(target_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+
+        if !glob.is_match(&rel_to_target) && !glob.is_match(file_name) {
+            continue;
+        }
+
+        matches.push(display_path(workspace_root, path));
+        if matches.len() >= limit {
+            break;
+        }
+    }
+
+    let stdout = matches.join("\n");
+    let details = if matches.is_empty() {
+        "filesystem actuator filesystem_glob completed with no matches".to_string()
+    } else {
+        format!(
+            "filesystem actuator filesystem_glob completed with {} matches",
+            matches.len()
+        )
+    };
+
+    Ok((stdout, String::new(), details, "completed".to_string()))
+}
+
+fn run_native_grep(
+    workspace_root: &Path,
+    target_dir: &Path,
+    pattern: &str,
+    limit: usize,
+) -> anyhow::Result<(String, String, String, String)> {
+    if !target_dir.exists() {
+        return Ok((
+            String::new(),
+            format!("target path does not exist: {}", target_dir.display()),
+            format!("filesystem actuator filesystem_grep failed: target path {} does not exist", target_dir.display()),
+            "failed".to_string(),
+        ));
+    }
+
+    let regex = Regex::new(pattern)
+        .with_context(|| format!("invalid regex pattern '{pattern}'"))?;
+
+    let mut matches = Vec::new();
+    for entry in WalkDir::new(target_dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => continue,
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+
+        let text = String::from_utf8_lossy(&bytes);
+        for (idx, line) in text.lines().enumerate() {
+            if !regex.is_match(line) {
+                continue;
+            }
+
+            matches.push(format!(
+                "{}:{}:{}",
+                display_path(workspace_root, path),
+                idx + 1,
+                line
+            ));
+            if matches.len() >= limit {
+                break;
+            }
+        }
+
+        if matches.len() >= limit {
+            break;
+        }
+    }
+
+    let stdout = matches.join("\n");
+    let details = if matches.is_empty() {
+        "filesystem actuator filesystem_grep completed with no matches".to_string()
+    } else {
+        format!(
+            "filesystem actuator filesystem_grep completed with {} matches",
+            matches.len()
+        )
+    };
+
+    Ok((stdout, String::new(), details, "completed".to_string()))
+}
+
+fn display_path(workspace_root: &Path, path: &Path) -> String {
+    path
+        .strip_prefix(workspace_root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> (String, bool) {
+    let chars = text.chars().count();
+    if chars <= max_chars {
+        return (text.to_string(), false);
+    }
+
+    let capped = text.chars().take(max_chars).collect::<String>();
+    (capped, true)
 }
 
 fn now_millis() -> u128 {

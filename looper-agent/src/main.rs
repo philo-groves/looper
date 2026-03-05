@@ -420,6 +420,7 @@ async fn handle_user_socket(
                                 &session_id,
                                 &domain,
                                 percept,
+                                &persisted.settings.workspace_dir,
                                 &persisted.settings.provider,
                                 &persisted.settings.model,
                                 &persisted.keys,

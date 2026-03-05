@@ -1,0 +1,46 @@
+{
+  "name": "filesystem-read",
+  "description": "Filesystem read plugin for grep/glob planning and command observation",
+  "version": "0.1.0",
+  "entry": "main.ts",
+  "permissions": {
+    "read": ["."],
+    "run": []
+  },
+  "peas": {
+    "performance": [
+      {
+        "name": "filesystem-read-correctness",
+        "description": "Use grep/glob only when relevant and capture results accurately"
+      }
+    ],
+    "environment": {
+      "name": "workspace-filesystem",
+      "description": "Workspace-local filesystem readable through guarded shell commands"
+    },
+    "actuators": [
+      {
+        "name": "filesystem_grep",
+        "description": "Run ripgrep content searches on allowed workspace paths"
+      },
+      {
+        "name": "filesystem_glob",
+        "description": "List files by glob pattern on allowed workspace paths"
+      }
+    ],
+    "sensors": [
+      {
+        "name": "filesystem_command_output",
+        "description": "Observe command stdout for filesystem read actions"
+      },
+      {
+        "name": "filesystem_command_error",
+        "description": "Observe command stderr and permission denials"
+      },
+      {
+        "name": "filesystem_command_complete",
+        "description": "Observe command completion status and metadata"
+      }
+    ]
+  }
+}
