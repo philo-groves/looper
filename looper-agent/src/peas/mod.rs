@@ -27,7 +27,63 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct PeasRuntime {
     agent_id: String,
     db_path: PathBuf,
-    chat_plugin_path: PathBuf,
+    plugins: Vec<LoadedPlugin>,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedPlugin {
+    manifest_path: PathBuf,
+    root_dir: PathBuf,
+    entry_path: PathBuf,
+    manifest: PluginManifest,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginManifest {
+    name: String,
+    description: String,
+    version: String,
+    entry: String,
+    permissions: PluginPermissions,
+    peas: PluginPeas,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginPermissions {
+    #[serde(default)]
+    read: Vec<String>,
+    #[serde(default)]
+    run: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginPeas {
+    #[serde(default)]
+    performance: Vec<PluginPerformance>,
+    #[serde(default)]
+    environment: Option<PluginEnvironment>,
+    #[serde(default)]
+    actuators: Vec<PluginComponent>,
+    #[serde(default)]
+    sensors: Vec<PluginComponent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginPerformance {
+    name: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginEnvironment {
+    name: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginComponent {
+    name: String,
+    description: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -66,15 +122,16 @@ impl PeasRuntime {
         let db_path = chats_db_path()?;
         initialize_db(&db_path)?;
 
-        let chat_plugin_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("plugins")
-            .join("internal-chat")
-            .join("main.ts");
+        let plugins = load_plugins(&Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"))?;
+
+        if plugins.is_empty() {
+            bail!("no PEAS plugins were loaded");
+        }
 
         Ok(Self {
             agent_id,
             db_path,
-            chat_plugin_path,
+            plugins,
         })
     }
 
@@ -138,7 +195,8 @@ impl PeasRuntime {
             &text,
         )?;
 
-        let plan = runtime.run_chat_plugin(ChatPluginPerceptInput {
+        let chat_plugin = runtime.chat_plugin()?;
+        let plan = runtime.run_chat_plugin(chat_plugin, ChatPluginPerceptInput {
             session_id: session_id.clone(),
             turn_id: turn_id.clone(),
             text: text.clone(),
@@ -167,10 +225,9 @@ impl PeasRuntime {
 
             let service = chat_service(provider);
             let mut session = ChatSession::new(session_id.clone(), provider_id, model.clone());
-            if let Some(system_prompt) = plan.system_prompt.clone() {
-                if !system_prompt.trim().is_empty() {
-                    session = session.with_system_prompt(system_prompt);
-                }
+            let full_system_prompt = runtime.build_chat_system_prompt(plan.system_prompt.clone());
+            if !full_system_prompt.trim().is_empty() {
+                session = session.with_system_prompt(full_system_prompt);
             }
 
             let request = ChatTurnRequest::new(session, prompt).enable_streaming();
@@ -280,24 +337,34 @@ impl PeasRuntime {
 
     fn run_chat_plugin(
         &self,
+        plugin: &LoadedPlugin,
         input: ChatPluginPerceptInput,
     ) -> anyhow::Result<ChatPluginPerceptPlan> {
-        if !self.chat_plugin_path.exists() {
+        if !plugin.entry_path.exists() {
             bail!(
-                "internal chat plugin is missing at {}",
-                self.chat_plugin_path.display()
+                "chat plugin '{}' entrypoint is missing at {}",
+                plugin.manifest.name,
+                plugin.entry_path.display()
             );
         }
 
-        let mut child = Command::new("deno")
-            .arg("run")
-            .arg("--quiet")
-            .arg(&self.chat_plugin_path)
+        let mut cmd = Command::new("deno");
+        cmd.arg("run").arg("--quiet");
+        append_deno_permissions(&mut cmd, plugin);
+
+        let mut child = cmd
+            .arg(&plugin.entry_path)
+            .current_dir(&plugin.root_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .context("failed to start deno for internal chat plugin")?;
+            .with_context(|| {
+                format!(
+                    "failed to start deno for chat plugin '{}'",
+                    plugin.manifest.name
+                )
+            })?;
 
         let input_json = serde_json::to_string(&input).context("serialize plugin percept input")?;
         {
@@ -330,6 +397,103 @@ impl PeasRuntime {
             .context("chat plugin returned invalid json plan payload")
     }
 
+    fn chat_plugin(&self) -> anyhow::Result<&LoadedPlugin> {
+        self.plugins
+            .iter()
+            .find(|plugin| {
+                plugin
+                    .manifest
+                    .peas
+                    .sensors
+                    .iter()
+                    .any(|sensor| sensor.name == "terminal_chat_percept")
+                    && plugin
+                        .manifest
+                        .peas
+                        .actuators
+                        .iter()
+                        .any(|actuator| actuator.name == "chat_effect_append")
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no active plugin can process chat percepts (missing sensor 'terminal_chat_percept' and actuator 'chat_effect_append')"
+                )
+            })
+    }
+
+    fn build_chat_system_prompt(&self, plugin_system_prompt: Option<String>) -> String {
+        let mut sections = Vec::new();
+        if let Some(system_prompt) = plugin_system_prompt {
+            if !system_prompt.trim().is_empty() {
+                sections.push(system_prompt);
+            }
+        }
+
+        let context = self.build_component_context();
+        if !context.is_empty() {
+            sections.push(format!(
+                "PEAS plugin context (available for consideration during this chat):\n{context}\nUse these components when relevant, and do not claim to have used a component unless it was actually invoked."
+            ));
+        }
+
+        sections.join("\n\n")
+    }
+
+    fn build_component_context(&self) -> String {
+        let mut lines = Vec::new();
+        for plugin in &self.plugins {
+            lines.push(format!(
+                "- plugin '{}' v{}: {}",
+                plugin.manifest.name, plugin.manifest.version, plugin.manifest.description
+            ));
+
+            if let Some(environment) = &plugin.manifest.peas.environment {
+                lines.push(format!(
+                    "  environment: {} - {}",
+                    environment.name, environment.description
+                ));
+            }
+
+            if !plugin.manifest.peas.actuators.is_empty() {
+                let actuators = plugin
+                    .manifest
+                    .peas
+                    .actuators
+                    .iter()
+                    .map(|entry| format!("{} ({})", entry.name, entry.description))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("  actuators: {actuators}"));
+            }
+
+            if !plugin.manifest.peas.sensors.is_empty() {
+                let sensors = plugin
+                    .manifest
+                    .peas
+                    .sensors
+                    .iter()
+                    .map(|entry| format!("{} ({})", entry.name, entry.description))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("  sensors: {sensors}"));
+            }
+
+            if !plugin.manifest.peas.performance.is_empty() {
+                let performance = plugin
+                    .manifest
+                    .peas
+                    .performance
+                    .iter()
+                    .map(|entry| format!("{} ({})", entry.name, entry.description))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("  performance: {performance}"));
+            }
+        }
+
+        lines.join("\n")
+    }
+
     fn append_event(
         &self,
         session_id: &str,
@@ -355,6 +519,112 @@ impl PeasRuntime {
         )
         .with_context(|| format!("failed to append event for session {session_id}"))?;
         Ok(())
+    }
+}
+
+fn load_plugins(plugins_root: &Path) -> anyhow::Result<Vec<LoadedPlugin>> {
+    if !plugins_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut plugins = Vec::new();
+    for entry in fs::read_dir(plugins_root)
+        .with_context(|| format!("failed to read plugins root at {}", plugins_root.display()))?
+    {
+        let entry = entry.context("failed to read plugin directory entry")?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+
+        let manifest_path = path.join("looper-plugin.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+
+        let manifest_text = fs::read_to_string(&manifest_path)
+            .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+        let manifest = serde_json::from_str::<PluginManifest>(&manifest_text)
+            .with_context(|| format!("invalid plugin manifest {}", manifest_path.display()))?;
+
+        if manifest.name.trim().is_empty() {
+            bail!("plugin at {} has empty name", manifest_path.display());
+        }
+
+        let entry_path = path.join(&manifest.entry);
+        if !entry_path.exists() {
+            bail!(
+                "plugin '{}' entry file is missing at {}",
+                manifest.name,
+                entry_path.display()
+            );
+        }
+
+        plugins.push(LoadedPlugin {
+            manifest_path,
+            root_dir: path,
+            entry_path,
+            manifest,
+        });
+    }
+
+    plugins.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+
+    for pair in plugins.windows(2) {
+        if pair[0].manifest.name == pair[1].manifest.name {
+            bail!(
+                "duplicate plugin id '{}' in {} and {}",
+                pair[0].manifest.name,
+                pair[0].manifest_path.display(),
+                pair[1].manifest_path.display()
+            );
+        }
+    }
+
+    Ok(plugins)
+}
+
+fn append_deno_permissions(cmd: &mut Command, plugin: &LoadedPlugin) {
+    append_deno_permission(cmd, "--allow-read", &plugin.permissions().read, &plugin.root_dir);
+    append_deno_permission(cmd, "--allow-run", &plugin.permissions().run, &plugin.root_dir);
+}
+
+fn append_deno_permission(cmd: &mut Command, flag: &str, values: &[String], plugin_root: &Path) {
+    if values.is_empty() {
+        return;
+    }
+
+    if values.iter().any(|value| value.trim() == ".") {
+        cmd.arg(flag);
+        return;
+    }
+
+    let allowed = values
+        .iter()
+        .map(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return String::new();
+            }
+
+            if Path::new(trimmed).is_absolute() {
+                trimmed.to_string()
+            } else {
+                plugin_root.join(trimmed).to_string_lossy().to_string()
+            }
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if !allowed.is_empty() {
+        cmd.arg(format!("{flag}={allowed}"));
+    }
+}
+
+impl LoadedPlugin {
+    fn permissions(&self) -> &PluginPermissions {
+        &self.manifest.permissions
     }
 }
 
