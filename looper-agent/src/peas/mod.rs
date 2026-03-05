@@ -473,7 +473,8 @@ impl PeasRuntime {
 
             let service = chat_service(provider);
             let mut session = ChatSession::new(session_id.clone(), provider_id, model.clone());
-            let full_system_prompt = runtime.build_chat_system_prompt(plan.system_prompt.clone());
+            let full_system_prompt =
+                runtime.build_chat_system_prompt(plan.system_prompt.clone(), &workspace_dir);
             if !full_system_prompt.trim().is_empty() {
                 session = session.with_system_prompt(full_system_prompt);
             }
@@ -881,8 +882,16 @@ impl PeasRuntime {
         })
     }
 
-    fn build_chat_system_prompt(&self, plugin_system_prompt: Option<String>) -> String {
+    fn build_chat_system_prompt(
+        &self,
+        plugin_system_prompt: Option<String>,
+        workspace_dir: &str,
+    ) -> String {
         let mut sections = Vec::new();
+        if let Some(soul) = load_soul_prompt(workspace_dir) {
+            sections.push(soul);
+        }
+
         if let Some(system_prompt) = plugin_system_prompt {
             if !system_prompt.trim().is_empty() {
                 sections.push(system_prompt);
@@ -1213,6 +1222,25 @@ fn format_pending_approval_prompt(pending: &[PendingApproval]) -> String {
     }
 
     lines.join("\n")
+}
+
+fn load_soul_prompt(workspace_dir: &str) -> Option<String> {
+    let soul_path = Path::new(workspace_dir).join("SOUL.md");
+    let content = fs::read_to_string(&soul_path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (snippet, truncated) = truncate_text(trimmed, 10_000);
+    let mut prompt = format!(
+        "Workspace SOUL guidance (from SOUL.md):\n{}\nFollow this guidance when planning and executing tasks unless the user explicitly overrides it.",
+        snippet
+    );
+    if truncated {
+        prompt.push_str("\n(SOUL.md content truncated for prompt size limits.)");
+    }
+    Some(prompt)
 }
 
 fn resolve_requested_path(workspace_root: &Path, requested_path: &str) -> PathBuf {

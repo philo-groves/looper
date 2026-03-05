@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -484,6 +485,7 @@ async fn complete_setup(
     api_keys: Vec<looper_common::ProviderApiKey>,
 ) -> anyhow::Result<()> {
     let workspace_path = normalize_workspace_dir(&workspace_dir)?;
+    ensure_default_soul_md(&workspace_path)?;
     let runtime_guard = runtime.lock().await;
 
     if port != runtime_guard.assigned_port {
@@ -522,6 +524,41 @@ async fn complete_setup(
     runtime_guard.persisted = Some(persisted);
     runtime_guard.workspace_hint = Some(workspace_path);
     runtime_guard.mode = AgentMode::Running;
+    Ok(())
+}
+
+fn ensure_default_soul_md(workspace_dir: &std::path::Path) -> anyhow::Result<()> {
+    let soul_path = workspace_dir.join("SOUL.md");
+    if soul_path.exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(workspace_dir)
+        .with_context(|| format!("failed to create workspace {}", workspace_dir.display()))?;
+
+    let template = r#"# SOUL
+
+This file defines workspace-specific guidance for the Looper agent.
+
+## Mission
+- Describe the purpose of this project and what success looks like.
+
+## Priorities
+- List the highest-priority goals for work in this repository.
+
+## Coding Principles
+- Add style, architecture, and quality expectations.
+
+## Safety and Boundaries
+- Call out operations that require confirmation.
+- Note sensitive files, environments, or deployment constraints.
+
+## Preferences
+- Capture team preferences for communication, testing, and commits.
+"#;
+
+    fs::write(&soul_path, template)
+        .with_context(|| format!("failed to write {}", soul_path.display()))?;
     Ok(())
 }
 
