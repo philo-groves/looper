@@ -502,6 +502,7 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
         cursor_visible: true,
         messages: Vec::new(),
         scroll_offset: 0,
+        history_max_scroll: 0,
         follow_tail: true,
         status: ChatStatus::Idle,
         status_ticks: 0,
@@ -1358,6 +1359,7 @@ struct ChatApp {
     cursor_visible: bool,
     messages: Vec<ChatMessage>,
     scroll_offset: usize,
+    history_max_scroll: usize,
     follow_tail: bool,
     status: ChatStatus,
     status_ticks: u8,
@@ -1453,7 +1455,6 @@ impl TuiApp for ChatApp {
                     });
                     self.status = ChatStatus::Idle;
                     self.status_ticks = 0;
-                    self.follow_tail = true;
                 }
                 ChatEvent::EffectApplied { effect } => {
                     match effect {
@@ -1492,7 +1493,6 @@ impl TuiApp for ChatApp {
                     }
                     self.status = ChatStatus::Idle;
                     self.status_ticks = 0;
-                    self.follow_tail = true;
                 }
                 ChatEvent::Error { message } => {
                     self.messages.push(ChatMessage {
@@ -1501,7 +1501,6 @@ impl TuiApp for ChatApp {
                     });
                     self.status = ChatStatus::Idle;
                     self.status_ticks = 0;
-                    self.follow_tail = true;
                 }
                 ChatEvent::Disconnected => {
                     self.messages.push(ChatMessage {
@@ -1510,7 +1509,6 @@ impl TuiApp for ChatApp {
                     });
                     self.status = ChatStatus::Idle;
                     self.status_ticks = 0;
-                    self.follow_tail = true;
                 }
             }
         }
@@ -1559,10 +1557,30 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
             app.status_ticks = 0;
         }
         KeyCode::Up => {
-            app.input_view_backscroll = app.input_view_backscroll.saturating_add(1);
+            if has_history_scroll_modifier(key.modifiers) {
+                app.follow_tail = false;
+                app.scroll_offset = app.scroll_offset.saturating_sub(1);
+            } else {
+                app.input_view_backscroll = app.input_view_backscroll.saturating_add(1);
+            }
         }
         KeyCode::Down => {
-            app.input_view_backscroll = app.input_view_backscroll.saturating_sub(1);
+            if has_history_scroll_modifier(key.modifiers) {
+                app.follow_tail = false;
+                app.scroll_offset = app
+                    .scroll_offset
+                    .saturating_add(1)
+                    .min(app.history_max_scroll);
+                if app.scroll_offset >= app.history_max_scroll {
+                    app.follow_tail = true;
+                }
+            } else {
+                app.input_view_backscroll = app.input_view_backscroll.saturating_sub(1);
+            }
+        }
+        KeyCode::End => {
+            app.follow_tail = true;
+            app.scroll_offset = app.history_max_scroll;
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1574,6 +1592,10 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
         }
         _ => {}
     }
+}
+
+fn has_history_scroll_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) || modifiers.contains(KeyModifiers::SUPER)
 }
 
 fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {
@@ -1641,6 +1663,7 @@ fn draw_chat_panel(frame: &mut Frame, area: Rect, app: &mut ChatApp) {
     let content_length = history_lines.len().max(1);
     let viewport_height = history_area.height as usize;
     let max_scroll = content_length.saturating_sub(viewport_height);
+    app.history_max_scroll = max_scroll;
 
     if app.follow_tail {
         app.scroll_offset = max_scroll;
