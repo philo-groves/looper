@@ -86,9 +86,65 @@ function planActions(text: string): PlannedAction[] {
     return [];
   }
 
+  const inspectAction = parseInspectorCommand(text);
+  if (inspectAction.length > 0) return inspectAction;
+
+  const starterPackAction = parseStarterPackCommands(text);
+  if (starterPackAction.length > 0) return starterPackAction;
+
   const fromCommand = parseFilesystemCommand(text);
   if (fromCommand.length > 0) return fromCommand;
   return parseFilesystemRequest(text);
+}
+
+function parseInspectorCommand(text: string): PlannedAction[] {
+  const inspectCommand = text.match(/^\/(inspect|analyze-text)\s+(.+)$/i);
+  if (!inspectCommand) {
+    return [];
+  }
+
+  const targetText = inspectCommand[2].trim();
+  if (!targetText) {
+    return [];
+  }
+
+  return [{
+    plugin: "reference-inspector",
+    actuator: "text_inspect",
+    args: {
+      text: targetText,
+    },
+  }];
+}
+
+function parseStarterPackCommands(text: string): PlannedAction[] {
+  const cyberTriage = text.match(/^\/(cyber-triage)\s+(.+)$/i);
+  if (cyberTriage) {
+    return [{
+      plugin: "cybersecurity-starter",
+      actuator: "cyber_triage",
+      args: {
+        target: cyberTriage[2].trim(),
+        observations: [
+          "user-requested quick triage",
+        ],
+      },
+    }];
+  }
+
+  const blogOutline = text.match(/^\/(blog-outline)\s+(.+)$/i);
+  if (blogOutline) {
+    return [{
+      plugin: "blogging-starter",
+      actuator: "blog_outline",
+      args: {
+        topic: blogOutline[2].trim(),
+        audience: "general",
+      },
+    }];
+  }
+
+  return [];
 }
 
 function parseFilesystemCommand(text: string): PlannedAction[] {

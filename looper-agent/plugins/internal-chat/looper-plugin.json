@@ -12,6 +12,12 @@
       {
         "name": "chat-response-completeness",
         "description": "Every terminal chat percept receives a response effect",
+        "weight": 1.0,
+        "evaluation_mode": "strict",
+        "success_criteria": [
+          "Return a direct response for every terminal percept",
+          "If actions run, incorporate observed outputs instead of asking the user to rerun commands"
+        ],
         "rewards": [
           {
             "name": "responded",

@@ -59,13 +59,29 @@ Removes the API key for a model provider (if exists).
 
 Manage the PEAS plugins that are used by the agent.
 
-#### `/plugin add <dir|url|zip>`
+#### `/plugin add <directory_path>`
 
-Adds a plugin to the agent.
+Installs an external plugin directory into the active workspace.
 
 #### `/plugin remove <plugin_id>`
 
 Removes a plugin from the agent
+
+#### `/plugin enable <plugin_id>`
+
+Enables a plugin in the active workspace.
+
+#### `/plugin disable <plugin_id>`
+
+Disables a plugin in the active workspace.
+
+#### `/plugin list`
+
+Lists builtin and workspace plugins with enabled/disabled state.
+
+#### `/plugin catalog`
+
+Lists bundled external starter plugins that can be installed with `/plugin add`.
 
 #### `/soul`
 

@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use looper_common::{
     AGENT_HOST, AgentEntry, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL,
     DiscoveryRequest, DiscoveryResponse, Effect, Percept, PlannedAction, PlannedActionStatus,
-    ProviderApiKey, SessionOrigin,
+    PluginCommandRequest, ProviderApiKey, SessionOrigin,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -532,6 +532,7 @@ fn run_chat_ui(agent: &AgentInfo) -> anyhow::Result<()> {
 #[derive(Debug)]
 enum ChatCommand {
     SendPercept { turn_id: String, text: String },
+    PluginCommand { command: PluginCommandRequest },
     EndSession,
 }
 
@@ -546,6 +547,10 @@ enum ChatEvent {
         effect: Effect,
     },
     Error {
+        message: String,
+    },
+    PluginCommandResult {
+        success: bool,
         message: String,
     },
     Disconnected,
@@ -680,6 +685,22 @@ async fn chat_socket_loop(
                             break;
                         }
                     }
+                    ChatCommand::PluginCommand { command } => {
+                        let request = AgentSocketMessage::PluginCommand { command };
+                        if let Err(error) = writer
+                            .send(Message::Text(
+                                serde_json::to_string(&request)
+                                    .unwrap_or_else(|_| "{}".to_string())
+                                    .into(),
+                            ))
+                            .await
+                        {
+                            let _ = event_tx.send(ChatEvent::Error {
+                                message: format!("failed to send plugin command: {error}"),
+                            });
+                            break;
+                        }
+                    }
                     ChatCommand::EndSession => {
                         if let Some(active_session_id) = session_id.clone() {
                             let end = AgentSocketMessage::SessionEnd {
@@ -716,6 +737,14 @@ async fn chat_socket_loop(
                         match payload {
                             AgentSocketMessage::EffectApplied { effect, .. } => {
                                 let _ = event_tx.send(ChatEvent::EffectApplied { effect });
+                            }
+                            AgentSocketMessage::PluginCommandResult {
+                                success, message, ..
+                            } => {
+                                let _ = event_tx.send(ChatEvent::PluginCommandResult {
+                                    success,
+                                    message,
+                                });
                             }
                             AgentSocketMessage::Error { message } => {
                                 let _ = event_tx.send(ChatEvent::Error { message });
@@ -1455,7 +1484,10 @@ impl TuiApp for ChatApp {
                     self.planned_actions.clear();
                     self.messages.push(ChatMessage {
                         role: MessageRole::System,
-                        text: format!("Connected to {session_id} on ws://{AGENT_HOST}:{}", self.agent_port),
+                        text: format!(
+                            "Connected to {session_id} on ws://{AGENT_HOST}:{}",
+                            self.agent_port
+                        ),
                     });
                     self.status = ChatStatus::Idle;
                     self.status_ticks = 0;
@@ -1520,6 +1552,18 @@ impl TuiApp for ChatApp {
                     self.status = ChatStatus::Idle;
                     self.status_ticks = 0;
                 }
+                ChatEvent::PluginCommandResult { success, message } => {
+                    self.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        text: if success {
+                            format!("Plugin: {message}")
+                        } else {
+                            format!("Plugin Error: {message}")
+                        },
+                    });
+                    self.status = ChatStatus::Idle;
+                    self.status_ticks = 0;
+                }
                 ChatEvent::Disconnected => {
                     self.messages.push(ChatMessage {
                         role: MessageRole::System,
@@ -1552,6 +1596,43 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
                 return;
             }
             let text = app.input.trim().to_string();
+
+            if let Some(command) = parse_plugin_command(&text) {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::User,
+                    text: text.clone(),
+                });
+                match command {
+                    Ok(command) => {
+                        if app
+                            .chat_cmd_tx
+                            .send(ChatCommand::PluginCommand { command })
+                            .is_err()
+                        {
+                            app.messages.push(ChatMessage {
+                                role: MessageRole::System,
+                                text: "Error: Unable to send plugin command to agent.".to_string(),
+                            });
+                        } else {
+                            app.status = ChatStatus::Thinking;
+                            app.status_ticks = 0;
+                        }
+                    }
+                    Err(error_message) => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            text: error_message,
+                        });
+                        app.status = ChatStatus::Idle;
+                        app.status_ticks = 0;
+                    }
+                }
+                app.input.clear();
+                app.input_view_backscroll = 0;
+                app.follow_tail = true;
+                return;
+            }
+
             let turn_id = format!("turn-{}", app.next_turn_id);
             app.next_turn_id = app.next_turn_id.saturating_add(1);
             app.messages.push(ChatMessage {
@@ -1614,6 +1695,72 @@ fn handle_chat_key(app: &mut ChatApp, key: KeyEvent) {
 
 fn has_history_scroll_modifier(modifiers: KeyModifiers) -> bool {
     modifiers.contains(KeyModifiers::CONTROL) || modifiers.contains(KeyModifiers::SUPER)
+}
+
+fn parse_plugin_command(input: &str) -> Option<Result<PluginCommandRequest, String>> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with("/plugin") {
+        return None;
+    }
+
+    let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+    if tokens.len() < 2 {
+        return Some(Err(
+            "Usage: /plugin <add|remove|enable|disable|list|catalog> [arg]".to_string(),
+        ));
+    }
+
+    let result = match tokens[1] {
+        "add" => {
+            if tokens.len() < 3 {
+                Err("Usage: /plugin add <directory_path>".to_string())
+            } else {
+                let source = trimmed
+                    .splitn(3, ' ')
+                    .nth(2)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if source.is_empty() {
+                    Err("Usage: /plugin add <directory_path>".to_string())
+                } else {
+                    Ok(PluginCommandRequest::Add { source })
+                }
+            }
+        }
+        "remove" => {
+            if tokens.len() < 3 {
+                Err("Usage: /plugin remove <plugin_name>".to_string())
+            } else {
+                Ok(PluginCommandRequest::Remove {
+                    plugin_name: tokens[2].to_string(),
+                })
+            }
+        }
+        "enable" => {
+            if tokens.len() < 3 {
+                Err("Usage: /plugin enable <plugin_name>".to_string())
+            } else {
+                Ok(PluginCommandRequest::Enable {
+                    plugin_name: tokens[2].to_string(),
+                })
+            }
+        }
+        "disable" => {
+            if tokens.len() < 3 {
+                Err("Usage: /plugin disable <plugin_name>".to_string())
+            } else {
+                Ok(PluginCommandRequest::Disable {
+                    plugin_name: tokens[2].to_string(),
+                })
+            }
+        }
+        "list" => Ok(PluginCommandRequest::List),
+        "catalog" => Ok(PluginCommandRequest::Catalog),
+        _ => Err("Usage: /plugin <add|remove|enable|disable|list|catalog> [arg]".to_string()),
+    };
+
+    Some(result)
 }
 
 fn draw_chat(frame: &mut Frame, app: &mut ChatApp) {

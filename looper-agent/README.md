@@ -32,6 +32,12 @@ If omitted, discovery assigns a port and the agent can be configured from termin
 - [ ] Operational Observability
 - [ ] Websocket Connections
 
+## Guidance Model
+
+- Performance measures from active plugins are the default guidance mechanism.
+- `SOUL.md` is optional and treated as a secondary overlay for style/ethics preferences.
+- New workspaces are no longer auto-seeded with `SOUL.md`.
+
 Additional feature lists are available the libraries:
 - [looper-peas](../looper-peas/README.md)
 - [looper-settings](../looper-settings/README.md)

@@ -1,0 +1,57 @@
+{
+  "name": "blogging-starter",
+  "description": "Starter external plugin pack for blogging and editorial workflows",
+  "version": "0.1.0",
+  "entry": "main.ts",
+  "permissions": {
+    "read": ["."],
+    "run": []
+  },
+  "peas": {
+    "actuator_executor": "plugin_process",
+    "performance": [
+      {
+        "name": "clarity-and-structure",
+        "description": "Produce concise, coherent outlines and drafts with clear narrative flow",
+        "weight": 1.4,
+        "evaluation_mode": "strict",
+        "success_criteria": [
+          "Outline includes intro, body sections, and conclusion",
+          "Draft summaries avoid filler and remain actionable"
+        ]
+      },
+      {
+        "name": "audience-fit",
+        "description": "Align topic framing and tone with target audience",
+        "weight": 1.1,
+        "evaluation_mode": "balanced",
+        "success_criteria": [
+          "Audience intent is reflected in headings",
+          "Tone remains consistent for intended readers"
+        ]
+      }
+    ],
+    "environment": {
+      "name": "editorial-workspace",
+      "description": "Structured writing workflows for blogging and long-form articles"
+    },
+    "actuators": [
+      {
+        "name": "blog_outline",
+        "description": "Generate a structured blog outline from topic and audience",
+        "executor": "plugin_process"
+      },
+      {
+        "name": "blog_draft_summary",
+        "description": "Generate a concise draft summary with key takeaways",
+        "executor": "plugin_process"
+      }
+    ],
+    "sensors": [
+      {
+        "name": "plugin_command_complete",
+        "description": "Reports plugin actuator completion details"
+      }
+    ]
+  }
+}

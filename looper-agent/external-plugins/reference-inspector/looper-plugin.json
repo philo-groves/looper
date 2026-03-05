@@ -1,0 +1,43 @@
+{
+  "name": "reference-inspector",
+  "description": "Reference external plugin that demonstrates plugin_process actuator execution",
+  "version": "0.1.0",
+  "entry": "main.ts",
+  "permissions": {
+    "read": ["."],
+    "run": []
+  },
+  "peas": {
+    "actuator_executor": "plugin_process",
+    "performance": [
+      {
+        "name": "inspection-signal-quality",
+        "description": "Return concise, useful inspection signals for provided text",
+        "weight": 1.0,
+        "evaluation_mode": "balanced",
+        "success_criteria": [
+          "Include character, word, and line counts",
+          "Detect whether potential secrets are present",
+          "Keep results concise and structured"
+        ]
+      }
+    ],
+    "environment": {
+      "name": "workspace-text-inspection",
+      "description": "Inspects user-provided text payloads without shelling out"
+    },
+    "actuators": [
+      {
+        "name": "text_inspect",
+        "description": "Inspect text payload and return structured summary",
+        "executor": "plugin_process"
+      }
+    ],
+    "sensors": [
+      {
+        "name": "plugin_command_complete",
+        "description": "Reports actuator completion details"
+      }
+    ]
+  }
+}

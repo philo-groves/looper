@@ -112,6 +112,14 @@ pub enum AgentSocketMessage {
     SessionEnd {
         session_id: String,
     },
+    PluginCommand {
+        command: PluginCommandRequest,
+    },
+    PluginCommandResult {
+        command: PluginCommandRequest,
+        success: bool,
+        message: String,
+    },
     PerceptObserved {
         session_id: String,
         domain: String,
@@ -122,6 +130,17 @@ pub enum AgentSocketMessage {
         domain: String,
         effect: Effect,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum PluginCommandRequest {
+    Add { source: String },
+    Remove { plugin_name: String },
+    Enable { plugin_name: String },
+    Disable { plugin_name: String },
+    List,
+    Catalog,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

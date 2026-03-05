@@ -1,0 +1,58 @@
+{
+  "name": "cybersecurity-starter",
+  "description": "Starter external plugin pack for cybersecurity-oriented workflows",
+  "version": "0.1.0",
+  "entry": "main.ts",
+  "permissions": {
+    "read": ["."],
+    "run": []
+  },
+  "peas": {
+    "actuator_executor": "plugin_process",
+    "performance": [
+      {
+        "name": "finding-signal-quality",
+        "description": "Generate high-signal, reproducible findings with clear evidence",
+        "weight": 1.6,
+        "evaluation_mode": "strict",
+        "success_criteria": [
+          "Findings include target, vector, and impact",
+          "Each finding includes at least one evidence artifact",
+          "Recommendations are specific and actionable"
+        ]
+      },
+      {
+        "name": "false-positive-control",
+        "description": "Avoid speculative claims and clearly mark confidence",
+        "weight": 1.2,
+        "evaluation_mode": "balanced",
+        "success_criteria": [
+          "Mark confidence per finding",
+          "Avoid unverified exploit claims"
+        ]
+      }
+    ],
+    "environment": {
+      "name": "security-assessment-workspace",
+      "description": "Repository and textual inputs used to triage and report cybersecurity findings"
+    },
+    "actuators": [
+      {
+        "name": "cyber_triage",
+        "description": "Convert raw observations into structured candidate findings",
+        "executor": "plugin_process"
+      },
+      {
+        "name": "cyber_report_outline",
+        "description": "Build a concise security report outline from findings",
+        "executor": "plugin_process"
+      }
+    ],
+    "sensors": [
+      {
+        "name": "plugin_command_complete",
+        "description": "Reports plugin actuator completion details"
+      }
+    ]
+  }
+}

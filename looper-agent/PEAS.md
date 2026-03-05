@@ -4,13 +4,13 @@ This project contains the core functionality for Looper agents to load and run P
 
 ## Features
 
-- [ ] A Typescript-based PEAS plugin system based on Deno runtime
+- [x] A Typescript-based PEAS plugin system based on Deno runtime
+- [x] Measure-aware runtime scoring from plugin performance definitions
+- [x] Workspace plugin registry for enabling/disabling plugins
+- [x] Dynamic actuator dispatch (native and plugin-process executors)
 - [ ] Easily import/remove external PEAS plugins
-- [ ] Custom key-value metadata for PEAS plugins and/or their components
-- [ ] Easily activate/deactivate PEAS plugins and/or their components
 - [ ] Sensor and actuator runtime priorities
 - [ ] Track changes of the environment over time
-- [ ] Audit of performance after each task
 
 ## Plugin Structure
 
@@ -54,6 +54,7 @@ The `peas` object contains information related to PEAS components that are suppl
 | Field | Type | Required? | Description |
 |---|---|---|---|
 | `performance` | List (Object) | Required | A list of performance measures |
+| `actuator_executor` | Text | Optional | Default executor for all actuators (`plugin_process` or `native_filesystem`) |
 | `environment` | Object | Optional | A list of environment descriptions |
 | `actuators` | List (Object) | Optional | A list of actuators |
 | `sensors` | List (Object) | Optional | A list of sensors |
@@ -64,6 +65,9 @@ The `peas` object contains information related to PEAS components that are suppl
 |---|---|---|---|
 | `name` | Text | Required | A display name for the measure |
 | `description` | Text | Required | Tell the critic about the measure |
+| `weight` | Number | Optional | Top-level weight for scoring (defaults to `1.0`) |
+| `evaluation_mode` | Text | Optional | Strategy hint (e.g. `strict`, `balanced`) |
+| `success_criteria` | List (Text) | Optional | Criteria used by runtime feedback summaries |
 | `rewards` | List (Object) | Optional | How to reward good behavior |
 | `punishments` | List (Object) | Optional | How to punish bad behavior |
 
@@ -92,6 +96,7 @@ The `peas` object contains information related to PEAS components that are suppl
 |---|---|---|---|
 | `name` | Text | Required | Acts as the ID and name (must be in plugin) |
 | `description` | Text | Required | Tell the agent about the actuator |
+| `executor` | Text | Optional | Per-actuator override (`plugin_process` or `native_filesystem`) |
 
 #### Sensors
 
@@ -99,3 +104,78 @@ The `peas` object contains information related to PEAS components that are suppl
 |---|---|---|---|
 | `name` | Text | Required | Acts as the ID and name (must be in plugin) |
 | `description` | Text | Required | Tell the agent about the sensor |
+
+## Workspace Plugin Registry
+
+Runtime plugin activation can be controlled by `./.looper/plugin-registry.json` in each workspace.
+
+```json
+{
+  "plugins": [
+    { "name": "filesystem-read", "enabled": true, "source": "builtin", "version": "0.1.0" },
+    { "name": "cybersecurity-pack", "enabled": false, "source": "git+https://...", "version": "1.2.3" }
+  ]
+}
+```
+
+When present, `enabled: false` removes a plugin from active planning/execution for that workspace only.
+
+## Dynamic Actuator Execution
+
+Actuators are dispatched by executor type instead of hardcoded actuator names:
+
+- `native_filesystem`: handled by Looper's Rust runtime.
+- `plugin_process`: handled by invoking the plugin entrypoint in Deno.
+
+For `plugin_process`, Looper sends this input payload to plugin stdin:
+
+```json
+{
+  "kind": "actuator_execute",
+  "actuator": "your_actuator",
+  "args": { "...": "..." },
+  "workspace_dir": "/path/to/workspace"
+}
+```
+
+And expects this JSON response on stdout:
+
+```json
+{
+  "status": "completed",
+  "details": "optional detail text",
+  "sensor_output": "optional sensor summary for the model"
+}
+```
+
+## Reference External Plugin
+
+A reference external plugin is included at:
+
+`looper-agent/external-plugins/reference-inspector`
+
+You can install it in a workspace from chat with:
+
+`/plugin add looper-agent/external-plugins/reference-inspector`
+
+## Starter Pack Templates
+
+Looper includes external plugin starter packs for domain-specific workflows:
+
+- `looper-agent/external-plugins/cybersecurity-starter`
+- `looper-agent/external-plugins/blogging-starter`
+
+You can view bundled starter packs from terminal chat with:
+
+- `/plugin catalog`
+
+Install either pack with:
+
+- `/plugin add looper-agent/external-plugins/cybersecurity-starter`
+- `/plugin add looper-agent/external-plugins/blogging-starter`
+
+## Guidance Priority
+
+- Active plugin performance measures are primary runtime guidance.
+- User instructions are always authoritative.
+- `SOUL.md` is optional and treated as a secondary overlay, not the default control surface.

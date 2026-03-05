@@ -1,12 +1,12 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::{Command, Stdio};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
@@ -17,9 +17,7 @@ use fiddlesticks::{
 };
 use futures_util::{Stream, StreamExt};
 use globset::Glob;
-use looper_common::{
-    Effect, Percept, PlannedAction, PlannedActionStatus, SessionOrigin,
-};
+use looper_common::{Effect, Percept, PlannedAction, PlannedActionStatus, SessionOrigin};
 use regex::Regex;
 use rusqlite::{Connection, params};
 use serde::de::DeserializeOwned;
@@ -36,7 +34,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 pub struct PeasRuntime {
     agent_id: String,
     db_path: PathBuf,
-    plugins: Vec<LoadedPlugin>,
+    builtin_plugins: Vec<LoadedPlugin>,
     pending_approvals: Arc<Mutex<HashMap<String, Vec<PendingApproval>>>>,
 }
 
@@ -71,6 +69,8 @@ struct PluginPeas {
     #[serde(default)]
     performance: Vec<PluginPerformance>,
     #[serde(default)]
+    actuator_executor: Option<String>,
+    #[serde(default)]
     environment: Option<PluginEnvironment>,
     #[serde(default)]
     actuators: Vec<PluginComponent>,
@@ -82,6 +82,24 @@ struct PluginPeas {
 struct PluginPerformance {
     name: String,
     description: String,
+    #[serde(default)]
+    weight: Option<f64>,
+    #[serde(default)]
+    evaluation_mode: Option<String>,
+    #[serde(default)]
+    success_criteria: Vec<String>,
+    #[serde(default)]
+    rewards: Vec<PluginPerformanceReward>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PluginPerformanceReward {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    when: String,
+    #[serde(default)]
+    weight: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,6 +112,25 @@ struct PluginEnvironment {
 struct PluginComponent {
     name: String,
     description: String,
+    #[serde(default)]
+    executor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct WorkspacePluginRegistry {
+    #[serde(default)]
+    plugins: Vec<WorkspacePluginState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspacePluginState {
+    name: String,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,10 +185,28 @@ struct FilesystemActionPlan {
 }
 
 #[derive(Debug, Clone)]
-struct FilesystemActionOutcome {
+struct ActionOutcome {
     status: String,
     details: String,
     sensor_output: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginActuatorInput {
+    kind: String,
+    actuator: String,
+    args: Value,
+    workspace_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginActuatorOutput {
+    #[serde(default = "default_completed_status")]
+    status: String,
+    #[serde(default)]
+    details: String,
+    #[serde(default)]
+    sensor_output: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -172,8 +227,33 @@ enum ApprovalDecision {
     Deny { action_ids: HashSet<String> },
 }
 
+#[derive(Debug, Clone)]
+struct PerformanceMeasureContext {
+    name: String,
+    description: String,
+    weight: f64,
+    evaluation_mode: String,
+    success_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PerformanceScoreTracker {
+    measures_by_plugin: HashMap<String, Vec<PerformanceMeasureContext>>,
+    total_score: f64,
+    max_abs_score: f64,
+    notes: Vec<String>,
+}
+
 fn default_mode() -> String {
     "stream_chat".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_completed_status() -> String {
+    "completed".to_string()
 }
 
 type EffectStream = Pin<Box<dyn Stream<Item = anyhow::Result<Effect>> + Send>>;
@@ -183,16 +263,16 @@ impl PeasRuntime {
         let db_path = chats_db_path()?;
         initialize_db(&db_path)?;
 
-        let plugins = load_plugins(&Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"))?;
+        let builtin_plugins = load_plugins(&Path::new(env!("CARGO_MANIFEST_DIR")).join("plugins"))?;
 
-        if plugins.is_empty() {
+        if builtin_plugins.is_empty() {
             bail!("no PEAS plugins were loaded");
         }
 
         Ok(Self {
             agent_id,
             db_path,
-            plugins,
+            builtin_plugins,
             pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -229,6 +309,186 @@ impl PeasRuntime {
         Ok(())
     }
 
+    pub fn install_workspace_plugin(
+        &self,
+        workspace_dir: &str,
+        source: &str,
+    ) -> anyhow::Result<String> {
+        let source_path = PathBuf::from(source.trim());
+        if source_path.as_os_str().is_empty() {
+            bail!("plugin source path cannot be empty");
+        }
+        if !source_path.exists() {
+            bail!(
+                "plugin source path does not exist: {}",
+                source_path.display()
+            );
+        }
+        if !source_path.is_dir() {
+            bail!(
+                "plugin source must be a directory containing looper-plugin.json: {}",
+                source_path.display()
+            );
+        }
+
+        let plugin = load_plugin_from_dir(&source_path)?;
+        if self
+            .builtin_plugins
+            .iter()
+            .any(|entry| entry.manifest.name == plugin.manifest.name)
+        {
+            bail!(
+                "cannot install plugin '{}' because a builtin plugin already uses that name",
+                plugin.manifest.name
+            );
+        }
+        let plugins_dir = workspace_plugins_dir(workspace_dir);
+        fs::create_dir_all(&plugins_dir)
+            .with_context(|| format!("failed to create {}", plugins_dir.display()))?;
+
+        let destination = plugins_dir.join(&plugin.manifest.name);
+        if destination.exists() {
+            fs::remove_dir_all(&destination).with_context(|| {
+                format!(
+                    "failed to replace existing plugin directory {}",
+                    destination.display()
+                )
+            })?;
+        }
+
+        copy_dir_recursive(&source_path, &destination)?;
+        let _ = load_plugin_from_dir(&destination)?;
+
+        let source_meta = fs::canonicalize(&source_path)
+            .unwrap_or(source_path)
+            .to_string_lossy()
+            .to_string();
+        upsert_workspace_plugin_registry(
+            workspace_dir,
+            &plugin.manifest.name,
+            true,
+            Some(source_meta),
+            Some(plugin.manifest.version.clone()),
+        )?;
+
+        Ok(format!(
+            "installed plugin '{}' v{} into {}",
+            plugin.manifest.name,
+            plugin.manifest.version,
+            destination.display()
+        ))
+    }
+
+    pub fn remove_workspace_plugin(
+        &self,
+        workspace_dir: &str,
+        plugin_name: &str,
+    ) -> anyhow::Result<String> {
+        let trimmed = plugin_name.trim();
+        if trimmed.is_empty() {
+            bail!("plugin name cannot be empty");
+        }
+
+        if self
+            .builtin_plugins
+            .iter()
+            .any(|plugin| plugin.manifest.name == trimmed)
+        {
+            bail!(
+                "cannot remove builtin plugin '{}'; disable it instead",
+                trimmed
+            );
+        }
+
+        let plugin_dir = workspace_plugins_dir(workspace_dir).join(trimmed);
+        if !plugin_dir.exists() {
+            bail!("workspace plugin '{}' not found", trimmed);
+        }
+
+        fs::remove_dir_all(&plugin_dir)
+            .with_context(|| format!("failed to remove {}", plugin_dir.display()))?;
+        remove_workspace_plugin_registry_entry(workspace_dir, trimmed)?;
+
+        Ok(format!("removed plugin '{}'", trimmed))
+    }
+
+    pub fn set_workspace_plugin_enabled(
+        &self,
+        workspace_dir: &str,
+        plugin_name: &str,
+        enabled: bool,
+    ) -> anyhow::Result<String> {
+        let trimmed = plugin_name.trim();
+        if trimmed.is_empty() {
+            bail!("plugin name cannot be empty");
+        }
+
+        let active = self.plugins_for_workspace(workspace_dir)?;
+        let has_active = active.iter().any(|plugin| plugin.manifest.name == trimmed);
+        let has_builtin = self
+            .builtin_plugins
+            .iter()
+            .any(|plugin| plugin.manifest.name == trimmed);
+        let has_external = workspace_plugins_dir(workspace_dir).join(trimmed).exists();
+
+        if !has_active && !has_builtin && !has_external {
+            bail!(
+                "plugin '{}' is not installed for workspace {}",
+                trimmed,
+                workspace_dir
+            );
+        }
+
+        upsert_workspace_plugin_registry(workspace_dir, trimmed, enabled, None, None)?;
+        let status = if enabled { "enabled" } else { "disabled" };
+        Ok(format!("plugin '{}' {status}", trimmed))
+    }
+
+    pub fn list_workspace_plugins(&self, workspace_dir: &str) -> anyhow::Result<String> {
+        let all_plugins = self.plugins_with_registry(workspace_dir)?;
+        if all_plugins.is_empty() {
+            return Ok("no plugins available".to_string());
+        }
+
+        let mut lines = Vec::new();
+        for (plugin, enabled, source) in all_plugins {
+            lines.push(format!(
+                "- {} v{} [{}] source={}",
+                plugin.manifest.name,
+                plugin.manifest.version,
+                if enabled { "enabled" } else { "disabled" },
+                source
+            ));
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    pub fn catalog_external_plugins(&self) -> anyhow::Result<String> {
+        let catalog_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("external-plugins");
+        let catalog_plugins = load_plugins(&catalog_root)?;
+        if catalog_plugins.is_empty() {
+            return Ok("no bundled external plugins found".to_string());
+        }
+
+        let mut lines = vec![format!(
+            "bundled plugin catalog ({})",
+            catalog_root.display()
+        )];
+        for plugin in catalog_plugins {
+            lines.push(format!(
+                "- {} v{}: {}",
+                plugin.manifest.name, plugin.manifest.version, plugin.manifest.description
+            ));
+            lines.push(format!(
+                "  install: /plugin add {}",
+                plugin.root_dir.display()
+            ));
+        }
+
+        Ok(lines.join("\n"))
+    }
+
     pub async fn stream_percept_effects(
         &self,
         session_id: &str,
@@ -249,6 +509,7 @@ impl PeasRuntime {
         let session_id = session_id.to_string();
         let workspace_dir = workspace_dir.to_string();
         let runtime = self.clone();
+        let active_plugins = runtime.plugins_for_workspace(&workspace_dir)?;
 
         let Percept::UserText { turn_id, text } = percept;
         runtime.append_event(
@@ -295,6 +556,7 @@ impl PeasRuntime {
                             });
 
                             match runtime.execute_planned_action(
+                                &active_plugins,
                                 &workspace_dir,
                                 &action,
                                 PermissionMode::AllowOneShot,
@@ -310,8 +572,9 @@ impl PeasRuntime {
                                 }
                                 None => {
                                     action.status = PlannedActionStatus::Skipped;
-                                    action.details =
-                                        Some("No executor available for approved action".to_string());
+                                    action.details = Some(
+                                        "No executor available for approved action".to_string(),
+                                    );
                                     effects.push(Effect::ActionStatusChanged {
                                         turn_id: turn_id.clone(),
                                         action,
@@ -365,12 +628,15 @@ impl PeasRuntime {
             return Ok(Box::pin(stream));
         }
 
-        let chat_plugin = runtime.chat_plugin()?;
-        let plan = runtime.run_chat_plugin(chat_plugin, ChatPluginPerceptInput {
-            session_id: session_id.clone(),
-            turn_id: turn_id.clone(),
-            text: text.clone(),
-        })?;
+        let chat_plugin = runtime.chat_plugin(&active_plugins)?;
+        let plan = runtime.run_chat_plugin(
+            chat_plugin,
+            ChatPluginPerceptInput {
+                session_id: session_id.clone(),
+                turn_id: turn_id.clone(),
+                text: text.clone(),
+            },
+        )?;
 
         if plan.mode != "stream_chat" {
             bail!("unsupported chat plugin mode: {}", plan.mode);
@@ -379,6 +645,7 @@ impl PeasRuntime {
         let mut prompt = plan.user_prompt.unwrap_or(text);
         let mut pre_effects = Vec::new();
         let mut sensor_notes = Vec::new();
+        let mut performance_tracker = PerformanceScoreTracker::new(&active_plugins);
         let mut planned_actions = runtime.materialize_planned_actions(&plan.planned_actions);
         if !planned_actions.is_empty() {
             pre_effects.push(Effect::PlanUpdated {
@@ -395,9 +662,17 @@ impl PeasRuntime {
                 action: action.clone(),
             });
 
-            match runtime.execute_planned_action(&workspace_dir, action, PermissionMode::Enforce)? {
+            match runtime.execute_planned_action(
+                &active_plugins,
+                &workspace_dir,
+                action,
+                PermissionMode::Enforce,
+            )? {
                 Some(outcome) => {
                     sensor_notes.push(outcome.sensor_output.clone());
+                    if let Some(plugin) = runtime.resolve_action_plugin(&active_plugins, action) {
+                        performance_tracker.record(plugin, action, &outcome);
+                    }
                     if outcome.status == "blocked" {
                         action.status = PlannedActionStatus::AwaitingApproval;
                         action.details = Some(outcome.details.clone());
@@ -432,6 +707,22 @@ impl PeasRuntime {
             prompt = format!(
                 "{prompt}\n\nPlugin sensor observations:\n{}\nUse these observations directly. If an action is blocked by permissions, ask the user for explicit per-action approval before requesting broader access.",
                 sensor_notes.join("\n\n")
+            );
+        }
+
+        let performance_summary = performance_tracker.summary();
+        if let Some(payload) = performance_tracker.event_payload() {
+            let _ = runtime.append_event(
+                &session_id,
+                Some(turn_id.as_str()),
+                "performance_score",
+                Some("system"),
+                &payload,
+            );
+        }
+        if !performance_summary.trim().is_empty() {
+            prompt = format!(
+                "{prompt}\n\nPerformance review:\n{performance_summary}\nUse this feedback to improve your next response and action choices."
             );
         }
 
@@ -474,7 +765,7 @@ impl PeasRuntime {
             let service = chat_service(provider);
             let mut session = ChatSession::new(session_id.clone(), provider_id, model.clone());
             let full_system_prompt =
-                runtime.build_chat_system_prompt(plan.system_prompt.clone(), &workspace_dir);
+                runtime.build_chat_system_prompt(&active_plugins, plan.system_prompt.clone(), &workspace_dir);
             if !full_system_prompt.trim().is_empty() {
                 session = session.with_system_prompt(full_system_prompt);
             }
@@ -643,7 +934,9 @@ impl PeasRuntime {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("failed to start deno for plugin '{}'", plugin.manifest.name))?;
+            .with_context(|| {
+                format!("failed to start deno for plugin '{}'", plugin.manifest.name)
+            })?;
 
         let input_json = serde_json::to_string(input).context("serialize plugin percept input")?;
         {
@@ -662,7 +955,10 @@ impl PeasRuntime {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("plugin '{}' execution failed: {stderr}", plugin.manifest.name);
+            bail!(
+                "plugin '{}' execution failed: {stderr}",
+                plugin.manifest.name
+            );
         }
 
         let stdout = String::from_utf8(output.stdout).context("plugin emitted invalid utf8")?;
@@ -674,8 +970,8 @@ impl PeasRuntime {
         Ok(serde_json::from_str::<TOutput>(trimmed)?)
     }
 
-    fn chat_plugin(&self) -> anyhow::Result<&LoadedPlugin> {
-        self.plugins
+    fn chat_plugin<'a>(&self, plugins: &'a [LoadedPlugin]) -> anyhow::Result<&'a LoadedPlugin> {
+        plugins
             .iter()
             .find(|plugin| {
                 plugin
@@ -715,15 +1011,17 @@ impl PeasRuntime {
 
     fn execute_planned_action(
         &self,
+        plugins: &[LoadedPlugin],
         workspace_dir: &str,
         action: &PlannedAction,
         permission_mode: PermissionMode,
-    ) -> anyhow::Result<Option<FilesystemActionOutcome>> {
-        let Some(plugin) = self.resolve_action_plugin(action) else {
+    ) -> anyhow::Result<Option<ActionOutcome>> {
+        let Some(plugin) = self.resolve_action_plugin(plugins, action) else {
             return Ok(None);
         };
 
-        if action.actuator.starts_with("filesystem_") {
+        let actuator_executor = plugin.actuator_executor(&action.actuator);
+        if actuator_executor == "native_filesystem" {
             let fs_action = FilesystemActionPlan {
                 actuator: action.actuator.clone(),
                 pattern: action
@@ -759,12 +1057,32 @@ impl PeasRuntime {
                 .map(Some);
         }
 
-        Ok(None)
+        if actuator_executor == "plugin_process" {
+            return self
+                .execute_plugin_actuator(plugin, workspace_dir, action)
+                .map(Some);
+        }
+
+        Ok(Some(ActionOutcome {
+            status: "skipped".to_string(),
+            details: format!(
+                "unsupported actuator executor '{}' for actuator '{}'",
+                actuator_executor, action.actuator
+            ),
+            sensor_output: format!(
+                "sensor plugin_command_error: unsupported actuator executor '{}' for {}",
+                actuator_executor, action.actuator
+            ),
+        }))
     }
 
-    fn resolve_action_plugin(&self, action: &PlannedAction) -> Option<&LoadedPlugin> {
+    fn resolve_action_plugin<'a>(
+        &self,
+        plugins: &'a [LoadedPlugin],
+        action: &PlannedAction,
+    ) -> Option<&'a LoadedPlugin> {
         if action.plugin != "auto"
-            && let Some(plugin) = self.plugin_by_name(&action.plugin)
+            && let Some(plugin) = self.plugin_by_name(plugins, &action.plugin)
             && plugin
                 .manifest
                 .peas
@@ -775,17 +1093,25 @@ impl PeasRuntime {
             return Some(plugin);
         }
 
-        self.plugin_for_actuator(&action.actuator)
+        self.plugin_for_actuator(plugins, &action.actuator)
     }
 
-    fn plugin_by_name(&self, plugin_name: &str) -> Option<&LoadedPlugin> {
-        self.plugins
+    fn plugin_by_name<'a>(
+        &self,
+        plugins: &'a [LoadedPlugin],
+        plugin_name: &str,
+    ) -> Option<&'a LoadedPlugin> {
+        plugins
             .iter()
             .find(|plugin| plugin.manifest.name == plugin_name)
     }
 
-    fn plugin_for_actuator(&self, actuator_name: &str) -> Option<&LoadedPlugin> {
-        self.plugins.iter().find(|plugin| {
+    fn plugin_for_actuator<'a>(
+        &self,
+        plugins: &'a [LoadedPlugin],
+        actuator_name: &str,
+    ) -> Option<&'a LoadedPlugin> {
+        plugins.iter().find(|plugin| {
             plugin
                 .manifest
                 .peas
@@ -801,7 +1127,7 @@ impl PeasRuntime {
         workspace_dir: &str,
         action: &FilesystemActionPlan,
         permission_mode: PermissionMode,
-    ) -> anyhow::Result<FilesystemActionOutcome> {
+    ) -> anyhow::Result<ActionOutcome> {
         let workspace_root = PathBuf::from(workspace_dir);
         let requested_path = if action.actuator == "filesystem_read" {
             action
@@ -823,7 +1149,7 @@ impl PeasRuntime {
                 target_dir.display(),
                 plugin.permissions().read
             );
-            return Ok(FilesystemActionOutcome {
+            return Ok(ActionOutcome {
                 status: "blocked".to_string(),
                 details: format!(
                     "filesystem action blocked for path '{}'; ask user for per-action approval",
@@ -835,14 +1161,18 @@ impl PeasRuntime {
         let limit = action.max_results.unwrap_or(200).clamp(1, 500);
 
         let (stdout, stderr, details, outcome_status) = match action.actuator.as_str() {
-            "filesystem_grep" => run_native_grep(&workspace_root, &target_dir, &action.pattern, limit)?,
-            "filesystem_glob" => run_native_glob(&workspace_root, &target_dir, &action.pattern, limit)?,
+            "filesystem_grep" => {
+                run_native_grep(&workspace_root, &target_dir, &action.pattern, limit)?
+            }
+            "filesystem_glob" => {
+                run_native_glob(&workspace_root, &target_dir, &action.pattern, limit)?
+            }
             "filesystem_read" => {
                 let max_lines = action.max_lines.unwrap_or(250).clamp(1, 1000);
                 run_native_read(&workspace_root, &target_dir, max_lines)?
             }
             other => {
-                return Ok(FilesystemActionOutcome {
+                return Ok(ActionOutcome {
                     status: "skipped".to_string(),
                     details: format!("unsupported filesystem actuator '{other}'"),
                     sensor_output: format!(
@@ -875,8 +1205,53 @@ impl PeasRuntime {
             sensor_output.push_str("\n\n(truncated output)");
         }
 
-        Ok(FilesystemActionOutcome {
+        Ok(ActionOutcome {
             status: outcome_status,
+            details,
+            sensor_output,
+        })
+    }
+
+    fn execute_plugin_actuator(
+        &self,
+        plugin: &LoadedPlugin,
+        workspace_dir: &str,
+        action: &PlannedAction,
+    ) -> anyhow::Result<ActionOutcome> {
+        let output = self.run_plugin_with_input::<PluginActuatorInput, PluginActuatorOutput>(
+            plugin,
+            &PluginActuatorInput {
+                kind: "actuator_execute".to_string(),
+                actuator: action.actuator.clone(),
+                args: action.args.clone(),
+                workspace_dir: workspace_dir.to_string(),
+            },
+        )?;
+
+        let PluginActuatorOutput {
+            status,
+            details,
+            sensor_output,
+        } = output;
+
+        let details = if details.trim().is_empty() {
+            format!(
+                "plugin actuator {} completed with status {}",
+                action.actuator, status
+            )
+        } else {
+            details
+        };
+
+        let sensor_output = sensor_output.unwrap_or_else(|| {
+            format!(
+                "sensor plugin_command_complete: plugin={} actuator={} status={}",
+                plugin.manifest.name, action.actuator, status
+            )
+        });
+
+        Ok(ActionOutcome {
+            status,
             details,
             sensor_output,
         })
@@ -884,13 +1259,11 @@ impl PeasRuntime {
 
     fn build_chat_system_prompt(
         &self,
+        plugins: &[LoadedPlugin],
         plugin_system_prompt: Option<String>,
         workspace_dir: &str,
     ) -> String {
         let mut sections = Vec::new();
-        if let Some(soul) = load_soul_prompt(workspace_dir) {
-            sections.push(soul);
-        }
 
         if let Some(system_prompt) = plugin_system_prompt {
             if !system_prompt.trim().is_empty() {
@@ -898,19 +1271,28 @@ impl PeasRuntime {
             }
         }
 
-        let context = self.build_component_context();
+        let context = self.build_component_context(plugins);
         if !context.is_empty() {
             sections.push(format!(
                 "PEAS plugin context (available for consideration during this chat):\n{context}\nUse these components when relevant, and do not claim to have used a component unless it was actually invoked."
             ));
         }
 
+        let performance_prompt = build_performance_prompt(plugins);
+        if !performance_prompt.is_empty() {
+            sections.push(performance_prompt);
+        }
+
+        if let Some(soul) = load_soul_prompt(workspace_dir) {
+            sections.push(soul);
+        }
+
         sections.join("\n\n")
     }
 
-    fn build_component_context(&self) -> String {
+    fn build_component_context(&self, plugins: &[LoadedPlugin]) -> String {
         let mut lines = Vec::new();
-        for plugin in &self.plugins {
+        for plugin in plugins {
             lines.push(format!(
                 "- plugin '{}' v{}: {}",
                 plugin.manifest.name, plugin.manifest.version, plugin.manifest.description
@@ -961,6 +1343,72 @@ impl PeasRuntime {
         }
 
         lines.join("\n")
+    }
+
+    fn plugins_for_workspace(&self, workspace_dir: &str) -> anyhow::Result<Vec<LoadedPlugin>> {
+        let all_plugins = self.plugins_with_registry(workspace_dir)?;
+        Ok(all_plugins
+            .into_iter()
+            .filter_map(|(plugin, enabled, _)| if enabled { Some(plugin) } else { None })
+            .collect())
+    }
+
+    fn plugins_with_registry(
+        &self,
+        workspace_dir: &str,
+    ) -> anyhow::Result<Vec<(LoadedPlugin, bool, String)>> {
+        let mut plugins = self.builtin_plugins.clone();
+
+        let external_root = workspace_plugins_dir(workspace_dir);
+        if external_root.exists() {
+            let mut external_plugins = load_plugins(&external_root)?;
+            plugins.append(&mut external_plugins);
+        }
+
+        plugins.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+        validate_unique_plugin_names(&plugins)?;
+
+        let registry_doc = load_workspace_plugin_registry_doc(workspace_dir)?;
+        let enabled_map = registry_doc
+            .plugins
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.enabled))
+            .collect::<HashMap<_, _>>();
+        let source_map = registry_doc
+            .plugins
+            .into_iter()
+            .map(|entry| {
+                (
+                    entry.name,
+                    entry.source.unwrap_or_else(|| "workspace".to_string()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+
+        let mut result = Vec::new();
+        for plugin in plugins {
+            let enabled = enabled_map
+                .get(&plugin.manifest.name)
+                .copied()
+                .unwrap_or(true);
+            let source = source_map
+                .get(&plugin.manifest.name)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if self
+                        .builtin_plugins
+                        .iter()
+                        .any(|builtin| builtin.manifest.name == plugin.manifest.name)
+                    {
+                        "builtin".to_string()
+                    } else {
+                        "workspace".to_string()
+                    }
+                });
+            result.push((plugin, enabled, source));
+        }
+
+        Ok(result)
     }
 
     fn append_event(
@@ -1079,9 +1527,186 @@ fn load_plugins(plugins_root: &Path) -> anyhow::Result<Vec<LoadedPlugin>> {
     Ok(plugins)
 }
 
+fn validate_unique_plugin_names(plugins: &[LoadedPlugin]) -> anyhow::Result<()> {
+    for pair in plugins.windows(2) {
+        if pair[0].manifest.name == pair[1].manifest.name {
+            bail!(
+                "duplicate plugin id '{}' in {} and {}",
+                pair[0].manifest.name,
+                pair[0].manifest_path.display(),
+                pair[1].manifest_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn workspace_plugins_dir(workspace_dir: &str) -> PathBuf {
+    Path::new(workspace_dir).join(".looper").join("plugins")
+}
+
+fn workspace_plugin_registry_path(workspace_dir: &str) -> PathBuf {
+    Path::new(workspace_dir)
+        .join(".looper")
+        .join("plugin-registry.json")
+}
+
+fn load_workspace_plugin_registry_doc(
+    workspace_dir: &str,
+) -> anyhow::Result<WorkspacePluginRegistry> {
+    let registry_path = workspace_plugin_registry_path(workspace_dir);
+    if !registry_path.exists() {
+        return Ok(WorkspacePluginRegistry::default());
+    }
+
+    let text = fs::read_to_string(&registry_path)
+        .with_context(|| format!("failed to read {}", registry_path.display()))?;
+    let mut registry = serde_json::from_str::<WorkspacePluginRegistry>(&text)
+        .with_context(|| format!("invalid plugin registry {}", registry_path.display()))?;
+    registry
+        .plugins
+        .retain(|plugin| !plugin.name.trim().is_empty());
+    Ok(registry)
+}
+
+fn save_workspace_plugin_registry_doc(
+    workspace_dir: &str,
+    registry: &WorkspacePluginRegistry,
+) -> anyhow::Result<()> {
+    let registry_path = workspace_plugin_registry_path(workspace_dir);
+    if let Some(parent) = registry_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(registry)
+        .context("failed to serialize workspace plugin registry")?;
+    fs::write(&registry_path, text)
+        .with_context(|| format!("failed to write {}", registry_path.display()))
+}
+
+fn upsert_workspace_plugin_registry(
+    workspace_dir: &str,
+    plugin_name: &str,
+    enabled: bool,
+    source: Option<String>,
+    version: Option<String>,
+) -> anyhow::Result<()> {
+    let mut registry = load_workspace_plugin_registry_doc(workspace_dir)?;
+    if let Some(existing) = registry
+        .plugins
+        .iter_mut()
+        .find(|entry| entry.name == plugin_name)
+    {
+        existing.enabled = enabled;
+        if let Some(source) = source {
+            existing.source = Some(source);
+        }
+        if let Some(version) = version {
+            existing.version = Some(version);
+        }
+    } else {
+        registry.plugins.push(WorkspacePluginState {
+            name: plugin_name.to_string(),
+            enabled,
+            source,
+            version,
+        });
+    }
+
+    registry.plugins.sort_by(|a, b| a.name.cmp(&b.name));
+    save_workspace_plugin_registry_doc(workspace_dir, &registry)
+}
+
+fn remove_workspace_plugin_registry_entry(
+    workspace_dir: &str,
+    plugin_name: &str,
+) -> anyhow::Result<()> {
+    let mut registry = load_workspace_plugin_registry_doc(workspace_dir)?;
+    let before = registry.plugins.len();
+    registry
+        .plugins
+        .retain(|entry| entry.name.as_str() != plugin_name);
+    if registry.plugins.len() == before {
+        return Ok(());
+    }
+
+    save_workspace_plugin_registry_doc(workspace_dir, &registry)
+}
+
+fn load_plugin_from_dir(path: &Path) -> anyhow::Result<LoadedPlugin> {
+    let manifest_path = path.join("looper-plugin.json");
+    if !manifest_path.exists() {
+        bail!(
+            "plugin source is missing looper-plugin.json at {}",
+            manifest_path.display()
+        );
+    }
+
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))?;
+    let manifest = serde_json::from_str::<PluginManifest>(&manifest_text)
+        .with_context(|| format!("invalid plugin manifest {}", manifest_path.display()))?;
+
+    if manifest.name.trim().is_empty() {
+        bail!("plugin at {} has empty name", manifest_path.display());
+    }
+
+    let entry_path = path.join(&manifest.entry);
+    if !entry_path.exists() {
+        bail!(
+            "plugin '{}' entry file is missing at {}",
+            manifest.name,
+            entry_path.display()
+        );
+    }
+
+    Ok(LoadedPlugin {
+        manifest_path,
+        root_dir: path.to_path_buf(),
+        entry_path,
+        manifest,
+    })
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+
+    for entry in fs::read_dir(source)
+        .with_context(|| format!("failed to read source directory {}", source.display()))?
+    {
+        let entry = entry.context("failed to read source plugin directory entry")?;
+        let path = entry.path();
+        let target = destination.join(entry.file_name());
+        if path.is_dir() {
+            copy_dir_recursive(&path, &target)?;
+        } else {
+            fs::copy(&path, &target).with_context(|| {
+                format!(
+                    "failed to copy plugin file from {} to {}",
+                    path.display(),
+                    target.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 fn append_deno_permissions(cmd: &mut Command, plugin: &LoadedPlugin) {
-    append_deno_permission(cmd, "--allow-read", &plugin.permissions().read, &plugin.root_dir);
-    append_deno_permission(cmd, "--allow-run", &plugin.permissions().run, &plugin.root_dir);
+    append_deno_permission(
+        cmd,
+        "--allow-read",
+        &plugin.permissions().read,
+        &plugin.root_dir,
+    );
+    append_deno_permission(
+        cmd,
+        "--allow-run",
+        &plugin.permissions().run,
+        &plugin.root_dir,
+    );
 }
 
 fn append_deno_permission(cmd: &mut Command, flag: &str, values: &[String], plugin_root: &Path) {
@@ -1120,6 +1745,178 @@ fn append_deno_permission(cmd: &mut Command, flag: &str, values: &[String], plug
 impl LoadedPlugin {
     fn permissions(&self) -> &PluginPermissions {
         &self.manifest.permissions
+    }
+
+    fn actuator_executor(&self, actuator_name: &str) -> &str {
+        if let Some(component_executor) = self
+            .manifest
+            .peas
+            .actuators
+            .iter()
+            .find(|component| component.name == actuator_name)
+            .and_then(|component| component.executor.as_deref())
+            .filter(|executor| !executor.trim().is_empty())
+        {
+            return component_executor;
+        }
+
+        if let Some(default_executor) = self
+            .manifest
+            .peas
+            .actuator_executor
+            .as_deref()
+            .filter(|executor| !executor.trim().is_empty())
+        {
+            return default_executor;
+        }
+
+        if actuator_name.starts_with("filesystem_") {
+            return "native_filesystem";
+        }
+
+        "plugin_process"
+    }
+}
+
+fn build_performance_prompt(plugins: &[LoadedPlugin]) -> String {
+    let tracker = PerformanceScoreTracker::new(plugins);
+    if tracker.measures_by_plugin.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = vec![
+        "Performance measures (weighted) to optimize while planning and responding:".to_string(),
+    ];
+    for (plugin_name, measures) in tracker.measures_by_plugin {
+        lines.push(format!("- plugin '{plugin_name}':"));
+        for measure in measures {
+            lines.push(format!(
+                "  - {} (weight {:.2}, mode {}): {}",
+                measure.name, measure.weight, measure.evaluation_mode, measure.description
+            ));
+            if !measure.success_criteria.is_empty() {
+                lines.push(format!(
+                    "    criteria: {}",
+                    measure.success_criteria.join(" | ")
+                ));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+impl PerformanceScoreTracker {
+    fn new(plugins: &[LoadedPlugin]) -> Self {
+        let mut measures_by_plugin: HashMap<String, Vec<PerformanceMeasureContext>> =
+            HashMap::new();
+        for plugin in plugins {
+            let mut measures = Vec::new();
+            for entry in &plugin.manifest.peas.performance {
+                let reward_weight_sum: f64 = entry
+                    .rewards
+                    .iter()
+                    .map(|reward| {
+                        let _ = (&reward.name, &reward.when);
+                        reward.weight.unwrap_or(0.0)
+                    })
+                    .sum();
+
+                let weight = entry
+                    .weight
+                    .or(if reward_weight_sum > 0.0 {
+                        Some(reward_weight_sum)
+                    } else {
+                        None
+                    })
+                    .unwrap_or(1.0)
+                    .clamp(0.1, 10.0);
+
+                let mut criteria = entry.success_criteria.clone();
+                for reward in &entry.rewards {
+                    if !reward.when.trim().is_empty() {
+                        criteria.push(reward.when.clone());
+                    }
+                }
+
+                measures.push(PerformanceMeasureContext {
+                    name: entry.name.clone(),
+                    description: entry.description.clone(),
+                    weight,
+                    evaluation_mode: entry
+                        .evaluation_mode
+                        .clone()
+                        .unwrap_or_else(|| "balanced".to_string()),
+                    success_criteria: criteria,
+                });
+            }
+
+            if !measures.is_empty() {
+                measures_by_plugin.insert(plugin.manifest.name.clone(), measures);
+            }
+        }
+
+        Self {
+            measures_by_plugin,
+            total_score: 0.0,
+            max_abs_score: 0.0,
+            notes: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, plugin: &LoadedPlugin, action: &PlannedAction, outcome: &ActionOutcome) {
+        let status_factor = match outcome.status.as_str() {
+            "completed" => 1.0,
+            "failed" => -1.0,
+            "blocked" => -0.5,
+            "skipped" => 0.0,
+            _ => -0.25,
+        };
+
+        let measures = self
+            .measures_by_plugin
+            .get(&plugin.manifest.name)
+            .cloned()
+            .unwrap_or_default();
+
+        let weight_sum: f64 = measures.iter().map(|measure| measure.weight).sum();
+        if weight_sum <= 0.0 {
+            return;
+        }
+
+        let delta = weight_sum * status_factor;
+        self.total_score += delta;
+        self.max_abs_score += weight_sum;
+        self.notes.push(format!(
+            "{}::{} => status={} score_delta={:+.2}",
+            plugin.manifest.name, action.actuator, outcome.status, delta
+        ));
+    }
+
+    fn summary(&self) -> String {
+        if self.notes.is_empty() {
+            return String::new();
+        }
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "turn_score={:+.2} / max={:.2}",
+            self.total_score, self.max_abs_score
+        ));
+        lines.extend(self.notes.iter().map(|entry| format!("- {entry}")));
+        lines.join("\n")
+    }
+
+    fn event_payload(&self) -> Option<String> {
+        if self.notes.is_empty() {
+            return None;
+        }
+
+        let payload = serde_json::json!({
+            "turn_score": self.total_score,
+            "max_abs_score": self.max_abs_score,
+            "notes": self.notes,
+        });
+        Some(payload.to_string())
     }
 }
 
@@ -1234,7 +2031,7 @@ fn load_soul_prompt(workspace_dir: &str) -> Option<String> {
 
     let (snippet, truncated) = truncate_text(trimmed, 10_000);
     let mut prompt = format!(
-        "Workspace SOUL guidance (from SOUL.md):\n{}\nFollow this guidance when planning and executing tasks unless the user explicitly overrides it.",
+        "Optional workspace SOUL overlay (from SOUL.md):\n{}\nUse this as secondary style/ethics guidance. Prioritize active performance measures and explicit user instructions.",
         snippet
     );
     if truncated {
@@ -1302,7 +2099,10 @@ fn run_native_glob(
         return Ok((
             String::new(),
             format!("target path does not exist: {}", target_dir.display()),
-            format!("filesystem actuator filesystem_glob failed: target path {} does not exist", target_dir.display()),
+            format!(
+                "filesystem actuator filesystem_glob failed: target path {} does not exist",
+                target_dir.display()
+            ),
             "failed".to_string(),
         ));
     }
@@ -1365,13 +2165,16 @@ fn run_native_grep(
         return Ok((
             String::new(),
             format!("target path does not exist: {}", target_dir.display()),
-            format!("filesystem actuator filesystem_grep failed: target path {} does not exist", target_dir.display()),
+            format!(
+                "filesystem actuator filesystem_grep failed: target path {} does not exist",
+                target_dir.display()
+            ),
             "failed".to_string(),
         ));
     }
 
-    let regex = Regex::new(pattern)
-        .with_context(|| format!("invalid regex pattern '{pattern}'"))?;
+    let regex =
+        Regex::new(pattern).with_context(|| format!("invalid regex pattern '{pattern}'"))?;
 
     let mut matches = Vec::new();
     for entry in WalkDir::new(target_dir)
@@ -1499,8 +2302,7 @@ fn run_native_read(
 }
 
 fn display_path(workspace_root: &Path, path: &Path) -> String {
-    path
-        .strip_prefix(workspace_root)
+    path.strip_prefix(workspace_root)
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")

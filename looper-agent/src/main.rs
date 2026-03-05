@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -12,7 +11,7 @@ use looper_agent::settings::{
 };
 use looper_common::{
     AGENT_HOST, AgentInfo, AgentMode, AgentSocketMessage, DEFAULT_DISCOVERY_URL, DiscoveryRequest,
-    DiscoveryResponse, SessionOrigin,
+    DiscoveryResponse, PluginCommandRequest, SessionOrigin,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -442,6 +441,82 @@ async fn handle_user_socket(
                             peas.record_effect(&session_id, &effect)?;
                         }
                     }
+                    AgentSocketMessage::PluginCommand { command } => {
+                        let runtime_guard = runtime.lock().await;
+                        if runtime_guard.mode != AgentMode::Running {
+                            drop(runtime_guard);
+                            let response = AgentSocketMessage::PluginCommandResult {
+                                command,
+                                success: false,
+                                message: "agent is in setup mode".to_string(),
+                            };
+                            writer
+                                .send(Message::Text(serde_json::to_string(&response)?.into()))
+                                .await
+                                .context("failed to send plugin command setup mode warning")?;
+                            continue;
+                        }
+
+                        let peas = runtime_guard.peas.clone();
+                        let workspace_dir = runtime_guard
+                            .persisted
+                            .as_ref()
+                            .map(|config| config.settings.workspace_dir.clone());
+                        drop(runtime_guard);
+
+                        let result = match &command {
+                            PluginCommandRequest::Catalog => peas.catalog_external_plugins(),
+                            PluginCommandRequest::Add { source } => {
+                                let Some(workspace_dir) = workspace_dir.as_deref() else {
+                                    bail!("agent is missing persisted workspace configuration");
+                                };
+                                peas.install_workspace_plugin(&workspace_dir, source)
+                            }
+                            PluginCommandRequest::Remove { plugin_name } => {
+                                let Some(workspace_dir) = workspace_dir.as_deref() else {
+                                    bail!("agent is missing persisted workspace configuration");
+                                };
+                                peas.remove_workspace_plugin(&workspace_dir, plugin_name)
+                            }
+                            PluginCommandRequest::Enable { plugin_name } => {
+                                let Some(workspace_dir) = workspace_dir.as_deref() else {
+                                    bail!("agent is missing persisted workspace configuration");
+                                };
+                                peas.set_workspace_plugin_enabled(&workspace_dir, plugin_name, true)
+                            }
+                            PluginCommandRequest::Disable { plugin_name } => {
+                                let Some(workspace_dir) = workspace_dir.as_deref() else {
+                                    bail!("agent is missing persisted workspace configuration");
+                                };
+                                peas.set_workspace_plugin_enabled(
+                                    &workspace_dir,
+                                    plugin_name,
+                                    false,
+                                )
+                            }
+                            PluginCommandRequest::List => {
+                                let Some(workspace_dir) = workspace_dir.as_deref() else {
+                                    bail!("agent is missing persisted workspace configuration");
+                                };
+                                peas.list_workspace_plugins(&workspace_dir)
+                            }
+                        };
+
+                        let (success, message) = match result {
+                            Ok(message) => (true, message),
+                            Err(error) => (false, error.to_string()),
+                        };
+
+                        let response = AgentSocketMessage::PluginCommandResult {
+                            command,
+                            success,
+                            message,
+                        };
+                        writer
+                            .send(Message::Text(serde_json::to_string(&response)?.into()))
+                            .await
+                            .context("failed to send plugin command result")?;
+                    }
                     AgentSocketMessage::SessionEnd { session_id } => {
                         let runtime_guard = runtime.lock().await;
                         let peas = runtime_guard.peas.clone();
@@ -456,6 +531,7 @@ async fn handle_user_socket(
                     | AgentSocketMessage::SetupAccepted { .. }
                     | AgentSocketMessage::Error { .. }
                     | AgentSocketMessage::SessionStarted { .. }
+                    | AgentSocketMessage::PluginCommandResult { .. }
                     | AgentSocketMessage::EffectApplied { .. } => {}
                 }
             }
@@ -485,7 +561,6 @@ async fn complete_setup(
     api_keys: Vec<looper_common::ProviderApiKey>,
 ) -> anyhow::Result<()> {
     let workspace_path = normalize_workspace_dir(&workspace_dir)?;
-    ensure_default_soul_md(&workspace_path)?;
     let runtime_guard = runtime.lock().await;
 
     if port != runtime_guard.assigned_port {
@@ -524,41 +599,6 @@ async fn complete_setup(
     runtime_guard.persisted = Some(persisted);
     runtime_guard.workspace_hint = Some(workspace_path);
     runtime_guard.mode = AgentMode::Running;
-    Ok(())
-}
-
-fn ensure_default_soul_md(workspace_dir: &std::path::Path) -> anyhow::Result<()> {
-    let soul_path = workspace_dir.join("SOUL.md");
-    if soul_path.exists() {
-        return Ok(());
-    }
-
-    fs::create_dir_all(workspace_dir)
-        .with_context(|| format!("failed to create workspace {}", workspace_dir.display()))?;
-
-    let template = r#"# SOUL
-
-This file defines workspace-specific guidance for the Looper agent.
-
-## Mission
-- Describe the purpose of this project and what success looks like.
-
-## Priorities
-- List the highest-priority goals for work in this repository.
-
-## Coding Principles
-- Add style, architecture, and quality expectations.
-
-## Safety and Boundaries
-- Call out operations that require confirmation.
-- Note sensitive files, environments, or deployment constraints.
-
-## Preferences
-- Capture team preferences for communication, testing, and commits.
-"#;
-
-    fs::write(&soul_path, template)
-        .with_context(|| format!("failed to write {}", soul_path.display()))?;
     Ok(())
 }
 

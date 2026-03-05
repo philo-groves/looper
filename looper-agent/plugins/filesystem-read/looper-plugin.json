@@ -8,10 +8,18 @@
     "run": []
   },
   "peas": {
+    "actuator_executor": "native_filesystem",
     "performance": [
       {
         "name": "filesystem-read-correctness",
-        "description": "Use grep/glob only when relevant and capture results accurately"
+        "description": "Use grep/glob only when relevant and capture results accurately",
+        "weight": 1.4,
+        "evaluation_mode": "balanced",
+        "success_criteria": [
+          "Only run filesystem actions that are directly relevant to the user request",
+          "Prefer targeted paths and patterns over broad scans",
+          "Reflect command output faithfully in the response"
+        ]
       }
     ],
     "environment": {
