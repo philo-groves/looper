@@ -18,7 +18,7 @@ use looper_common::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Padding, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
@@ -2044,18 +2044,32 @@ fn build_history_lines(messages: &[ChatMessage], width: usize) -> Vec<Line<'stat
         let bubble_style = Style::default()
             .bg(Color::Rgb(20, 24, 31))
             .fg(Color::Rgb(224, 233, 245));
-        let wrapped = wrap_text(&message.text, bubble_inner_width);
+        let wrapped = format_agent_markdown(&message.text, bubble_inner_width);
 
         lines.push(Line::from(Span::styled(
             " ".repeat(bubble_outer_width),
             bubble_style,
         )));
         for part in wrapped {
-            let mut content = String::with_capacity(bubble_outer_width);
-            content.push(' ');
-            content.push_str(&pad_right(&part, bubble_inner_width));
-            content.push(' ');
-            lines.push(Line::from(Span::styled(content, bubble_style)));
+            let content_width = part
+                .iter()
+                .map(|segment| segment.text.chars().count())
+                .sum::<usize>();
+            let right_padding = bubble_inner_width
+                .saturating_sub(content_width)
+                .saturating_add(1);
+
+            let mut spans = Vec::with_capacity(part.len().saturating_add(2));
+            spans.push(Span::styled(" ", bubble_style));
+            for segment in part {
+                spans.push(Span::styled(
+                    segment.text,
+                    bubble_style.patch(segment.style),
+                ));
+            }
+            spans.push(Span::styled(" ".repeat(right_padding), bubble_style));
+
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(Span::styled(
             " ".repeat(bubble_outer_width),
@@ -2069,6 +2083,330 @@ fn build_history_lines(messages: &[ChatMessage], width: usize) -> Vec<Line<'stat
     }
 
     lines
+}
+
+#[derive(Clone)]
+struct StyledSegment {
+    text: String,
+    style: Style,
+}
+
+fn format_agent_markdown(input: &str, max_width: usize) -> Vec<Vec<StyledSegment>> {
+    if max_width == 0 {
+        return vec![Vec::new()];
+    }
+
+    let mut lines = Vec::new();
+    for raw_line in input.lines() {
+        let styled = parse_markdown_line(raw_line);
+        let mut wrapped = wrap_styled_segments(&styled, max_width);
+        lines.append(&mut wrapped);
+    }
+
+    if input.ends_with('\n') {
+        lines.push(Vec::new());
+    }
+
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+
+    lines
+}
+
+fn parse_markdown_line(raw_line: &str) -> Vec<StyledSegment> {
+    let heading = parse_markdown_heading(raw_line);
+
+    let mut output = Vec::new();
+    if !heading.prefix.is_empty() {
+        output.push(StyledSegment {
+            text: heading.prefix,
+            style: Style::default(),
+        });
+    }
+
+    if !heading.ordered_prefix.is_empty() {
+        output.push(StyledSegment {
+            text: heading.ordered_prefix,
+            style: Style::default().add_modifier(Modifier::BOLD),
+        });
+    }
+
+    let mut inline = parse_inline_markdown(heading.remaining.as_str());
+    if heading.bold_line {
+        for segment in &mut inline {
+            segment.style = segment.style.add_modifier(Modifier::BOLD);
+        }
+    }
+    output.append(&mut inline);
+
+    output
+}
+
+struct ParsedLine {
+    prefix: String,
+    ordered_prefix: String,
+    remaining: String,
+    bold_line: bool,
+}
+
+fn parse_markdown_heading(raw_line: &str) -> ParsedLine {
+    let mut chars = raw_line.chars();
+    let mut prefix = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == ' ' || ch == '\t' {
+            prefix.push(ch);
+        } else {
+            let mut remaining_chars = String::new();
+            remaining_chars.push(ch);
+            remaining_chars.extend(chars);
+
+            let (content, bold_line) = strip_heading_marker(&remaining_chars);
+            let (ordered_prefix, remaining) = split_ordered_prefix(&content);
+            return ParsedLine {
+                prefix,
+                ordered_prefix,
+                remaining,
+                bold_line,
+            };
+        }
+    }
+
+    ParsedLine {
+        prefix,
+        ordered_prefix: String::new(),
+        remaining: String::new(),
+        bold_line: false,
+    }
+}
+
+fn strip_heading_marker(line: &str) -> (String, bool) {
+    let mut marker_len = 0;
+    for ch in line.chars() {
+        if ch == '#' {
+            marker_len += 1;
+        } else {
+            break;
+        }
+    }
+
+    if marker_len == 0 || marker_len > 6 {
+        return (line.to_string(), false);
+    }
+
+    let after_markers = line.chars().skip(marker_len).collect::<String>();
+    if !after_markers.starts_with(' ') {
+        return (line.to_string(), false);
+    }
+
+    (after_markers.trim_start().to_string(), true)
+}
+
+fn split_ordered_prefix(line: &str) -> (String, String) {
+    let mut digits = String::new();
+    let mut consumed = 0usize;
+
+    for ch in line.chars() {
+        if ch.is_ascii_digit() {
+            digits.push(ch);
+            consumed += ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+
+    if digits.is_empty() {
+        return (String::new(), line.to_string());
+    }
+
+    let rest = &line[consumed..];
+    if let Some(stripped) = rest.strip_prefix(". ") {
+        return (format!("{digits}."), format!(" {stripped}"));
+    }
+
+    (String::new(), line.to_string())
+}
+
+fn parse_inline_markdown(text: &str) -> Vec<StyledSegment> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    let mut bold = false;
+    let mut italic = false;
+    let mut buffer = String::new();
+    let mut segments = Vec::new();
+
+    while i < chars.len() {
+        if let Some((display, url, consumed)) = parse_markdown_link(&chars[i..]) {
+            push_buffered_text(&mut segments, &mut buffer, bold, italic);
+            let link_style = style_for_state(bold, italic)
+                .fg(Color::Blue)
+                .add_modifier(Modifier::UNDERLINED);
+            let append_url = !url.is_empty() && url != display;
+            segments.push(StyledSegment {
+                text: display,
+                style: link_style,
+            });
+            if append_url {
+                segments.push(StyledSegment {
+                    text: format!(" ({url})"),
+                    style: link_style,
+                });
+            }
+            i += consumed;
+            continue;
+        }
+
+        if let Some((url, consumed)) = parse_plain_url(&chars[i..]) {
+            push_buffered_text(&mut segments, &mut buffer, bold, italic);
+            segments.push(StyledSegment {
+                text: url,
+                style: style_for_state(bold, italic)
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED),
+            });
+            i += consumed;
+            continue;
+        }
+
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            push_buffered_text(&mut segments, &mut buffer, bold, italic);
+            bold = !bold;
+            i += 2;
+            continue;
+        }
+        if chars[i] == '_' && i + 1 < chars.len() && chars[i + 1] == '_' {
+            push_buffered_text(&mut segments, &mut buffer, bold, italic);
+            bold = !bold;
+            i += 2;
+            continue;
+        }
+        if chars[i] == '*' || chars[i] == '_' {
+            push_buffered_text(&mut segments, &mut buffer, bold, italic);
+            italic = !italic;
+            i += 1;
+            continue;
+        }
+
+        buffer.push(chars[i]);
+        i += 1;
+    }
+
+    push_buffered_text(&mut segments, &mut buffer, bold, italic);
+    segments
+}
+
+fn parse_markdown_link(chars: &[char]) -> Option<(String, String, usize)> {
+    if chars.first() != Some(&'[') {
+        return None;
+    }
+
+    let close_label = chars.iter().position(|ch| *ch == ']')?;
+    if chars.get(close_label + 1) != Some(&'(') {
+        return None;
+    }
+
+    let url_start = close_label + 2;
+    let close_url = chars[url_start..].iter().position(|ch| *ch == ')')? + url_start;
+    let label = chars[1..close_label].iter().collect::<String>();
+    let url = chars[url_start..close_url].iter().collect::<String>();
+
+    Some((label, url, close_url + 1))
+}
+
+fn parse_plain_url(chars: &[char]) -> Option<(String, usize)> {
+    let starts_http = chars.starts_with(&['h', 't', 't', 'p', ':', '/', '/']);
+    let starts_https = chars.starts_with(&['h', 't', 't', 'p', 's', ':', '/', '/']);
+    if !starts_http && !starts_https {
+        return None;
+    }
+
+    let mut consumed = 0usize;
+    let mut url = String::new();
+    for ch in chars {
+        if ch.is_whitespace() {
+            break;
+        }
+        if *ch == ')' || *ch == ']' {
+            break;
+        }
+        consumed += 1;
+        url.push(*ch);
+    }
+
+    if url.is_empty() {
+        None
+    } else {
+        Some((url, consumed))
+    }
+}
+
+fn push_buffered_text(
+    segments: &mut Vec<StyledSegment>,
+    buffer: &mut String,
+    bold: bool,
+    italic: bool,
+) {
+    if buffer.is_empty() {
+        return;
+    }
+
+    segments.push(StyledSegment {
+        text: std::mem::take(buffer),
+        style: style_for_state(bold, italic),
+    });
+}
+
+fn style_for_state(bold: bool, italic: bool) -> Style {
+    let mut style = Style::default();
+    if bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if italic {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    style
+}
+
+fn wrap_styled_segments(segments: &[StyledSegment], max_width: usize) -> Vec<Vec<StyledSegment>> {
+    if max_width == 0 {
+        return vec![Vec::new()];
+    }
+
+    if segments.is_empty() {
+        return vec![Vec::new()];
+    }
+
+    let mut wrapped: Vec<Vec<StyledSegment>> = vec![Vec::new()];
+    let mut current_width = 0usize;
+
+    for segment in segments {
+        for ch in segment.text.chars() {
+            if current_width >= max_width {
+                wrapped.push(Vec::new());
+                current_width = 0;
+            }
+
+            if let Some(last) = wrapped.last_mut().and_then(|line| line.last_mut()) {
+                if last.style == segment.style {
+                    last.text.push(ch);
+                } else if let Some(line) = wrapped.last_mut() {
+                    line.push(StyledSegment {
+                        text: ch.to_string(),
+                        style: segment.style,
+                    });
+                }
+            } else if let Some(line) = wrapped.last_mut() {
+                line.push(StyledSegment {
+                    text: ch.to_string(),
+                    style: segment.style,
+                });
+            }
+
+            current_width += 1;
+        }
+    }
+
+    wrapped
 }
 
 fn wrap_text(input: &str, max_width: usize) -> Vec<String> {
@@ -2133,15 +2471,6 @@ fn wrap_text(input: &str, max_width: usize) -> Vec<String> {
     }
 
     result
-}
-
-fn pad_right(input: &str, width: usize) -> String {
-    let len = input.chars().count();
-    if len >= width {
-        input.to_string()
-    } else {
-        format!("{input}{}", " ".repeat(width - len))
-    }
 }
 
 fn draw_sidenav(
