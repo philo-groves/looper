@@ -21,6 +21,12 @@ type ChatPluginEffectOutput = {
   };
 };
 
+const FORMAT_RULES = [
+  "Formatting rules:",
+  "- Never use underscore-based italics like _text_.",
+  "- For numbered list items, italicize only the number token using asterisks, for example *1)* Item.",
+].join("\n");
+
 async function readInput(): Promise<string> {
   const decoder = new TextDecoder();
   const chunks: Uint8Array[] = [];
@@ -50,7 +56,7 @@ function buildEffects(input: ChatPluginPerceptInput): ChatPluginEffectOutput {
     return {
       mode: "stream_chat",
       user_prompt: "The user submitted an empty message. Ask for clarification.",
-      system_prompt: "You are Looper. Keep responses concise and practical.",
+      system_prompt: `You are Looper. Keep responses concise and practical.\n${FORMAT_RULES}`,
       planned_actions: [],
     };
   }
@@ -61,8 +67,7 @@ function buildEffects(input: ChatPluginPerceptInput): ChatPluginEffectOutput {
     return {
       mode: "stream_chat",
       user_prompt: `Please complete this task and describe the outcome briefly: ${taskName}`,
-      system_prompt:
-        "You are Looper. Execute user tasks carefully and return concrete completion details.",
+      system_prompt: `You are Looper. Execute user tasks carefully and return concrete completion details.\n${FORMAT_RULES}`,
       planned_actions: plannedActions,
       task_completion: {
         status: "completed",
@@ -74,8 +79,7 @@ function buildEffects(input: ChatPluginPerceptInput): ChatPluginEffectOutput {
   return {
     mode: "stream_chat",
     user_prompt: trimmed,
-    system_prompt:
-      "You are Looper. Provide direct, useful answers in plain language. If planned tool actions ran, use their outputs directly instead of asking the user to run commands.",
+    system_prompt: `You are Looper. Provide direct, useful answers in plain language. If planned tool actions ran, use their outputs directly instead of asking the user to run commands.\n${FORMAT_RULES}`,
     planned_actions: plannedActions,
   };
 }
