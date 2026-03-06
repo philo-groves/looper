@@ -122,59 +122,6 @@ function parseInspectorCommand(text: string): PlannedAction[] {
 }
 
 function parseStarterPackCommands(text: string): PlannedAction[] {
-  const cyberSurface = text.match(/^\/(cyber-surface)\s+(.+)$/i);
-  if (cyberSurface) {
-    return [{
-      plugin: "cybersecurity-starter",
-      actuator: "cyber_surface_map",
-      args: {
-        target: cyberSurface[2].trim(),
-      },
-    }];
-  }
-
-  const cyberTriage = text.match(/^\/(cyber-triage)\s+(.+)$/i);
-  if (cyberTriage) {
-    return [{
-      plugin: "cybersecurity-starter",
-      actuator: "cyber_triage",
-      args: {
-        target: cyberTriage[2].trim(),
-        observations: [
-          "user-requested quick triage",
-        ],
-      },
-    }];
-  }
-
-  const cyberValidate = text.match(/^\/(cyber-validate)\s+(.+)$/i);
-  if (cyberValidate) {
-    const target = cyberValidate[2].trim();
-    return [{
-      plugin: "cybersecurity-starter",
-      actuator: "cyber_validate_finding",
-      args: {
-        target,
-        observations: [
-          `Validation requested for ${target}`,
-        ],
-      },
-    }];
-  }
-
-  const cyberReport = text.match(/^\/(cyber-report)\s+(.+)$/i);
-  if (cyberReport) {
-    const target = cyberReport[2].trim();
-    return [{
-      plugin: "cybersecurity-starter",
-      actuator: "cyber_report_draft",
-      args: {
-        title: `Security Assessment - ${target}`,
-        findings: [],
-      },
-    }];
-  }
-
   const blogOutline = text.match(/^\/(blog-outline)\s+(.+)$/i);
   if (blogOutline) {
     return [{
