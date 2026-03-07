@@ -1,6 +1,6 @@
 # Looper
 
-An experimental continuous AI agent based on the PEAS (performance measure, environment, actuators, sensors) architecture from robotics, and its harness is based on the [Fiddlesticks](https://github.com/philo-groves/fiddlesticks) framework.
+An experimental continuous AI agent workspace based on the PEAS (performance measure, environment, actuators, sensors) architecture from robotics, and its harness is based on the [Fiddlesticks](https://github.com/philo-groves/fiddlesticks) framework.
 
 ## Crates
 
